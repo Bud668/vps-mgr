@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v1.3.4-green)
+![Version](https://img.shields.io/badge/version-v1.4.0-green)
 
 </div>
 
@@ -136,11 +136,11 @@ net.ipv4.tcp_congestion_control = bbr
 
 ### 📡 Telegram 告警
 
-SSH 告警走**独立群**（安全事件不该和运维噪音混在一起）；其余两类共用一个**话题群**，各占一个话题：
+三类通知共用一个**话题群**，各占一个话题：
 
 | 通道 | 内容 |
 |------|------|
-| 🔐 SSH（独立群） | 登录成功/失败，IP + 时间 + 方式 |
+| 🔐 SSH 登录（话题） | 登录成功/失败，IP + 时间 + 方式；Fail2Ban 封禁通知 |
 | 📊 流量配额（话题） | 用量预警、超额暂停通知 |
 | ☁️ DDNS（话题） | IP 变更、健康巡检 |
 

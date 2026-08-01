@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.3.4"
+readonly SCRIPT_VERSION="1.4.0"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -366,11 +366,12 @@ _tg_cfg_get() {
 
 # 解析通知通道，设置 TG_BOT_TOKEN / TG_CHAT_ID / TG_THREAD_ID
 # $1 = monitor | quota | ddns —— 三者共用话题群(TG_CHAT_HUB)，各占一个话题
-# SSH 不走这里：它用独立群(TG_CHAT_ID)，不带话题
+# 三个通道共用话题群(TG_CHAT_HUB)，各占一个话题
 _tg_resolve_channel() {
     local _key
     TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_THREAD_ID=""
     case "$1" in
+        ssh)     _key=TG_THREAD_SSH     ;;
         quota)   _key=TG_THREAD_QUOTA   ;;
         ddns)    _key=TG_THREAD_DDNS    ;;
         *)       return 0 ;;
@@ -381,18 +382,21 @@ _tg_resolve_channel() {
     return 0
 }
 
-# 写入统一 TG 配置：SSH 独立群 + 话题群及三个话题ID
+# 写入统一 TG 配置：话题群 + SSH/配额/DDNS 三个话题ID
+# 全部通知统一发到话题群，各占一个话题。TG_CHAT_ID 保留并等于话题群 ID：
+# SSH 监控脚本沿用它作 chat_id，配合 TG_THREAD_SSH 投递到 SSH 话题。
 _write_tg_conf() {
-    local _tok="$1" _chat="$2" _srv="$3"
-    local _hub="${4:-}" _th_qt="${5:-}" _th_dd="${6:-}"
+    local _tok="$1" _hub="$2" _srv="$3"
+    local _th_ssh="${4:-}" _th_qt="${5:-}" _th_dd="${6:-}"
     local _tmp; _tmp=$(mktemp)
     {
         printf "TG_BOT_TOKEN='%s'\n" "$_tok"
-        printf "TG_CHAT_ID='%s'\n"   "$_chat"
-        [[ -n "$_srv"   ]] && printf 'SERVER_NAME="%s"\n'     "$_srv"
-        [[ -n "$_hub"   ]] && printf "TG_CHAT_HUB='%s'\n"     "$_hub"
-        [[ -n "$_th_qt" ]] && printf "TG_THREAD_QUOTA='%s'\n" "$_th_qt"
-        [[ -n "$_th_dd" ]] && printf "TG_THREAD_DDNS='%s'\n"  "$_th_dd"
+        printf "TG_CHAT_ID='%s'\n"   "$_hub"
+        printf "TG_CHAT_HUB='%s'\n"  "$_hub"
+        [[ -n "$_srv"    ]] && printf 'SERVER_NAME="%s"\n'      "$_srv"
+        [[ -n "$_th_ssh" ]] && printf "TG_THREAD_SSH='%s'\n"    "$_th_ssh"
+        [[ -n "$_th_qt"  ]] && printf "TG_THREAD_QUOTA='%s'\n"  "$_th_qt"
+        [[ -n "$_th_dd"  ]] && printf "TG_THREAD_DDNS='%s'\n"   "$_th_dd"
     } > "$_tmp"
     chmod 600 "$_tmp"
     mv "$_tmp" "$TG_CONF"
@@ -402,15 +406,15 @@ _write_tg_conf() {
 # $1 = SERVER_NAME（可为空）
 _tg_input_tokens() {
     local _srv="${1:-}"
-    local _vals _vline _blank _new_tok _new_chat _hub _th_qt _th_dd
+    local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd
     local _resp _bot _gf _cf
     while :; do
         printf "  粘贴配置，支持 # 注释行和空行分隔，自动跳过:\n"
-        printf "  顺序: Bot Token → SSH 群 Chat ID → 话题群 Chat ID\n"
-        printf "        → 配额 话题ID → DDNS 话题ID\n"
+        printf "  顺序: Bot Token → 话题群 Chat ID\n"
+        printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID\n"
         printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
         printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
-        printf "  ${C_YELLOW}填完后（最少填 Token 和 SSH Chat ID 两行）连按两次回车结束；输入 q 放弃${C_RESET}\n>>> "
+        printf "  ${C_YELLOW}填完后（最少填 Token 和 话题群 Chat ID 两行）连按两次回车结束；输入 q 放弃${C_RESET}\n>>> "
         _vals=(); _blank=0
         while [[ ${#_vals[@]} -lt 5 ]]; do
             read -r _vline < /dev/tty || break
@@ -428,11 +432,11 @@ _tg_input_tokens() {
             [[ "$_vline" =~ ^# ]] && continue
             _vals+=("$_vline")
         done
-        _new_tok="${_vals[0]:-}" _new_chat="${_vals[1]:-}" _hub="${_vals[2]:-}"
-        _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
+        _new_tok="${_vals[0]:-}" _hub="${_vals[1]:-}"
+        _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
         [[ "$_new_tok" == "q" || "$_new_tok" == "Q" ]] && { printf "  ${C_YELLOW}⚠ 已放弃配置${C_RESET}\n"; return 1; }
-        if [[ -z "$_new_tok" || -z "$_new_chat" ]]; then
-            printf "  ${C_RED}✗ Token 或 SSH Chat ID 不能为空，请重新粘贴（q 放弃）${C_RESET}\n"; continue
+        if [[ -z "$_new_tok" || -z "$_hub" ]]; then
+            printf "  ${C_RED}✗ Token 或 话题群 Chat ID 不能为空，请重新粘贴（q 放弃）${C_RESET}\n"; continue
         fi
         printf "  正在验证 Bot..."
         _resp=$(curl -s --max-time 8 "https://api.telegram.org/bot${_new_tok}/getMe" 2>/dev/null || true)
@@ -447,14 +451,10 @@ _tg_input_tokens() {
         fi
         printf "  ${C_CYAN}── 待写入内容（请核对）──${C_RESET}\n"
         printf "  Token   : %s\n" "${_new_tok:0:20}..."
-        printf "  SSH 群  : %s ${C_DIM}(独立群，不用话题)${C_RESET}\n" "$_new_chat"
-        if [[ -n "$_hub" ]]; then
-            printf "  话题群  : %s\n" "$_hub"
-            printf "    ├ 流量配额 : 话题 %s\n" "${_th_qt:-未设置}"
-            printf "    └ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
-        else
-            printf "  话题群  : ${C_DIM}未设置（配额/DDNS 通道将不可用）${C_RESET}\n"
-        fi
+        printf "  话题群  : %s\n" "$_hub"
+        printf "    ├ SSH 登录 : 话题 %s\n" "${_th_ssh:-未设置}"
+        printf "    ├ 流量配额 : 话题 %s\n" "${_th_qt:-未设置}"
+        printf "    └ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
         printf "  ${C_YELLOW}确认写入？[y=写入 / q=放弃 / 回车=重新粘贴]: ${C_RESET}"
         read -r _cf < /dev/tty || _cf="q"
         case "$_cf" in
@@ -463,16 +463,14 @@ _tg_input_tokens() {
             *)    printf "  ${C_CYAN}↻ 重新粘贴${C_RESET}\n"; continue ;;
         esac
     done
-    _write_tg_conf "$_new_tok" "$_new_chat" "$_srv" "$_hub" "$_th_qt" "$_th_dd"
+    _write_tg_conf "$_new_tok" "$_hub" "$_srv" "$_th_ssh" "$_th_qt" "$_th_dd"
     printf "  ${C_GREEN}✓ 已保存${C_RESET}\n"
     printf "  ${C_CYAN}正在启动各监控服务...${C_RESET}\n"
     _setup_ssh_tg_monitor || true
-    if [[ -n "$_hub" ]]; then
-        # 先发确认：服务未装时也能立刻验证话题 ID 是否正确
-        printf "  ${C_CYAN}正在验证话题群各通道...${C_RESET}\n"
-        _tg_notify_configured "$_srv"
-        [[ -n "$_th_qt" ]] && grep -q '^[0-9]' "$QUOTA_CONFIG" 2>/dev/null && { install_quota_services || true; }
-    fi
+    # 先发确认：服务未装时也能立刻验证话题 ID 是否正确
+    printf "  ${C_CYAN}正在验证话题群各通道...${C_RESET}\n"
+    _tg_notify_configured "$_srv"
+    [[ -n "$_th_qt" ]] && grep -q '^[0-9]' "$QUOTA_CONFIG" 2>/dev/null && { install_quota_services || true; }
     return 0
 }
 
@@ -480,7 +478,7 @@ _tg_input_tokens() {
 _tg_notify_configured() {
     local _srv="$1" _entry _ch _label _msg _ts
     _ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
-    for _entry in "quota:流量配额" "ddns:DDNS"; do
+    for _entry in "ssh:SSH 登录" "quota:流量配额" "ddns:DDNS"; do
         _ch="${_entry%%:*}"; _label="${_entry#*:}"
         _tg_resolve_channel "$_ch"
         [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" || -z "$TG_THREAD_ID" ]] && continue
@@ -523,13 +521,13 @@ _do_tg_config() {
         clear
         printf "${C_CYAN}:: TG 推送配置 ::${C_RESET}\n\n"
 
-        local _tok="" _chat="" _srv="" _hub="" _th_qt="" _th_dd=""
-        _tok=$(_tg_cfg_get   "$TG_CONF" TG_BOT_TOKEN)
-        _chat=$(_tg_cfg_get  "$TG_CONF" TG_CHAT_ID)
-        _srv=$(_tg_cfg_get   "$TG_CONF" SERVER_NAME)
-        _hub=$(_tg_cfg_get   "$TG_CONF" TG_CHAT_HUB)
-        _th_qt=$(_tg_cfg_get "$TG_CONF" TG_THREAD_QUOTA)
-        _th_dd=$(_tg_cfg_get "$TG_CONF" TG_THREAD_DDNS)
+        local _tok="" _srv="" _hub="" _th_ssh="" _th_qt="" _th_dd=""
+        _tok=$(_tg_cfg_get    "$TG_CONF" TG_BOT_TOKEN)
+        _srv=$(_tg_cfg_get    "$TG_CONF" SERVER_NAME)
+        _hub=$(_tg_cfg_get    "$TG_CONF" TG_CHAT_HUB)
+        _th_ssh=$(_tg_cfg_get "$TG_CONF" TG_THREAD_SSH)
+        _th_qt=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_QUOTA)
+        _th_dd=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_DDNS)
 
         local _ssh_tg_st _quota_st _ddns_st
         systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null \
@@ -541,10 +539,8 @@ _do_tg_config() {
 
         local _d
         _d="${_tok:+${_tok:0:20}...}"; printf "  Token : %s\n\n" "${_d:-未设置}"
-        printf "  ${C_BLUE}[ SSH ]${C_RESET}   %b   ${C_DIM}独立群${C_RESET}\n" "$_ssh_tg_st"
-        printf "    Chat   : %s\n\n" "${_chat:-未设置}"
-
         printf "  ${C_BLUE}[ 话题群 ]${C_RESET}  %b\n" "${_hub:-${C_YELLOW}未设置${C_RESET}}"
+        printf "    ├ SSH 登录 %b  话题 %b\n" "$_ssh_tg_st"  "${_th_ssh:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ 流量配额 %b  话题 %b\n" "$_quota_st" "${_th_qt:-${C_YELLOW}未设置${C_RESET}}"
         printf "    └ DDNS     %b  话题 %b\n" "$_ddns_st" "${_th_dd:-${C_YELLOW}未设置${C_RESET}}"
 
@@ -566,31 +562,22 @@ _do_tg_config() {
                     systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null \
                         && _ss_st="${C_GREEN}运行中${C_RESET}" || _ss_st="${C_RED}未运行${C_RESET}"
                     printf "  状态    : %b\n" "$_ss_st"
-                    { [[ -n "$_chat" ]] && printf "  推送频道: ${C_CYAN}%s${C_RESET}\n" "$_chat" || printf "  推送频道: ${C_YELLOW}未设置${C_RESET}\n"; }
-                    printf "\n  ${C_GREEN}1.${C_RESET} 设置 Token & Chat ID\n"
-                    printf "  ${C_GREEN}2.${C_RESET} 配置并启动服务\n"
-                    printf "  ${C_GREEN}3.${C_RESET} 查看日志\n"
-                    printf "  ${C_GREEN}4.${C_RESET} 停止并卸载\n"
+                    printf "  推送目标: ${C_CYAN}%s${C_RESET} 话题 ${C_CYAN}%s${C_RESET}\n" \
+                        "${_hub:-未设置}" "${_th_ssh:-未设置}"
+                    printf "\n  ${C_GREEN}1.${C_RESET} 配置并启动服务\n"
+                    printf "  ${C_GREEN}2.${C_RESET} 查看日志\n"
+                    printf "  ${C_GREEN}3.${C_RESET} 停止并卸载\n"
                     printf "  ${C_GREEN}0.${C_RESET} 返回\n"
-                    printf "\n${C_CYAN}请选择 [0-4]: ${C_RESET}"
+                    printf "\n${C_CYAN}请选择 [0-3]: ${C_RESET}"
                     local _ssh_sub; read -r _ssh_sub < /dev/tty; printf "\n"
                     case $_ssh_sub in
-                        1)  printf "  粘贴2行 (Token / Chat ID，回车跳过保持不变):\n>>> "
-                            local _nt _nc; read -r _nt < /dev/tty; read -r _nc < /dev/tty
-                            _nt=$(echo "$_nt" | tr -d '[:space:]'); _nc=$(echo "$_nc" | tr -d '[:space:]')
-                            [[ -n "$_nt" ]] && _tok="$_nt"
-                            [[ -n "$_nc" ]] && _chat="$_nc"
-                            _write_tg_conf "$_tok" "$_chat" "$_srv" "$_hub" "$_th_qt" "$_th_dd"
-                            printf "  ${C_CYAN}正在启动 SSH 推送服务...${C_RESET}\n"
-                            _setup_ssh_tg_monitor || true
-                            pause ;;
-                        2)  _setup_ssh_tg_monitor; pause ;;
-                        3)  clear
+                        1)  _setup_ssh_tg_monitor; pause ;;
+                        2)  clear
                             printf "${C_YELLOW}--- SSH 推送最近日志 (50条) ---${C_RESET}\n"
                             journalctl -u "$SSH_TG_SERVICE" --no-pager -n 50 2>/dev/null \
                                 || printf "${C_YELLOW}暂无日志${C_RESET}\n"
                             pause ;;
-                        4)  systemctl stop    "$SSH_TG_SERVICE" 2>/dev/null || true
+                        3)  systemctl stop    "$SSH_TG_SERVICE" 2>/dev/null || true
                             systemctl disable "$SSH_TG_SERVICE" 2>/dev/null || true
                             rm -f "/etc/systemd/system/${SSH_TG_SERVICE}.service" \
                                   "$SSH_TG_SCRIPT" "$SSH_TG_CONF"
@@ -625,11 +612,11 @@ _do_tg_config() {
                         *) msg_warn "无效选项"; printf "\n${C_GREEN}按任意键返回...${C_RESET}"; read -rsn1 ;;
                     esac
                 done ;;
-            4)  # 测试推送（SSH 独立群 + 话题群两个话题）
+            4)  # 测试推送（话题群三个话题）
                 local _ts; _ts=$(TZ="$TZ_DEFAULT" date '+%H:%M:%S')
-                _tg_test_one "SSH"  "$_tok" "$_chat" ""       "$_ts"
-                _tg_test_one "配额" "$_tok" "$_hub"  "$_th_qt" "$_ts"
-                _tg_test_one "DDNS" "$_tok" "$_hub"  "$_th_dd" "$_ts"
+                _tg_test_one "SSH"  "$_tok" "$_hub" "$_th_ssh" "$_ts"
+                _tg_test_one "配额" "$_tok" "$_hub" "$_th_qt"  "$_ts"
+                _tg_test_one "DDNS" "$_tok" "$_hub" "$_th_dd"  "$_ts"
                 pause ;;
             0|"") return ;;
             *) continue ;;
@@ -3168,18 +3155,19 @@ EOF
 _setup_ssh_tg_monitor() {
     echo -e "\n${L_CYAN}配置 SSH 登录 TG 通知${NC}"
 
-    local _token="" _chat="" _alias=""
+    local _token="" _chat="" _alias="" _thread=""
     if [ -f "$SSH_TG_CONF" ]; then
         _token=$(grep "^TG_BOT_TOKEN=" "$SSH_TG_CONF" 2>/dev/null | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
         _chat=$(grep  "^TG_CHAT_ID="   "$SSH_TG_CONF" 2>/dev/null | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
+        _thread=$(grep "^TG_THREAD_SSH=" "$SSH_TG_CONF" 2>/dev/null | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
         _alias=$(grep "^SERVER_NAME="  "$SSH_TG_CONF" 2>/dev/null | cut -d= -f2- | sed 's/^"//;s/"$//' || true)
     fi
 
     if [ -z "$_token" ] || [ -z "$_chat" ]; then
-        echo -e "${RED}未找到 TG Token/Chat ID，请先在主菜单 ★4「TG 推送配置」中设置${NC}"
+        echo -e "${RED}未找到 TG Token/话题群 Chat ID，请先在主菜单 ★3「TG 推送配置」中设置${NC}"
         return 1
     fi
-    echo -e "  使用已配置的 Token=${_token:0:20}...  ChatID=${_chat}"
+    echo -e "  使用已配置的 Token=${_token:0:20}...  群=${_chat}${_thread:+  话题=${_thread}}"
 
     # 停止旧服务并杀掉所有残留进程
     systemctl stop "$SSH_TG_SERVICE" 2>/dev/null || true
@@ -3218,9 +3206,11 @@ _srv_display() {
     fi
 }
 send_tg() {
+    # TG_THREAD_SSH 为空时不传 message_thread_id（普通群/频道场景仍可用）
     curl -s --max-time 10 \
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" \
+        ${TG_THREAD_SSH:+-d "message_thread_id=${TG_THREAD_SSH}"} \
         -d "parse_mode=HTML" \
         --data-urlencode "text=$1" \
         >/dev/null 2>&1 || true
@@ -3292,6 +3282,7 @@ ts=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
 curl -s --max-time 10 \
     "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TG_CHAT_ID}" \
+    ${TG_THREAD_SSH:+-d "message_thread_id=${TG_THREAD_SSH}"} \
     -d "parse_mode=HTML" \
     --data-urlencode "text=🚫 #IP已封禁
 服务器: ${SERVER_DISPLAY}
