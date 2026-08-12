@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.4.1"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -180,12 +180,43 @@ get_flag_emoji() {
 # 仅用于推送，终端显示不加。
 # 注：SSH 监控脚本内有一份等价的 _srv_display，因其独立运行无法共用。
 _srv_render() {
-    local _n="$1" _tag="${2:-}"
+    local _n="$1" _tag="${2:-}" _cc="${3:-${SERVER_COUNTRY_CODE:-}}"
     if [[ "$_n" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        local _f; _f=$(get_flag_emoji "${SERVER_COUNTRY_CODE:-}")
+        local _f; _f=$(get_flag_emoji "$_cc")
         printf '%s%s%s' "${_f:+${_f} }" "${_tag:+#}" "${_n//-/_}"
     else
         printf '%s' "$_n"
+    fi
+}
+
+# 返回供配额和 DDNS 共用的本机标识。默认输出 Telegram 标签；传 plain 时
+# 输出终端展示名。优先使用用户设置的 SERVER_NAME，没有时回退到国家码和
+# 公网 IPv4 末段。该函数必须留在共享工具区，不能随某个业务模块一起删除。
+get_node_id() {
+    local _mode="${1:-tag}" _tag="tag"
+    local _name="" _cc="" _ip="" _last=""
+    [[ "$_mode" == "plain" ]] && _tag=""
+
+    _name=$(_tg_cfg_get "$TG_CONF" SERVER_NAME)
+    _cc=$(_read_cache_value "SERVER_COUNTRY_CODE" "$CACHE_FILE")
+    if [[ -n "$_name" ]]; then
+        _srv_render "$_name" "$_tag" "${_cc:-${SERVER_COUNTRY_CODE:-UN}}"
+        return 0
+    fi
+
+    _ip=$(_read_cache_value "SERVER_IP" "$CACHE_FILE")
+    if [[ ! "$_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        _ip=$(get_public_ip 2>/dev/null || true)
+    fi
+    [[ "$_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && _last="${_ip##*.}"
+
+    _cc="${_cc:-${SERVER_COUNTRY_CODE:-UN}}"
+    [[ "$_cc" =~ ^[A-Za-z]{2}$ ]] || _cc="UN"
+    _cc="${_cc^^}"
+    if [[ -n "$_last" ]]; then
+        printf '%s%s_%s' "${_tag:+#}" "$_cc" "$_last"
+    else
+        printf '%s%s' "${_tag:+#}" "$_cc"
     fi
 }
 
