@@ -27,16 +27,15 @@ for caller in do_retune_bandwidth _do_full_init; do
     declare -f "$caller" | grep -Fq '_apply_fq "$_def_if" "$_fq_maxrate"'
 done
 declare -f do_retune_bandwidth | grep -Fq '/etc/sysctl.d/99-custom-tuning.conf'
-# One entry, no mode question: standard VPS keeps the old full initialization.
+# One entry, no mode question: containers also reach the shared full workflow.
 (
-    _minimal_setup() { echo container; }
     _do_full_init() { echo full; }
     _is_container() { return 1; }
     assert_eq full "$(do_quick_init </dev/null)" 'normal VPS uses full initialization'
     _is_container() { return 0; }
     log_message() { :; }
     output=$(do_quick_init </dev/null)
-    assert_eq container "${output##*$'\n'}" 'shared-kernel container detected automatically'
+    assert_eq full "${output##*$'\n'}" 'container uses the same user-space initialization'
 )
 [[ $(declare -f _do_full_init | grep -c 'do_init_firewall') == 1 ]] || {
     echo 'FAIL: full initialization repeats firewall setup'; exit 1;
@@ -68,6 +67,33 @@ if [[ ${1:-} == --netns ]]; then
     tc qdisc add dev vps-test root handle 1: fq maxrate 100mbit flow_limit 250
     _apply_fq vps-test "$(_fq_maxrate_mbps 80)"
     tc qdisc show dev vps-test | grep -Eq 'fq 1:.*flow_limit 250p.*maxrate 80Mbit'
+    tc qdisc replace dev vps-test root fq_codel
+    _apply_fq vps-test 80
+    tc qdisc show dev vps-test | grep -Eq 'qdisc fq .*flow_limit 250p.*maxrate 80Mbit'
+    ip link add vps-mq numtxqueues 4 numrxqueues 4 type dummy
+    ip link set vps-mq up
+    tc qdisc replace dev vps-mq root handle 10: mq
+    _apply_fq vps-mq 80
+    assert_eq 4 "$(tc -j qdisc show dev vps-mq | jq '[.[] | select(.kind=="fq")]|length')" 'all mq leaves use fq'
+    assert_eq 4 "$(tc qdisc show dev vps-mq | grep -c 'flow_limit 250p.*maxrate 80Mbit')" 'all mq leaves tuned'
+    _apply_fq vps-mq 120
+    assert_eq 4 "$(tc qdisc show dev vps-mq | grep -c 'maxrate 120Mbit')" 'mq retune changes every leaf'
+    (
+        ip() { echo 'default via 192.0.2.1 dev vps-mq'; }
+        clear() { :; }
+        output=$(do_check_all || true)
+        [[ $output == *'qdisc fq 已生效（含多队列叶子）'* ]] || { echo 'FAIL: mq fq health check'; exit 1; }
+    )
+    tc qdisc replace dev vps-mq parent 10:1 pfifo limit 1000
+    before=$(tc qdisc show dev vps-mq)
+    if _apply_fq vps-mq 80; then echo 'FAIL: custom mq leaf overwritten'; exit 1; fi
+    assert_eq "$before" "$(tc qdisc show dev vps-mq)" 'mixed mq tree unchanged'
+    (
+        ip() { echo 'default via 192.0.2.1 dev vps-mq'; }
+        clear() { :; }
+        output=$(do_check_all || true)
+        [[ $output == *'部分队列或 maxrate/flow_limit 未完整配置'* ]] || { echo 'FAIL: mixed mq falsely reported healthy'; exit 1; }
+    )
     tc qdisc replace dev vps-test root handle 2: pfifo limit 1000
     before=$(tc qdisc show dev vps-test)
     if _apply_fq vps-test 80; then echo 'FAIL: unrelated qdisc accepted'; exit 1; fi

@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.3-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.4-orange)
 
 </div>
 
@@ -17,16 +17,16 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.3 预发布测试版**，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.4 预发布测试版**，包含本轮老版功能补齐，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
 command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.3/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.4/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.3。发布页：[v2.0.0-beta.3](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.3)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.4。发布页：[v2.0.0-beta.4](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.4)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
@@ -45,7 +45,7 @@ curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/B
 | 🔀 **端口转发** | realm 转发规则、失效端点检测 |
 | 📊 **流量配额** | 按端口计量、超额自动暂停、到期管理 |
 | 📡 **监控告警** | Telegram 话题群推送、SSH 登录通知、流量配额告警 |
-| 🔄 **自更新** | 手动更新；每日自动更新需自行启用，带语法校验、备份和防降级 |
+| 🔄 **自更新** | 手动更新 + 初始化默认开启每日正式版检查，带语法校验、备份和防降级 |
 | ☁️ **DDNS** | Cloudflare A 记录自动更新 |
 
 ---
@@ -143,10 +143,15 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - **不要求新开 SSH、不输入确认码、不重复进入初始化。**应用/保存/启用失败会撤回本次加载的表；异常中断由 3 分钟定时器兜底，恢复失败保留原有配置文件
 - 核对的是本机 SSH 端口规则，不等于实测公网新连接；可自行另开 SSH 验证，但不会阻断安装流程
 - 重复初始化保留现有规则并检查开机恢复；已保存但未加载时使用原配置恢复，不抹掉代理端口、配额暂停或白名单
+- 菜单 5 → 8 切换安全 DROP / 开放 ACCEPT；开放模式仍保留显式封禁、配额与 ACL，不绕过其他表
+- 菜单 5 → 9 重建本脚本基础链为 DROP，保留业务端口集合、ACL、配额计数和暂停状态；不会清空整个 ruleset
+- 按链和 nftables `handle` 删除规则，或按端口清理专用集合、ACL 和配额；当前 SSH 规则/监听端口受保护。批量清理只处理精确单端口匹配，范围/多端口规则需用 handle 审阅处理
+- 菜单 5 → 10 管理防火墙 SSH 放行端口，不修改 sshd 本身；菜单 5 → 7 提供静态拦截、实时拦截、实时完整内核日志
+- 详细规则带包/字节计数；首页合并 TCP+UDP 端口、自动换行，并显示 TCPing/测试端口、CN、域名 ACL、SSH 放行标记
 
-**首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；不提供“全开放/清空所有规则”菜单。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
+**首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；开放模式不等于清空整机规则。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
 
-业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。已有 fq 使用 change 更新；其他 qdisc 保留不动，持久化使用单独的 `vps-mgr-fq.service`。
+业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。已有 fq 使用 change 更新；常见 fq_codel 改为 fq，mq 保留多队列根并逐一调整 fq/fq_codel 叶子。自定义队列保持不动并报告未完成。持久化使用 `vps-mgr-fq.service`，同时在已安装的 ifupdown、networkd-dispatcher、NetworkManager 钩子目录加入网络上线后重应用入口。
 
 **SSH 加固**
 
@@ -158,6 +163,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 **测试模式**
 
 - 通过内核 timeout 临时开放 Ping 和 iperf3，**2 小时自动到期**，不依赖 atd，也不随重启重新开放
+- 开启时显示本机/对端 iperf3 命令，菜单显示实际自动关闭时间（上海时区）；再次选择可提前关闭
 - 两端口 NAT 容器通常没有 5201 映射，不应为测速或 TCPing 随意占用业务端口
 
 ---
@@ -203,7 +209,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 重装系统后运行 v2 脚本：
 
-1. 选择 **「1. 一键初始化」**，无需再选“完整/简化”。独立 VPS 沿用老版的关闭 IPv6 → 系统更新 → XanMod → 网络优化 → 防火墙 → TG/Fail2Ban 流程和默认调优档位；此前的低带宽、内存上限、连接重试安全修复保留。
+1. 选择 **「1. 一键初始化」**，无需再选“完整/简化”。独立 VPS 沿用老版的关闭 IPv6 → 系统更新 → XanMod → 网络优化 → 防火墙 → TG/Fail2Ban → TCPing/每日更新流程和默认调优档位；此前的低带宽、内存上限、连接重试安全修复保留。
 2. 在同一 SSH 窗口按原来的带宽、角色、TG 等提示完成一轮配置；防火墙自动保存并启用开机恢复。仅安装了新内核时，最后提示重启一次。
 3. 按需选择 **菜单 7 Snell、8 Realm、9 sing-box（SS/SS2022、SOCKS5、Hysteria2）**，没有协议限制。
 4. NAT 容器按实际映射手填端口，例如本机映射也为 24073/24074 时才填写这两个端口；不改供应商 SSH 映射。
@@ -211,9 +217,11 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 初始化默认关闭 IPv6，立即生效并写入开机配置；需要测试时用 **菜单 6 → 3（IPv6 管理）** 开启，测试后再用同一入口关闭。通过 IPv6 SSH 登录时拒绝直接禁用，避免断开当前管理连接，请先使用 IPv4 SSH 或控制台。主菜单按实际内核状态显示 IPv6 开关。
 
-脚本自动识别共享内核容器（如 LXC/OpenVZ），只配置必要依赖、关闭容器内 IPv6 和防火墙，不升级系统、不改 DNS、不换内核、不创建 Swap、不调整 qdisc；代理功能与独立 VPS 相同。若宿主机禁止 IPv6 sysctl 写入，会明确报错，不假报成功。你不需要手动判断或选择环境。NAT 或公网端口数量不能作为容器判据。
+脚本自动识别共享内核容器（如 LXC/OpenVZ），与 VPS 共用完整用户态初始化：依赖/软件更新、时区、日志、文件描述符、TG、Fail2Ban、TCPing 和每日更新不再整批跳过。只跳过换内核、Swap、宿主 sysctl/qdisc 和共享时钟修改；挂载或只读 DNS 文件保留宿主设置。若宿主禁止 IPv6 sysctl 写入，会报告“未禁用”并继续其他功能，不假报成功。菜单 2 → 3 可单独安装/修复 Fail2Ban。你不需要手动判断或选择环境，NAT 或公网端口数量不能作为容器判据。
 
-本版不额外默认安装专用 TCPing 服务；参数计算尊重 cgroup 内存上限和真实页大小。独立 VPS 不再先跑一遍轻量初始化。
+**TCPing 默认 9999**，仅在被占用时向后找空闲端口；已运行的服务保留原端口。菜单 6 → 7 可手动指定端口、查看哪吒目标或卸载。它是 TCP 延迟探测监听，不是哪吒 Agent；NAT 机器还需对应公网映射，脚本不能新增供应商的开放端口。参数计算尊重 cgroup 内存上限和真实页大小。
+
+关闭 IPv6 时使用 Exim4 原生配置处理 IPv6 监听冲突，保留邮件服务和自定义配置；重新开启 IPv6 时撤回脚本加入的配置。SSH 监控安装后恢复启动测试推送，地址以可复制的代码格式展示，并转义消息中的 HTML 特殊字符。客户端自定义节点名称保留国旗与防重名后缀；到期删除 Realm/配额时清理对应元数据和告警标记，避免同月复用端口漏告警。sing-box 的文件描述符上限恢复为 1000000。
 
 **beta.1 重启后防火墙未生效怎么办？**如果是未完成旧版确认，更新测试脚本后选择 **菜单 5 → 1** 即可完成/恢复本脚本防火墙并修复开机加载，不必重跑整套系统优化，也不要求重装。若提示权限不足，应检查容器权限/宿主支持，重试初始化不能补足这些权限。
 
@@ -258,12 +266,15 @@ bash -n vps-mgr.sh
 shellcheck -S error vps-mgr.sh tests/*.sh
 bash tests/test_get_node_id.sh
 bash tests/test_safety.sh
+bash tests/test_feature_parity.sh
+bash tests/test_ipv6.sh
 bash tests/test_network_init.sh
+unshare --net bash tests/test_ipv6.sh --netns
 unshare --net bash tests/test_network_init.sh --netns
 unshare --net bash tests/test_nftables.sh
 ```
 
-网络集成测试只允许在独立 network namespace 中运行，状态文件重定向到临时目录，服务管理被替换为测试桩，不修改宿主防火墙。可设置 `VPS_MGR_REAL_SBX=/path/to/sing-box` 让安全回归调用真实核心校验配置。新系统的实际启动、SSH 重连和重启恢复仍需部署后验收。
+网络集成测试只允许在独立 network namespace 中运行，状态文件重定向到临时目录，服务管理被替换为测试桩，不修改宿主防火墙。功能回归覆盖 VPS/容器初始化调用链、TCPing 默认端口/冲突/回退、国旗、清理、通知生成和定时服务。可设置 `VPS_MGR_REAL_SBX=/path/to/sing-box` 让安全回归调用真实核心校验配置；已具备 Exim4 运行环境时，`VPS_MGR_REAL_EXIM=/usr/sbin/exim4` 可核验 IPv6 配置开关。新系统的实际启动、SSH 重连和重启恢复仍需部署后验收。
 
 ---
 

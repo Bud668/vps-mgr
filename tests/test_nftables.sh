@@ -58,7 +58,7 @@ assert test ! -e "$test_dir/timer"
 assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 [[ $(_fw_show_status) == *开机恢复已启用* ]] || exit 1
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH 22'* ]] || exit 1
+[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH'*'●'*'22'* ]] || exit 1
 [[ $status != *TCP* && $status != *UDP* && $status != *已暂停* && $status != *ssh_ports* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
 # Repair a beta.1 interruption/disabled boot unit without replacing live rules.
@@ -75,7 +75,7 @@ open_firewall_port 24073
 assert _fw_has_element tcp_ports 24073
 assert _fw_has_element udp_ports 24073
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'TCP 24073'*'UDP 24073'* ]] || exit 1
+[[ $status == *'24073/TCP+UDP'* ]] || exit 1
 
 mkdir -p "$QUOTA_DIR"
 printf '24073|test|104857600|-|0\n24074|socks|104857600|-|0\n' > "$QUOTA_CONFIG"
@@ -196,6 +196,29 @@ send_packet 6
 assert test "$(quota_get_port_bytes 24073)" = "$resumed_bytes 0"
 _fw_element delete cn_ports 24073
 
+# Policy changes and a genuine base-chain rebuild retain service restrictions,
+# quota counters and rules in unrelated tables, with no reboot/reconnect prompt.
+before=$(quota_get_port_bytes 24073)
+_fw_set_policy accept
+assert test "$(nft -j list chain inet "$FW_TABLE" input | jq -r '.nftables[].chain?.policy // empty')" = accept
+_fw_set_policy drop
+_fw_element add cn_ports 24073
+_fw_rebuild </dev/null
+assert test "$(quota_get_port_bytes 24073)" = "$before"
+assert _fw_has_element cn_ports 24073
+assert _fw_has_element tcping_ports 24076
+assert nft list set inet "$FW_TABLE" sk_24074_4
+assert nft list table inet unrelated_test
+_fw_element delete cn_ports 24073
+ssh_handle=$(nft -j list chain inet "$FW_TABLE" input | jq -r '.nftables[].rule? |
+    select(any(.expr[]?; .match.right? == "@ssh_ports") and any(.expr[]?; has("accept"))) | .handle' | tail -1)
+if _fw_delete_rule input "$ssh_handle"; then echo 'SSH rule was deleted'; exit 1; fi
+if _fw_remove_port 22; then echo 'SSH port was cleared'; exit 1; fi
+nft add rule inet "$FW_TABLE" input tcp dport 24080 counter accept
+handle=$(nft -j list chain inet "$FW_TABLE" input | jq -r '[.nftables[].rule? | select(.!=null)]|last|.handle')
+_fw_delete_rule input "$handle"
+if nft -j list chain inet "$FW_TABLE" input | jq -e --argjson h "$handle" '.nftables[].rule? | select(.handle==$h)' >/dev/null; then exit 1; fi
+
 # A separate Fail2Ban-like native table can still reject an open service.
 nft add chain inet unrelated_test ban '{ type filter hook input priority -1; policy accept; }'
 nft add rule inet unrelated_test ban ip saddr 192.0.2.2 udp dport 24073 drop
@@ -212,6 +235,9 @@ _quota_commit_port 24073 "$(date +%Y-%m)"
 quota_pause_port 24073 manual
 _fw_test_mode
 assert _fw_has_element test_tcp 5201
+assert test -n "$(_fw_test_deadline)"
+status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+[[ $status == *'5201/TCP+UDP[测试]'* && $status == *'24076/TCP[TCPing]'* ]] || exit 1
 assert test "$(quota_get_port_bytes 24073)" = "$resumed_bytes 0"
 # Simulate lost kernel rules/reboot; persisted ACL and paused state survive,
 # temporary ports stay closed, baseline resets without losing accrued traffic.
@@ -235,6 +261,12 @@ read -r _ _ _ total_in _ paused _ < <(_quota_read_data 24073)
 assert test "$total_in" = "$resumed_bytes"
 assert test "$paused" = 1
 assert nft list table inet unrelated_test
+_fw_element add tcping_ports 24073
+_fw_element add cn_ports 24073
+_fw_remove_port 24073
+if _fw_has_element tcp_ports 24073 || _fw_has_element tcping_ports 24073 || _fw_has_element cn_ports 24073; then
+    echo 'Port cleanup missed a dedicated set' >&2; exit 1
+fi
 _state_locked _quota_forget 24073
 if _fw_has_element paused_ports 24073 || nft list counter inet "$FW_TABLE" q24073_in >/dev/null 2>&1 ||
     grep -q '^24073|' "$QUOTA_CONFIG" "$QUOTA_DATA"; then

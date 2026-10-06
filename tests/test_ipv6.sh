@@ -10,8 +10,9 @@ source <(sed -e '/^main "\$@"$/d' \
     -e "s|/etc/network/interfaces|$test_dir/etc/network/interfaces|g" \
     -e "s|/etc/sysctl|$test_dir/etc/sysctl|g" "$repo_dir/vps-mgr.sh")
 log_message() { :; }
+_exim_ipv6_compat() { :; } # Exim compatibility has its own isolated regression check.
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
-for caller in _minimal_setup _do_full_init toggle_ipv6; do
+for caller in _do_full_init toggle_ipv6; do
     [[ $(declare -f "$caller" | grep -c '_write_disable_ipv6_conf') == 1 ]] || exit 1
 done
 if [[ ${1:-} == --netns ]]; then

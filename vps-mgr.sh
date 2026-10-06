@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.3"
+readonly SCRIPT_VERSION="2.0.0-beta.4"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -795,7 +795,7 @@ _valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); 
 
 _fw_require() {
     command -v nft >/dev/null && command -v jq >/dev/null || {
-        msg_error "请先安装 nftables 和 jq（菜单：仅安装代理依赖）"; return 1;
+        msg_error "请先安装 nftables 和 jq（菜单 1 一键初始化）"; return 1;
     }
     nft list tables >/dev/null 2>&1 || {
         msg_error "无法访问 nftables：检查内核支持和容器 CAP_NET_ADMIN 权限"; return 1;
@@ -932,50 +932,54 @@ table inet $FW_TABLE {
     chain quota_out {}
     chain input {
         type filter hook input priority filter; policy drop;
-        iifname "lo" accept
-        ct state invalid drop
-        tcp dport @ssh_ports ip saddr @ssh_allow4 accept
-        tcp dport @ssh_ports ip6 saddr @ssh_allow6 accept
-        ip saddr @block4 drop
-        ip6 saddr @block6 drop
-        meta l4proto { tcp, udp } th dport @paused_ports drop
-        meta l4proto { tcp, udp } th dport @cn_ports ip saddr @cn4 drop
-        meta l4proto { tcp, udp } th dport @cn_ports ip6 saddr @cn6 drop
-        jump socks_acl
-        jump quota_in
-        tcp dport 5201 tcp dport != @test_tcp tcp dport != @tcp_ports drop
-        udp dport 5201 udp dport != @test_udp udp dport != @udp_ports drop
-        ct state established,related accept
-        tcp dport @ssh_ports ct state new meter ssh_rate4 { ip saddr timeout 1m limit rate over 15/minute burst 15 packets } drop
-        tcp dport @ssh_ports ct state new meter ssh_rate6 { ip6 saddr timeout 1m limit rate over 15/minute burst 15 packets } drop
-        tcp dport @ssh_ports accept
-        tcp dport @tcping_ports ct state new meter tcping4 { ip saddr ct count over 3 } drop
-        tcp dport @tcping_ports ct state new meter tcping6 { ip6 saddr ct count over 3 } drop
-        tcp dport @tcping_ports accept
-        tcp dport @tcp_ports accept
-        udp dport @udp_ports accept
-        tcp dport @test_tcp accept
-        udp dport @test_udp accept
-        meta nfproto @test_ping meta l4proto { icmp, ipv6-icmp } accept
-        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
-        ip protocol icmp icmp type echo-request limit rate 1/second burst 3 packets accept
-        meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
-        meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 1/second burst 3 packets accept
-        udp sport 67 udp dport 68 accept
-        ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
-        ip saddr @allow4 accept
-        ip6 saddr @allow6 accept
-        limit rate 5/minute burst 10 packets log prefix "VPS-DROP: "
+        iifname "lo" counter accept
+        ct state invalid counter drop
+        tcp dport @ssh_ports ip saddr @ssh_allow4 counter accept
+        tcp dport @ssh_ports ip6 saddr @ssh_allow6 counter accept
+        ip saddr @block4 counter drop
+        ip6 saddr @block6 counter drop
+        meta l4proto { tcp, udp } th dport @paused_ports counter drop
+        meta l4proto { tcp, udp } th dport @cn_ports ip saddr @cn4 counter drop
+        meta l4proto { tcp, udp } th dport @cn_ports ip6 saddr @cn6 counter drop
+        counter jump socks_acl
+        counter jump quota_in
+        tcp dport 5201 tcp dport != @test_tcp tcp dport != @tcp_ports counter drop
+        udp dport 5201 udp dport != @test_udp udp dport != @udp_ports counter drop
+        ct state established,related counter accept
+        tcp dport @ssh_ports ct state new meter ssh_rate4 { ip saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
+        tcp dport @ssh_ports ct state new meter ssh_rate6 { ip6 saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
+        tcp dport @ssh_ports counter accept
+        tcp dport @tcping_ports ct state new meter tcping4 { ip saddr ct count over 3 } counter drop
+        tcp dport @tcping_ports ct state new meter tcping6 { ip6 saddr ct count over 3 } counter drop
+        tcp dport @tcping_ports counter accept
+        tcp dport @tcp_ports counter accept
+        udp dport @udp_ports counter accept
+        tcp dport @test_tcp counter accept
+        udp dport @test_udp counter accept
+        meta nfproto @test_ping meta l4proto { icmp, ipv6-icmp } counter accept
+        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } counter accept
+        ip protocol icmp icmp type echo-request limit rate 1/second burst 3 packets counter accept
+        meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } counter accept
+        meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 1/second burst 3 packets counter accept
+        udp sport 67 udp dport 68 counter accept
+        ip6 saddr fe80::/10 udp sport 547 udp dport 546 counter accept
+        ip saddr @allow4 counter accept
+        ip6 saddr @allow6 counter accept
+        limit rate 5/minute burst 10 packets counter log prefix "VPS-DROP: " comment "default-drop-log"
+    }
+    chain ssh_brute {
+        limit rate 5/minute burst 10 packets counter log prefix "SSH-BRUTE: "
+        counter drop
     }
     chain output {
         type filter hook output priority filter; policy accept;
-        oifname "lo" accept
-        meta l4proto { tcp, udp } th sport @paused_ports drop
-        jump quota_out
+        oifname "lo" counter accept
+        meta l4proto { tcp, udp } th sport @paused_ports counter drop
+        counter jump quota_out
     }
     chain forward {
         type filter hook forward priority filter; policy drop;
-        ct state established,related accept
+        ct state established,related counter accept
     }
 }
 EOF
@@ -1038,18 +1042,18 @@ _fw_rollback_locked() {
 }
 
 _fw_show_status() {
-    local fw_json policy rules ssh tcp udp paused color
+    local fw_json policy rules ssh paused color port ssh_color=$C_GREEN cn
     if ! command -v nft >/dev/null; then
         printf '   nftables 未安装（菜单 1 初始化）\n'
     elif ! nft list tables >/dev/null 2>&1; then
         printf '   nftables 无法读取：检查 root / CAP_NET_ADMIN / 内核支持\n'
     elif fw_json=$(nft -j list table inet "$FW_TABLE" 2>/dev/null); then
-        read -r policy rules ssh tcp udp paused < <(jq -r '
+        read -r policy rules ssh paused < <(jq -r '
             def ports($name): [.nftables[].set? | select(.name==$name) | .elem[]? | tostring] |
                 if length == 0 then "-" else join(",") end;
             [([.nftables[].chain? | select(.name=="input") | .policy][0] // "unknown" | ascii_upcase),
              ([.nftables[].rule? | select(. != null)] | length),
-             ports("ssh_ports"), ports("tcp_ports"), ports("udp_ports"), ports("paused_ports")] | @tsv
+             ports("ssh_ports"), ports("paused_ports")] | @tsv
         ' <<< "$fw_json")
         color=$C_GREEN; [[ $policy == DROP ]] || color=$C_RED
         printf '   %b防火墙%b  nftables %b运行中%b   策略 %b%s%b   规则 %s条\n' \
@@ -1061,16 +1065,49 @@ _fw_show_status() {
         else
             printf '   %b仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）%b\n' "$C_YELLOW" "$C_RESET"
         fi
-        printf '   %b端  口%b  SSH %b%s%b' "$C_BLUE" "$C_RESET" "$C_CYAN" "$ssh" "$C_RESET"
-        [[ $tcp == - ]] || printf '   TCP %b%s%b' "$C_CYAN" "$tcp" "$C_RESET"
-        [[ $udp == - ]] || printf '   UDP %b%s%b' "$C_CYAN" "$udp" "$C_RESET"
-        printf '\n'
+        while read -r port; do
+            [[ -n $port && ,$ssh, == *,"$port",* ]] || ssh_color=$C_RED
+        done < <(get_current_ssh_port | tr ',' '\n')
+        [[ $policy != ACCEPT ]] || ssh_color=$C_GREEN
+        printf '   %bSSH%b      %b●%b %b%s%b（本机放行端口）\n' "$C_BLUE" "$C_RESET" "$ssh_color" "$C_RESET" "$C_CYAN" "$ssh" "$C_RESET"
+        _fw_port_summary "$fw_json"
         [[ $paused == - ]] || printf '   %b已暂停%b  %s\n' "$C_YELLOW" "$C_RESET" "$paused"
+        cn=$(jq -r '[.nftables[].set? | select(.name=="cn_ports") | .elem[]? | tostring] | join(",")' <<< "$fw_json")
+        if [[ -n $cn ]]; then
+            printf '   %b防护%b     CN 屏蔽 %b已开启 [%s]%b' "$C_BLUE" "$C_RESET" "$C_GREEN" "$cn" "$C_RESET"
+        else
+            printf '   %b防护%b     CN 屏蔽 %b已关闭%b' "$C_BLUE" "$C_RESET" "$C_DIM" "$C_RESET"
+        fi
+        printf '   域名 ACL %b\n' "$(_sbx_acl_status)"
     elif [[ -s "$FW_CONF" ]]; then
         printf '   已有保存配置，但规则未加载（菜单 5 → 1 恢复，不必重跑整套初始化）\n'
     else
         printf '   nftables 尚未初始化（菜单 1 或菜单 5 → 1）\n'
     fi
+    return 0
+}
+
+_fw_port_summary() {
+    local token width=${COLUMNS:-80} used=11 first=1
+    [[ $width =~ ^[0-9]+$ ]] || width=80
+    (( width >= 48 )) || width=48
+    (( width <= 120 )) || width=120
+    while IFS= read -r token; do
+        if (( first )); then printf '   %b端  口%b  ' "$C_BLUE" "$C_RESET"; first=0
+        elif (( used + ${#token} + 2 > width )); then printf '\n           '; used=11
+        else printf '  '; used=$((used + 2)); fi
+        printf '%b%s%b' "$C_CYAN" "$token" "$C_RESET"
+        used=$((used + ${#token}))
+    done < <(jq -r '
+        [.nftables[].set? | select(.name == "tcp_ports" or .name == "udp_ports" or
+            .name == "tcping_ports" or .name == "test_tcp" or .name == "test_udp") |
+            .name as $s | .elem[]? | {port:(if type=="object" then .elem.val else . end),
+            proto:(if $s=="udp_ports" or $s=="test_udp" then "UDP" else "TCP" end),
+            note:(if $s=="tcping_ports" then "TCPing" elif ($s|startswith("test_")) then "测试" else "" end)}] |
+        sort_by(.port) | group_by(.port)[] |
+        "\(.[0].port)/\([.[].proto]|unique|join("+"))" +
+        ([.[].note|select(.!="")]|unique|if length>0 then "["+join("+")+"]" else "" end)' <<< "$1")
+    (( first )) || printf '\n'
     return 0
 }
 
@@ -1085,9 +1122,121 @@ _fw_test_mode() {
             printf 'add element inet %s test_udp { 5201 timeout 2h }\n' "$FW_TABLE"
             printf 'add element inet %s test_ping { ipv4 timeout 2h, ipv6 timeout 2h }\n' "$FW_TABLE"
         fi
-    } | _fw_apply
+    } | _fw_apply || return 1
+    if [[ $state == 0 ]]; then
+        msg_success "测试模式已开启，2 小时后自动关闭（$(_fw_test_deadline)）"
+        printf '  Ping：临时放行；iperf3：TCP/UDP 5201\n  本机：iperf3 -s\n  对端：iperf3 -c %s -p 5201 -P 1 -t 20 -R\n' "$SERVER_IP"
+        msg_info "iperf3 须手动启动；再次按 4 可提前关闭。NAT 机器还需供应商映射 5201"
+    else
+        msg_success "测试模式已关闭；普通业务端口和其他规则不变"
+    fi
 }
 
+_fw_test_deadline() {
+    local seconds
+    seconds=$(nft -j list set inet "$FW_TABLE" test_tcp 2>/dev/null |
+        jq -r '[.nftables[].set?.elem[]? | .elem.expires? // 0] | max // 0') || return 1
+    [[ $seconds =~ ^[0-9]+$ ]] && (( seconds > 0 )) || return 1
+    TZ="$TZ_DEFAULT" date -d "+$seconds seconds" '+%H:%M:%S %Z'
+}
+
+# 重建本脚本基础链，保留业务集合、ACL/配额链和计数器，不接管其他表。
+_fw_rebuild() { _state_locked _fw_rebuild_locked; }
+_fw_rebuild_locked() {
+    _fw_restore || return 1
+    local ports chain
+    ports=$(get_current_ssh_port)
+    [[ -n $ports ]] || { msg_error "无法确认 SSH 端口，未重建"; return 1; }
+    {
+        for chain in input output forward ssh_brute; do
+            if nft list chain inet "$FW_TABLE" "$chain" >/dev/null 2>&1; then
+                printf 'flush chain inet %s %s\n' "$FW_TABLE" "$chain"
+            fi
+        done
+        _fw_base_rules "$ports"
+    } | _fw_apply || return 1
+    msg_success "基础策略已重建为安全模式；业务端口、黑白名单、ACL、配额与其他表均保留"
+}
+
+_fw_set_policy() { _state_locked _fw_set_policy_locked "$@"; }
+_fw_set_policy_locked() {
+    local policy=$1 handles handle
+    [[ $policy == drop || $policy == accept ]] || return 1
+    _fw_restore || return 1
+    handles=$(nft -j list chain inet "$FW_TABLE" input |
+        jq -r '.nftables[].rule? | select(.comment == "default-drop-log") | .handle') || return 1
+    {
+        printf 'add chain inet %s input { policy %s; }\nadd chain inet %s forward { policy %s; }\n' "$FW_TABLE" "$policy" "$FW_TABLE" "$policy"
+        for handle in $handles; do
+            printf 'delete rule inet %s input handle %s\n' "$FW_TABLE" "$handle"
+        done
+        if [[ $policy == drop ]]; then
+            printf 'add rule inet %s input limit rate 5/minute burst 10 packets counter log prefix "VPS-DROP: " comment "default-drop-log"\n' "$FW_TABLE"
+        fi
+    } | _fw_apply || return 1
+    msg_success "默认策略已设为 ${policy^^}；显式封禁、配额和 ACL 仍然有效，其他表未改动"
+}
+
+_fw_delete_rule() { _state_locked _fw_delete_rule_locked "$@"; }
+_fw_delete_rule_locked() {
+    local chain=$1 handle=$2 rule
+    [[ $chain =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ && $handle =~ ^[0-9]{1,10}$ ]] || return 1
+    _fw_restore || return 1
+    rule=$(nft -j list chain inet "$FW_TABLE" "$chain" |
+        jq -ce --argjson h "$handle" '.nftables[].rule? | select(.handle == $h)') || return 1
+    if [[ $chain == input ]] && jq -e '
+        any(.expr[]; has("accept")) and
+        any(.expr[]; .match.right? == "@ssh_ports" or .match.left.ct.key? == "state" or .match.left.meta.key? == "iifname")
+        ' <<< "$rule" >/dev/null; then
+        msg_error "此规则保护 SSH/已建立连接/回环，不能直接删除；SSH 放行端口请用专用菜单管理"; return 1
+    fi
+    printf 'delete rule inet %s %s handle %s\n' "$FW_TABLE" "$chain" "$handle" | _fw_apply
+}
+
+_fw_remove_port() { _state_locked _fw_remove_port_locked "$@"; }
+_fw_remove_port_locked() {
+    local port=$1 set chain handle rules
+    _valid_port "$port" || return 1
+    port=$((10#$port))
+    if [[ ,$(get_current_ssh_port), == *,"$port",* ]]; then
+        msg_error "不能清理正在使用的 SSH 端口 $port"; return 1
+    fi
+    _fw_restore || return 1
+    # 先撤回所有放行，再清理 ACL/配额，避免删除防护后仍保留普通放行。
+    {
+        for set in tcp_ports udp_ports ssh_ports tcping_ports test_tcp test_udp cn_ports; do
+            if _fw_has_element "$set" "$port"; then
+                printf 'delete element inet %s %s { %s }\n' "$FW_TABLE" "$set" "$port"
+            fi
+        done
+    } | _fw_apply || return 1
+    _sbx_socks_fw_clear "$port" && _quota_forget "$port" || return 1
+    rules=$(nft -j list table inet "$FW_TABLE") || return 1
+    # ponytail: 批量只删精确单端口匹配，多端口/范围规则用 handle 避免误删其他端口。
+    while read -r chain handle; do
+        printf 'delete rule inet %s %s handle %s\n' "$FW_TABLE" "$chain" "$handle"
+    done < <(jq -r --argjson p "$port" '.nftables[].rule? | select(. != null) |
+        select(any(.expr[]; .match.op? == "==" and
+            (.match.left.payload.field? == "dport" or .match.left.payload.field? == "sport") and .match.right? == $p)) |
+        [.chain,.handle] | @tsv' <<< "$rules") | _fw_apply || return 1
+    msg_success "端口 $port 的放行、专用集合、ACL 和配额已清理；代理程序未卸载"
+    msg_warn "范围/多端口规则未拆分，请按 handle 检查；重新配置代理可能重新生成规则"
+}
+
+_fw_manage_ssh_port() {
+    local action port
+    printf '自动检测本机 SSH 端口：%s\n' "$(get_current_ssh_port)"
+    nft list set inet "$FW_TABLE" ssh_ports || return 1
+    read -rp '操作 add/delete [add]：' action; action=${action:-add}
+    [[ $action == add || $action == delete ]] || return 1
+    read -rp '防火墙 SSH 放行端口（不修改 sshd；不是 NAT 外部端口）：' port
+    _valid_port "$port" || return 1
+    port=$((10#$port))
+    if [[ $action == delete && ,$(get_current_ssh_port), == *,"$port",* ]]; then
+        msg_error "不能删除正在使用的 SSH 端口"; return 1
+    fi
+    _fw_element "$action" ssh_ports "$port"
+}
 
 # ==============================================================================
 # 共享工具函数 (供多个核心功能复用)
@@ -1124,6 +1273,55 @@ _ipv6_ifaces_on() {
     done
 }
 
+# 用 Exim4 原生主选项关闭 IPv6 监听；不卸载邮件程序，不删除邮件或自定义配置。
+_exim_ipv6_compat() {
+    local mode=${1:-disable} file split active=0 changed=0 backup
+    local single=/etc/exim4/exim4.conf.localmacros multi=/etc/exim4/conf.d/main/00_vps_mgr_ipv4
+    [[ -f /etc/exim4/update-exim4.conf.conf ]] && command -v update-exim4.conf >/dev/null || return 0
+    [[ $mode == disable || $mode == enable ]] || return 1
+    split=$(_tg_cfg_get /etc/exim4/update-exim4.conf.conf dc_use_split_config)
+    file=$single; [[ $split == true ]] && file=$multi
+    if [[ $mode == disable ]] && [[ -f $file ]] && grep -qE '^[[:space:]]*disable_ipv6[[:space:]]*=' "$file" &&
+        ! grep -q '^# VPS-MGR IPv4 BEGIN$' "$file"; then
+        [[ $(exim4 -bP disable_ipv6 2>/dev/null) == disable_ipv6 ]] && return 0
+        msg_warn "Exim4 已有自定义 disable_ipv6，但当前未关闭 IPv6；保留原设置，请手动检查"; return 1
+    fi
+    backup=$(mktemp -d) || return 1
+    for file in "$single" "$multi"; do
+        if [[ -f $file ]]; then cp -p "$file" "$backup/${file##*/}" || { rm -rf "$backup"; return 1; }; fi
+    done
+    if [[ $mode == enable ]]; then
+        for file in "$single" "$multi"; do
+            if [[ -f $file ]] && grep -q '^# VPS-MGR IPv4 BEGIN$' "$file"; then
+                sed -i '/^# VPS-MGR IPv4 BEGIN$/,/^# VPS-MGR IPv4 END$/d' "$file" || { rm -rf "$backup"; return 1; }
+                grep -q '[^[:space:]]' "$file" || rm -f "$file"
+                changed=1
+            fi
+        done
+    else
+        file=$single; [[ $split == true ]] && file=$multi
+        if ! grep -q '^# VPS-MGR IPv4 BEGIN$' "$file" 2>/dev/null; then
+            printf '\n# VPS-MGR IPv4 BEGIN\ndisable_ipv6 = true\n# VPS-MGR IPv4 END\n' >> "$file" || { rm -rf "$backup"; return 1; }
+            changed=1
+        fi
+    fi
+    if (( changed == 0 )); then rm -rf "$backup"; return 0; fi
+    systemctl is-active --quiet exim4 && active=1
+    if update-exim4.conf && exim4 -bV >/dev/null 2>&1 &&
+        { if (( active )) || systemctl is-failed --quiet exim4; then systemctl restart exim4; else true; fi; }; then
+        rm -rf "$backup"
+        msg_success "Exim4 IPv6 兼容配置已更新（保留邮件服务）"
+    else
+        for file in "$single" "$multi"; do
+            if [[ -f $backup/${file##*/} ]]; then cp -p "$backup/${file##*/}" "$file"; else rm -f "$file"; fi
+        done
+        update-exim4.conf || true
+        (( active == 0 )) || systemctl restart exim4 || true
+        rm -rf "$backup"
+        msg_error "Exim4 校验/重启失败，邮件配置已还原，请检查 journalctl -u exim4"; return 1
+    fi
+}
+
 _write_disable_ipv6_conf() {
     if [[ ${SSH_CONNECTION:-} == *:* ]]; then
         msg_error "当前 SSH 使用 IPv6，未禁用；请通过 IPv4 SSH 或控制台操作"
@@ -1144,6 +1342,7 @@ IPVCEOF
         sed -i '/net\.ipv6\.conf\.\(all\|default\|lo\)\.disable_ipv6/d' /etc/sysctl.conf || return 1
     fi
     msg_success "IPv6 已禁用并保存，重启后保持关闭；测试时可在菜单 6 → 3 开启"
+    _exim_ipv6_compat || msg_warn "IPv6 已关闭，但 Exim4 兼容处理未完成"
 }
 
 # Swap 检测与自动创建（未启用时按磁盘剩余空间动态分配）
@@ -1567,6 +1766,7 @@ toggle_ipv6() {
         for i in /proc/sys/net/ipv6/conf/*/disable_ipv6; do 
             echo 0 > "$i" 2>/dev/null
         done
+        _exim_ipv6_compat enable || msg_warn "IPv6 已开启，但 Exim4 配置恢复未完成"
         
         # 4. 尝试获取地址：优先静态配置，fallback DHCPv6
         local ifaces
@@ -1652,32 +1852,43 @@ toggle_ipv6() {
 # 查找从 start_port 开始的第一个未占用端口
 # 仅依据 ss 实际监听状态判断，不受防火墙规则影响
 find_available_port() {
-    local start_port=${1:-9999}
-    local port=$start_port
-    while [ "$port" -le 65535 ]; do
-        if ! ss -tuln 2>/dev/null | grep -qE ":${port}[^0-9]"; then
-            echo "$port"
-            return 0
-        fi
-        port=$((port + 1))
-    done
-    echo "0"
-    return 1
+    _valid_port "${1:-9999}" || return 1
+    ss -H -ltun | awk -v start="$((10#${1:-9999}))" '
+        { n=split($5,a,":"); used[a[n]+0]=1 }
+        END { for(p=start;p<=65535;p++) if(!used[p]) {print p; exit} exit 1 }'
 }
 
 # 静默启用 TCPing 监控（用于一键初始化，不询问用户）
 _tcping_setup_silent() {
     _fw_ensure || return 1
-    local monitor_port=${1:-9999}
+    local monitor_port=${1:-} old_port active=0 enabled=0 backup rc=0 recovered=1
+    old_port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
+    systemctl is-active --quiet "$TCPING_SERVICE_NAME" && active=1
+    systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" && enabled=1
+    if [[ -z $monitor_port ]] && _valid_port "$old_port" && (( active )); then
+        printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
+            "$FW_TABLE" "$FW_TABLE" "$old_port" | _fw_apply || return 1
+        msg_info "TCPing 已运行，保留端口 $old_port（跳过重装）"
+        _tcping_target "$old_port"
+        return 0
+    fi
+    [[ -n $monitor_port ]] || monitor_port=$(find_available_port 9999) || {
+        msg_error "找不到空闲 TCPing 端口"; return 1;
+    }
     _valid_port "$monitor_port" || return 1
-    if ss -H -ltn "sport = :$monitor_port" | grep -q . &&
-        ! systemctl is-active --quiet "$TCPING_SERVICE_NAME"; then
-        msg_error "端口已占用"; return 1
+    monitor_port=$((10#$monitor_port))
+    if [[ $monitor_port != "$old_port" || $active == 0 ]] &&
+        ss -H -ltun "sport = :$monitor_port" | grep -q .; then
+        msg_error "端口 $monitor_port 已占用，保留原 TCPing 配置"; return 1
     fi
     command -v socat >/dev/null || apt-get install -y -qq socat || return 1
     id tcping >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tcping || return 1
-    printf 'PORT=%s\n' "$monitor_port" > "$TCPING_CONFIG_FILE"
-    cat > "/etc/systemd/system/$TCPING_SERVICE_NAME.service" <<EOF
+    backup=$(mktemp -d) || return 1
+    local unit="/etc/systemd/system/$TCPING_SERVICE_NAME.service"
+    if [[ -f $unit ]]; then cp -p "$unit" "$backup/unit" || { rmdir "$backup"; return 1; }; fi
+    if [[ -f $TCPING_CONFIG_FILE ]]; then cp -p "$TCPING_CONFIG_FILE" "$backup/config" || { rm -rf "$backup"; return 1; }; fi
+    printf 'PORT=%s\n' "$monitor_port" > "$TCPING_CONFIG_FILE" || rc=1
+    cat > "/etc/systemd/system/$TCPING_SERVICE_NAME.service" <<EOF || rc=1
 [Unit]
 Description=TCPing Monitor
 After=network.target $FW_SERVICE.service
@@ -1685,25 +1896,57 @@ Requires=$FW_SERVICE.service
 [Service]
 User=tcping
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=/usr/bin/socat TCP4-LISTEN:$monitor_port,reuseaddr,fork,max-children=100 EXEC:/bin/true
 Restart=on-failure
 RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload &&
+    if (( rc == 0 )) && systemctl daemon-reload &&
         systemctl enable "$TCPING_SERVICE_NAME" &&
-        systemctl restart "$TCPING_SERVICE_NAME" || return 1
-    printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
-        "$FW_TABLE" "$FW_TABLE" "$monitor_port" | _fw_apply
+        systemctl restart "$TCPING_SERVICE_NAME" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" &&
+        printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
+            "$FW_TABLE" "$FW_TABLE" "$monitor_port" | _fw_apply; then
+        rm -rf "$backup"
+        msg_success "TCPing 已启用：端口 $monitor_port"
+        _tcping_target "$monitor_port"
+    else
+        systemctl stop "$TCPING_SERVICE_NAME" || recovered=0
+        (( enabled )) || systemctl disable "$TCPING_SERVICE_NAME" || recovered=0
+        if [[ -f $backup/unit ]]; then cp -p "$backup/unit" "$unit" || recovered=0; else rm -f "$unit" || recovered=0; fi
+        if [[ -f $backup/config ]]; then cp -p "$backup/config" "$TCPING_CONFIG_FILE" || recovered=0; else rm -f "$TCPING_CONFIG_FILE" || recovered=0; fi
+        systemctl daemon-reload || recovered=0
+        (( active == 0 )) || systemctl restart "$TCPING_SERVICE_NAME" || recovered=0
+        if (( recovered )); then
+            rm -rf "$backup"
+            msg_error "TCPing 配置失败，已撤回本次更改"
+        else
+            msg_error "TCPing 配置失败且恢复未完成，原配置备份保留在 $backup"
+        fi
+        return 1
+    fi
+}
+
+_tcping_target() {
+    printf '  哪吒 TCPing 目标：%s:%s（可复制到 Dashboard）\n' "$SERVER_IP" "$1"
+    msg_info "NAT 机器需使用供应商分配的外部映射端口；本机放行不会新增公网端口"
 }
 
 do_tcping_monitor() {
     local choice port
-    printf '\n=== TCPing ===\n1. 安装/更换端口\n2. 停止并卸载\n3. 查看状态\n0. 返回\n'
+    printf '\n=== TCPing 监控（供哪吒探测，不是哪吒 Agent）===\n'
+    port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
+    if systemctl is-active --quiet "$TCPING_SERVICE_NAME"; then
+        printf '状态：运行中\n'; _tcping_target "$port"
+    else printf '状态：未运行\n'; fi
+    printf '\n1. 自动安装（从 9999 选择空闲端口；运行中保留原端口）\n2. 停止并卸载\n3. 查看状态\n4. 手动指定端口\n0. 返回\n'
     read -rp '选择: ' choice
     case "$choice" in
-        1) read -rp '监听端口（必须有外部映射；不建议两端口容器占用专用监控端口）: ' port
+        1) _tcping_setup_silent ;;
+        4) read -rp '本机监听端口（NAT 须与供应商的映射对应）: ' port
+           _valid_port "$port" || { msg_error "无效端口"; return 1; }
            _tcping_setup_silent "$port" ;;
         2) systemctl disable --now "$TCPING_SERVICE_NAME" || return 1
            printf 'flush set inet %s tcping_ports\n' "$FW_TABLE" | _fw_apply || return 1
@@ -1856,11 +2099,18 @@ do_check_all() {
     local _def_if_ck _qdisc_info
     _def_if_ck=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
     if [ -n "$_def_if_ck" ] && command -v tc >/dev/null 2>&1; then
-        _qdisc_info=$(tc qdisc show dev "$_def_if_ck" 2>/dev/null | head -1 || true)
-        if echo "$_qdisc_info" | grep -q "fq "; then
+        _qdisc_info=$(tc qdisc show dev "$_def_if_ck" 2>/dev/null || true)
+        if echo "$_qdisc_info" | grep -q '^qdisc fq '; then
             local _mr
-            _mr=$(echo "$_qdisc_info" | grep -oP 'maxrate \K[^ ]+' || echo "?")
-            _ck_pass "qdisc fq 已生效 → ${_def_if_ck}  maxrate=${_mr}"
+            _mr=$(echo "$_qdisc_info" | grep '^qdisc fq ' | grep -oP 'maxrate \K[^ ]+' | sort -u | paste -sd, - || true)
+            if tc -j qdisc show dev "$_def_if_ck" | jq -e '
+                [.[] | select(.kind != "ingress" and .kind != "clsact")] |
+                any(.kind == "fq") and all(.kind == "mq" or
+                    (.kind == "fq" and .options.flow_limit == 250 and (.options.maxrate // 0) > 0))' >/dev/null; then
+                _ck_pass "qdisc fq 已生效（含多队列叶子）→ ${_def_if_ck}  maxrate=${_mr}"
+            else
+                _ck_warn "已有 fq，但部分队列或 maxrate/flow_limit 未完整配置（菜单 6 → 2）"
+            fi
         else
             _ck_warn "qdisc 未使用 fq（当前: ${_qdisc_info:-未知}），BBR 重传优化可能未生效"
         fi
@@ -2092,42 +2342,40 @@ _effective_mem_mb() {
     printf '%s\n' "$((bytes / 1048576))"
 }
 
-_minimal_setup() {
-    check_system || return 1
-    check_package_manager_lock || return 1
-    apt-get update -qq &&
-        apt-get install -y --no-install-recommends nftables jq curl ca-certificates openssl \
-            python3 iproute2 procps util-linux tar unzip logrotate || return 1
-    setup_log_rotation || return 1
-    _write_disable_ipv6_conf || return 1
-    do_init_firewall || return 1
-    msg_success "容器初始化完成；防火墙已保存并启用开机恢复，无需重启"
-    msg_info "代理任选：菜单 7 Snell · 8 Realm · 9 SS/SS2022、SOCKS5、Hysteria2"
-}
-
-do_quick_init() {
-    if _is_container; then
-        msg_info "检测到共享内核容器，自动跳过换内核及宿主网络调优；代理功能不受限制"
-        _minimal_setup
-    else
-        _do_full_init
-    fi
-}
+do_quick_init() { _do_full_init; }
 
 _apply_fq() {
-    local iface=$1 rate=$2 kind
+    local iface=$1 rate=$2 kind data root parent child
     [[ -n $iface && $rate =~ ^[0-9]+$ ]] && ((rate > 0)) || return 1
     _is_container && { msg_warn "容器不自动调整 qdisc"; return 1; }
-    kind=$(tc -j qdisc show dev "$iface" | jq -r '.[] | select(.root == true) | .kind') || return 1
+    data=$(tc -j qdisc show dev "$iface") || return 1
+    kind=$(jq -r '.[] | select(.root == true) | .kind' <<< "$data") || return 1
     case "$kind" in
         fq) tc qdisc change dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
-        ""|noqueue) tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
+        ""|noqueue|fq_codel) tc qdisc replace dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
+        mq)
+            root=$(jq -r '.[] | select(.root == true) | .handle' <<< "$data")
+            # 保留多队列根，只调整其直接叶子；先检查全部叶子，避免碰到自定义调度时只改一半。
+            jq -e --arg root "$root" '
+                [.[] | select(.parent? | strings | startswith($root))] |
+                length > 0 and all(.kind == "fq" or .kind == "fq_codel")' <<< "$data" >/dev/null || {
+                msg_warn "mq 含自定义/未知叶子队列，未修改；请手动检查 tc qdisc"; return 1;
+            }
+            while read -r parent child; do
+                if [[ $child == fq ]]; then
+                    tc qdisc change dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
+                else
+                    tc qdisc replace dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
+                fi
+            done < <(jq -r --arg root "$root" '.[] | select(.parent? | strings | startswith($root)) | [.parent,.kind] | @tsv' <<< "$data") ;;
         *) msg_warn "保留已有 qdisc=$kind；未替换"; return 1 ;;
     esac
 }
 
 _persist_fq() {
     local script; script=$(realpath "$0")
+    [[ $script != *$'\n'* && $script != *'"'* && $script != *'%'* ]] || return 1
+    [[ $1 =~ ^[0-9]+$ ]] && (( $1 > 0 )) || return 1
     cat > /etc/systemd/system/vps-mgr-fq.service <<EOF
 [Unit]
 Description=VPS Manager fq tuning
@@ -2139,6 +2387,13 @@ ExecStart=/bin/bash "$script" apply-fq "$1"
 [Install]
 WantedBy=multi-user.target
 EOF
+    # 开机和网络重新上线共用同一个 oneshot，不覆盖管理员的其他网络钩子。
+    local hook
+    for hook in /etc/network/if-up.d/vps-mgr-fq /etc/networkd-dispatcher/routable.d/vps-mgr-fq /etc/NetworkManager/dispatcher.d/90-vps-mgr-fq; do
+        [[ -d ${hook%/*} ]] || continue
+        printf '%s\n' '#!/bin/sh' 'case "${2:-up}" in up|dhcp4-change|connectivity-change) systemctl start --no-block vps-mgr-fq.service ;; esac' > "$hook" || return 1
+        chmod 755 "$hook" || return 1
+    done
     systemctl daemon-reload && systemctl enable vps-mgr-fq.service
 }
 
@@ -2183,12 +2438,17 @@ do_system_update() {
 }
 
 _do_full_init() {
-    if _is_container; then msg_warn "容器仅执行轻量初始化；不修改内核、Swap 或宿主网络"; _minimal_setup; return; fi
     check_system || return 1
+    local _container=0 _ok_ipv6=0 _ok_tcping=0 _ok_update=0
+    _is_container && _container=1
     clear
     echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
     echo -e "  ${CYAN}关闭IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}nftables${NC} → ${CYAN}TG/Fail2Ban${NC}"
-    echo -e "  带宽须人工确认，安装内核后需重启以启用 BBR v3"
+    if (( _container )); then
+        msg_info "检测到共享内核容器：保留完整用户态功能，跳过换内核、Swap 和宿主网络调优"
+    else
+        echo -e "  带宽须人工确认，安装内核后仅在最后重启一次以启用 BBR v3"
+    fi
     echo
 
     local _ok_sys=0 _ok_net=0 _ok_fw=0 _ok_f2b=0 _ok_tg=0
@@ -2197,7 +2457,9 @@ _do_full_init() {
     local _init_srv_name=""
 
     echo -e "\n${L_BLUE}── [1/5] 默认关闭 IPv6 ─────────────────────────────────${NC}"
-    _write_disable_ipv6_conf || return 1
+    if _write_disable_ipv6_conf; then _ok_ipv6=1
+    elif (( _container )); then msg_warn "IPv6 未禁用（权限或 IPv6 SSH 限制），继续安装其他功能"
+    else return 1; fi
 
     # ── [2/5] 系统更新 & 依赖安装 ───────────────────────────
     echo -e "\n${L_BLUE}── [2/5] 系统更新 & 依赖安装 ──────────────────────────${NC}"
@@ -2267,6 +2529,9 @@ _do_full_init() {
             echo -e "  ${YELLOW}  建议手动: apt-get install -y ${_to_install[*]}${NC}"
         fi
     fi
+
+    # 某些镜像/依赖带来 Exim4；保留邮件配置，只处理关闭 IPv6 后的监听兼容性。
+    (( _ok_ipv6 == 0 )) || _exim_ipv6_compat || _step_ok=0
 
     # 依赖装完后获取服务器 IP 和地理信息并写缓存，后续启动直接读缓存无需 curl
     if command -v curl &>/dev/null; then
@@ -2360,7 +2625,9 @@ EOF
     echo -e "  ${GREEN}✓ 时区自动同步: systemd 每天 03:00（上海时区）${NC}"
 
     # NTP 时间同步
-    if timedatectl show 2>/dev/null | grep -q "NTPSynchronized=yes"; then
+    if (( _container )); then
+        msg_info "容器时间由宿主同步，保留时区设置，不修改共享系统时钟"
+    elif timedatectl show 2>/dev/null | grep -q "NTPSynchronized=yes"; then
         echo -e "  ${GREEN}✓ NTP 时间同步: 已同步${NC}"
     else
         if systemctl enable --now systemd-timesyncd >/dev/null 2>&1 && \
@@ -2380,7 +2647,9 @@ EOF
 
     # ── [3/5] XanMod 内核安装 (BBR v3) ──────────────────────
     echo -e "\n${L_BLUE}── [3/5] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
-    if [ "$(uname -m)" != "x86_64" ]; then
+    if (( _container )); then
+        msg_info "容器共用宿主内核，跳过 XanMod 安装"
+    elif [ "$(uname -m)" != "x86_64" ]; then
         echo -e "  ${YELLOW}⚠ 跳过（XanMod 仅支持 x86_64，当前架构: $(uname -m)）${NC}"
         local _arm_bv; _arm_bv=$(_get_bbr_version)
         if [ "$_arm_bv" = "v3" ]; then
@@ -2467,7 +2736,10 @@ EOF
     local phys_mem_mb
     phys_mem_mb=$(_effective_mem_mb)
 
-    # DNS
+    # DNS：挂载/只读的容器 DNS 由宿主管理，不覆盖它。
+    if (( _container )) && { mountpoint -q /etc/resolv.conf || [[ ! -w /etc/resolv.conf ]]; }; then
+        msg_info "容器 DNS 文件由宿主管理，保持现有配置"
+    else
     # 若 /etc/resolv.conf 是符号链接（systemd-resolved 系统），先删除再创建真实文件
     # 否则 chattr +i 对 tmpfs 目标静默失败，重启后 DNS 被 systemd-resolved 覆盖
     if [ -L /etc/resolv.conf ]; then
@@ -2484,10 +2756,15 @@ DNSEOF
         chattr +i /etc/resolv.conf 2>/dev/null || true
         echo -e "  ${GREEN}✓ DNS: 8.8.8.8 / 1.1.1.1 / 94.140.14.14 (已锁定)${NC}"
     fi
+    fi
 
     # Swap（幂等，已存在则跳过）
     _ensure_swap
 
+    if (( _container )); then
+        _ok_net=2
+        msg_info "容器保留宿主网络参数，不执行带宽/sysctl/qdisc 调优"
+    else
     # 带宽测速 + 端口速度（单一确认，同时用于 sysctl buffer 和 tc maxrate）
     printf "  测速中 (curl 8线程→Cloudflare)..."
     _measure_bandwidth 1000
@@ -2536,16 +2813,20 @@ DNSEOF
     sysctl --system >/dev/null 2>&1 || true
     sysctl -w net.ipv4.route.flush=1 >/dev/null 2>&1 || true
     _apply_conntrack_sysctl "$_P_CONNTRACK_MAX"
-    _apply_nofile_limits
-    _apply_journald_limits
-
-    _ok_net=1; _net_bw=$bw_mbps; _rmem_mb=$(( _P_RMEM_MAX / 1048576 ))
+    _net_bw=$bw_mbps; _rmem_mb=$(( _P_RMEM_MAX / 1048576 ))
     echo -e "  ${GREEN}✓ sysctl 写入完成  rmem: ${_rmem_mb}MB  CC: ${_cc}${NC}"
 
     local _def_if _fq_maxrate
     _def_if=$(ip route show default | awk '{print $5; exit}')
     _fq_maxrate=$(_fq_maxrate_mbps "$bw_mbps") || return 1
-    if _apply_fq "$_def_if" "$_fq_maxrate"; then _persist_fq "$_fq_maxrate" || return 1; fi
+    if _apply_fq "$_def_if" "$_fq_maxrate" && _persist_fq "$_fq_maxrate"; then
+        _ok_net=1
+    else
+        msg_warn "sysctl 已写入，但 fq 调优或持久化未完成；请检查后用菜单 6 → 2 重试"
+    fi
+    fi
+    _apply_nofile_limits
+    _apply_journald_limits
 
     # ── [5/5] 防火墙初始化 ──────────────────────────────────
     echo -e "\n${L_BLUE}── [5/5] 防火墙初始化 ──────────────────────────────────${NC}"
@@ -2572,19 +2853,25 @@ DNSEOF
 
     # Fail2Ban 规则配置
     echo -e "\n${L_BLUE}── [+] Fail2Ban ─────────────────────────────────────────${NC}"
-    if [[ -f /etc/fail2ban/jail.d/sshd.conf ]]; then
+    if [[ -f /etc/fail2ban/jail.d/sshd.conf ]] && fail2ban-client status sshd >/dev/null 2>&1; then
         echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
         _ok_f2b=1
     else
         _install_fail2ban && _ok_f2b=1 || true
     fi
 
-    # Dedicated TCPing ports and automatic script updates are opt-in from their menus.
+    echo -e "\n${L_BLUE}── [+] TCPing / 每日更新 ─────────────────────────────────${NC}"
+    _tcping_setup_silent && _ok_tcping=1 || msg_warn "TCPing 安装未完成，可从菜单 6 → 7 重试"
+    install_autoupdate && _ok_update=1 || msg_warn "每日更新未启用，可从菜单 16 重试"
 
     # ── 汇总报告 ─────────────────────────────────────────────
     echo
     echo -e "${L_PURPLE}─────────────────── 初始化汇总 ─────────────────────────${NC}"
-    echo -e "  IPv6        ${GREEN}已禁用（菜单 6 → 3 可手动开启）${NC}"
+    if (( _ok_ipv6 )); then
+        echo -e "  IPv6        ${GREEN}已禁用（菜单 6 → 3 可手动开启）${NC}"
+    else
+        echo -e "  IPv6        ${YELLOW}未禁用，请检查容器权限或改用 IPv4 SSH${NC}"
+    fi
     [ $_ok_sys -eq 1 ] \
         && echo -e "  系统更新    ${GREEN}✓${NC}" \
         || echo -e "  系统更新    ${RED}✗${NC}"
@@ -2595,9 +2882,11 @@ DNSEOF
     else
         echo -e "  XanMod      ${YELLOW}跳过${NC}"
     fi
-    [ $_ok_net -eq 1 ] \
-        && echo -e "  网络优化    ${GREEN}✓${NC}   ${WHITE}${_net_bw}Mbps · rmem ${_rmem_mb}MB · CC: ${_cc}${NC}" \
-        || echo -e "  网络优化    ${RED}✗${NC}"
+    case $_ok_net in
+        1) echo -e "  网络优化    ${GREEN}✓${NC}   ${WHITE}${_net_bw}Mbps · rmem ${_rmem_mb}MB · CC: ${_cc} · fq 已保存${NC}" ;;
+        2) echo -e "  网络优化    ${YELLOW}容器跳过宿主调优${NC}" ;;
+        *) echo -e "  网络优化    ${YELLOW}部分完成，fq 未完成（菜单 6 → 2）${NC}" ;;
+    esac
     [ $_ok_fw -eq 1 ] \
         && echo -e "  防火墙      ${GREEN}✓ 已生效、已保存、开机恢复已启用${NC}" \
         || echo -e "  防火墙      ${YELLOW}跳过${NC}"
@@ -2610,13 +2899,20 @@ DNSEOF
     else
         echo -e "  Fail2Ban    ${YELLOW}跳过${NC}"
     fi
-    if systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null; then
+    if (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null; then
         local _tp; _tp=$(grep "^PORT=" "$TCPING_CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "?")
         echo -e "  TCPing      ${GREEN}✓${NC}   ${WHITE}端口 ${_tp}${NC}"
     else
         echo -e "  TCPing      ${YELLOW}跳过${NC}"
     fi
-    if [ "$_cc" = "bbr" ]; then
+    if (( _ok_update )); then
+        echo -e "  每日更新    ${GREEN}✓ 仅跟随正式版，不自动安装 beta${NC}"
+    else
+        echo -e "  每日更新    ${YELLOW}未启用${NC}"
+    fi
+    if (( _container )); then
+        echo -e "  BBR         ${CYAN}由宿主提供（当前 $(_get_bbr_version)）${NC}"
+    elif [ "$_cc" = "bbr" ]; then
         if [ "$_xanmod_done" -eq 1 ]; then
             echo -e "  BBR v3      ${CYAN}⟳${NC}   ${WHITE}待重启后生效 (sysctl 已预写入)${NC}"
         elif [ "$_xanmod_done" -eq 2 ]; then
@@ -2668,7 +2964,7 @@ _get_bbr_version() {
 # 全局日志辅助函数（定义在全局，避免在循环内重复定义污染命名空间）
 _filter_fw_logs() {
     # L-04 修复: 匹配包含 DROP/REJECT/BLOCK 的内核日志行（包含 INPUT 方向 OUT= 为空的情况）
-    grep -E --line-buffered 'VPS-DROP:|IN=[^ ]+.*\b(DROP|REJECT|BLOCK)\b' || true
+    grep -E --line-buffered 'VPS-DROP:|SSH-BRUTE:|IN=[^ ]+.*\b(DROP|REJECT|BLOCK)\b' || true
 }
 _run_live_log() {
     if command -v journalctl &>/dev/null; then
@@ -2687,6 +2983,28 @@ _run_static_log() {
     else
         dmesg | tail -n 100
     fi
+}
+
+_fw_logs_menu() {
+    local choice pid
+    printf '\n1. 拦截日志（最近 100 条内核记录）\n2. 实时拦截日志\n3. 实时完整内核日志\n0. 返回\n'
+    read -rp '选择：' choice
+    case "$choice" in
+        1) _run_static_log | _filter_fw_logs ;;
+        2|3)
+            # 独立会话拥有日志管道，退出只终止自己的进程组，不影响主菜单/SSH。
+            export -f _run_live_log _filter_fw_logs
+            if [[ $choice == 2 ]]; then
+                setsid bash -c '_run_live_log | _filter_fw_logs' &
+            else
+                setsid bash -c '_run_live_log' &
+            fi
+            pid=$!
+            read -rsn1 -p '按任意键停止日志并返回…' || true
+            kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            printf '\n' ;;
+    esac
 }
 
 # 两列菜单行输出函数：内部直接读取 COLUMNS，不依赖任何外部变量（H-03 修复）
@@ -2796,6 +3114,7 @@ EOF
         fail2ban-client status sshd 2>/dev/null || true
     else
         echo -e "${RED}✗ fail2ban 启动失败，请检查: journalctl -u fail2ban${NC}"
+        return 1
     fi
 }
 
@@ -2809,7 +3128,7 @@ _setup_ssh_tg_monitor() {
     # Embed the same pure-Bash rendering/parser helpers; no source of user data.
     {
         printf '#!/bin/bash\n'
-        declare -f get_flag_emoji _srv_render _tg_cfg_get
+        declare -f get_flag_emoji _srv_render _tg_cfg_get _html_escape
         cat <<'NOTIFY_EOF'
 CONF=/etc/ssh-tg-monitor.conf
 TG_BOT_TOKEN=$(_tg_cfg_get "$CONF" TG_BOT_TOKEN)
@@ -2829,7 +3148,7 @@ _srv_display() {
 }
 send_tg() {
     local response
-    local -a args=(--data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1")
+    local -a args=(--data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" --data-urlencode 'parse_mode=HTML')
     [[ -z "$TG_THREAD_SSH" ]] || args+=(--data-urlencode "message_thread_id=$TG_THREAD_SSH")
     if ! response=$(curl -fsS --connect-timeout 5 --max-time 10 \
         "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" "${args[@]}" 2>/dev/null) ||
@@ -2859,8 +3178,8 @@ while IFS= read -r line; do
     remark=""
     if [[ -r /etc/fail2ban/f2b-whitelist.conf ]] && grep -qxF "$ip" /etc/fail2ban/f2b-whitelist.conf; then remark=" → #管理IP"; fi
     send_tg "$title
-服务器: $(_srv_display)
-用户: $user  来源: $ip$remark
+服务器: $(_html_escape "$(_srv_display)")
+用户: $(_html_escape "$user")  来源: <code>$(_html_escape "$ip")</code>$remark
 方式: $method  时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" || true
 done
 MONITOR_EOF
@@ -2869,9 +3188,9 @@ MONITOR_EOF
 #!/bin/bash
 source /usr/local/lib/vps-mgr-notify.sh
 send_tg "🚫 #IP已封禁
-服务器: $(_srv_display)
-封禁IP: $1
-原因: 登录失败$3次 ($2)
+服务器: $(_html_escape "$(_srv_display)")
+封禁IP: <code>$(_html_escape "$1")</code>
+原因: 登录失败$(_html_escape "$3")次 ($(_html_escape "$2"))
 时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 F2B_EOF
     chmod 755 /usr/local/bin/fail2ban-tg-notify.sh
@@ -2903,6 +3222,12 @@ EOF
         systemctl restart "$SSH_TG_SERVICE" || return 1
     systemctl is-active --quiet "$SSH_TG_SERVICE" || return 1
     msg_success "SSH 通知已启用（独立低权限用户、双栈来源地址）"
+    # 在监听已经启动后测试推送；Telegram 超时不会延迟开始读取 SSH 日志。
+    bash -c 'source /usr/local/lib/vps-mgr-notify.sh
+send_tg "✅ #SSH监控已启动
+服务器: $(_html_escape "$(_srv_display)")
+监控: SSH 登录成功 / 失败 / 密码 / 公钥
+时间: $(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M:%S")"' || msg_warn "SSH 监控已运行，但启动测试推送失败，请检查 Telegram 配置"
 }
 
 do_ssh_security() {
@@ -2927,8 +3252,9 @@ do_ssh_security() {
         _wl_count=$(awk '!/^#|^[[:space:]]*$/{c++} END{print c+0}' "$F2B_WHITELIST" 2>/dev/null || echo 0)
         echo -e "  1. 白名单管理  [${_wl_count} 个 IP]"
         echo -e "  2. 查看封禁 IP 列表"
+        echo -e "  3. 安装 / 修复 Fail2Ban 与 SSH 加固"
         echo -e "  0. 返回\n"
-        echo -ne "${BLUE}请选择 [0-2]: ${NC}"; read -r _sec_ch
+        echo -ne "${BLUE}请选择 [0-3]: ${NC}"; read -r _sec_ch
         case "$_sec_ch" in
             1)
                 clear
@@ -2987,6 +3313,7 @@ do_ssh_security() {
                     pause
                 fi
                 ;;
+            3) _install_fail2ban || true; pause ;;
             0|"") return ;;
             *) continue ;;
         esac
@@ -3019,7 +3346,7 @@ sys_maintenance_menu() {
             3) toggle_ipv6 || true; pause ;;
             4) do_check_all; pause ;;
             6) _set_server_name; pause ;;
-            7) do_tcping_monitor; pause ;;
+            7) do_tcping_monitor || true; pause ;;
             5)
                 clear
                 echo -e "${L_GREEN}--- 系统深度信息 ---${NC}"
@@ -3056,23 +3383,51 @@ sys_maintenance_menu() {
 
 # 子菜单 6：防火墙 & 规则
 sys_firewall_menu() {
-    local choice p proto action addr family set
+    local choice p proto action addr family set mode chain handle confirm
     while true; do
-        printf '\n=== nftables 防火墙（仅本脚本表）===\n1. 初始化\n2. 开放端口\n3. 关闭端口\n4. IP 黑白名单\n5. 查看规则\n6. 查看监听\n7. 拦截日志\n0. 返回\n'
+        printf '\n=== nftables 防火墙（仅本脚本表）===\n1. 初始化 / 恢复开机加载\n2. 开放端口\n3. 关闭端口 / 删除规则\n4. IP 黑白名单\n5. 查看详细规则（handle、包数和字节数）\n6. 查看监听\n7. 系统 / 拦截日志\n8. 安全 / 开放模式\n9. 重建基础防火墙策略\n10. 确认 / 管理 SSH 放行端口\n0. 返回\n'
         read -rp '选择: ' choice
         case "$choice" in
             1) do_init_firewall || true ;;
-            2|3)
+            2)
                 read -rp '本机监听端口（NAT 外部映射需另行配置）: ' p
                 _valid_port "$p" || { msg_warn "无效端口"; continue; }
                 read -rp '协议 tcp/udp/all [tcp]: ' proto; proto=${proto:-tcp}
                 [[ $proto == tcp || $proto == udp || $proto == all ]] || continue
-                action=add; [[ $choice == 3 ]] && action=delete
+                action=add
                 if [[ $proto == all ]]; then
                     _fw_element "$action" tcp_ports "$p" && _fw_element "$action" udp_ports "$p" || true
                 else
                     _fw_element "$action" "${proto}_ports" "$p" || true
                 fi ;;
+            3)
+                printf '1. 关闭普通 TCP/UDP 放行\n2. 按链和 handle 删除规则\n3. 按端口批量清理关联规则\n0. 返回\n'
+                read -rp '选择：' mode
+                case "$mode" in
+                    1)
+                        read -rp '端口：' p; _valid_port "$p" || continue
+                        read -rp '协议 tcp/udp/all [all]：' proto; proto=${proto:-all}
+                        case "$proto" in
+                            tcp|udp) _fw_element delete "${proto}_ports" "$p" || true ;;
+                            all) close_firewall_port "$p" || true ;;
+                        esac
+                        msg_info "只移除普通放行；SSH/TCPing/临时端口请用对应菜单或批量清理；开放模式下不等于封禁" ;;
+                    2)
+                        nft -j list table inet "$FW_TABLE" | jq -r '.nftables[].chain? | select(.name != null) | .name'
+                        read -rp '链 [input]：' chain; chain=${chain:-input}
+                        [[ $chain =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || continue
+                        while true; do
+                            nft -a list chain inet "$FW_TABLE" "$chain" || break
+                            read -rp '删除的 handle（0 返回）：' handle
+                            [[ -n $handle && $handle != 0 ]] || break
+                            read -rp '确认删除此规则？可能影响封禁/ACL/计量 [y/N]：' confirm
+                            [[ $confirm == [yY] ]] && { _fw_delete_rule "$chain" "$handle" || true; }
+                        done ;;
+                    3)
+                        read -rp '端口（TCP+UDP）：' p; _valid_port "$p" || continue
+                        read -rp '清理该端口放行、ACL、CN 和配额配置（不卸载代理）？[y/N]：' confirm
+                        [[ $confirm == [yY] ]] && { _fw_remove_port "$p" || true; } ;;
+                esac ;;
             4)
                 read -rp '类型 block/allow（白名单不绕过配额或代理 ACL）: ' set
                 [[ $set == block || $set == allow ]] || continue
@@ -3083,7 +3438,20 @@ sys_firewall_menu() {
                 _fw_element "$action" "$set$family" "$addr" || true ;;
             5) nft -a list table inet "$FW_TABLE" || true ;;
             6) ss -tulpn ;;
-            7) _run_static_log | _filter_fw_logs ;;
+            7) _fw_logs_menu ;;
+            8)
+                read -rp '1 安全模式 DROP（默认） / 2 开放模式 ACCEPT：' mode
+                case "$mode" in
+                    1) _fw_set_policy drop || true ;;
+                    2)
+                        msg_warn "未显式拦截的监听端口将对外开放；黑名单、配额、ACL 和其他表仍有效"
+                        read -rp '确认切换开放模式？[y/N]：' confirm
+                        [[ $confirm == [yY] ]] && { _fw_set_policy accept || true; } ;;
+                esac ;;
+            9)
+                read -rp '重建基础链为 DROP？保留业务集合/配额，移除基础链手工编辑 [y/N]：' confirm
+                [[ $confirm == [yY] ]] && { _fw_rebuild || true; } ;;
+            10) _fw_manage_ssh_port || true ;;
             0|"") return ;;
         esac
     done
@@ -4797,6 +5165,7 @@ self_update() {
 # 安装/开启每日自动更新定时器（仅正式版）。记录当前脚本路径，定时器认这个路径原地替换。
 install_autoupdate() {
     local _self; _self=$(realpath "${BASH_SOURCE[0]}")
+    [[ $_self != *$'\n'* && $_self != *'"'* && $_self != *'%'* ]] || return 1
     cat > /etc/systemd/system/vps-mgr-autoupdate.service <<EOF
 [Unit]
 Description=vps-mgr auto-update (stable releases only)
@@ -4805,7 +5174,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash ${_self} auto-update
+ExecStart=/bin/bash "${_self}" auto-update
 EOF
     # 固定用上海时区(而非机器本地时区)——各地机器在同一时刻统一更新，时间可预测：
     # 每天上海 05:00 起、1 小时内随机触发(05:00~06:00)。你在上海 05:00 前把新正式版测好即可。
@@ -4821,8 +5190,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now vps-mgr-autoupdate.timer >/dev/null 2>&1 || true
+    systemctl daemon-reload && systemctl enable --now vps-mgr-autoupdate.timer &&
+        systemctl is-enabled --quiet vps-mgr-autoupdate.timer && systemctl is-active --quiet vps-mgr-autoupdate.timer
 }
 
 uninstall_autoupdate() {
@@ -4894,7 +5263,8 @@ _do_update_menu() {
         6) if systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null; then
                uninstall_autoupdate; msg_info "自动更新已关闭"
            else
-               install_autoupdate; msg_success "自动更新已开启（每天检查正式版，预发布不更新）"
+               if install_autoupdate; then msg_success "自动更新已开启（每天检查正式版，预发布不更新）"
+               else msg_error "自动更新启用失败，请检查 systemd 日志"; fi
            fi ;;
         0) return ;;
         *) msg_warn "无效选项" ;;
@@ -5537,6 +5907,14 @@ _quota_auto_delete() {
             chown "$REALM_USER:$REALM_USER" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$REALM_CONFIG_FILE" || return 1
         _realm_safe_restart || return 1
     fi
+    if [[ -f "$REALM_META_FILE" ]]; then
+        tmp=$(mktemp "$REALM_CONFIG_DIR/.metadata.XXXXXX") || return 1
+        if ! jq --arg p "$port" 'del(.[$p])' "$REALM_META_FILE" > "$tmp" ||
+            ! chown --reference="$REALM_META_FILE" "$tmp" || ! chmod 600 "$tmp" ||
+            ! mv "$tmp" "$REALM_META_FILE"; then
+            rm -f "$tmp"; return 1
+        fi
+    fi
     close_firewall_port "$port" && _quota_forget "$port" || return 1
     _quota_tg_notify "🗑️ 端口已删除 $node_id
 #$alias 端口 $port 到期超过 7 天未续期，已删除。"
@@ -5551,6 +5929,9 @@ _quota_forget() {
         tmp=$(mktemp "$QUOTA_DIR/.state.XXXXXX") || return 1
         awk -F'|' -v p="$port" '$1 != p' "$file" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     done
+    # 只清本端口标记；新租期/同月复用端口必须能够再次发出用量与到期告警。
+    [[ -d $QUOTA_DIR ]] || return 0
+    find "$QUOTA_DIR" -maxdepth 1 -type f \( -name ".warned_${port}_*" -o -name ".expwarn_${port}_*" \) -delete
 }
 
 
@@ -5811,9 +6192,12 @@ _sbx_env_suffix() {
 
 # 节点显示名：优先 国旗_SERVER_NAME(主菜单选项1设置,存 TG_CONF)；否则回落 国旗_末段-后缀[-序号]
 _sbx_name_for() {
-    local f=$1 ip=$2 name port suffix
+    local f=$1 ip=$2 name port suffix flag
     name=$(_tg_cfg_get "$TG_CONF" SERVER_NAME)
-    [[ -n $name ]] || name="$(get_flag_emoji "${SERVER_COUNTRY_CODE:-UN}")_${ip##*.}"
+    flag=$(get_flag_emoji "${SERVER_COUNTRY_CODE:-UN}")
+    [[ -n $name ]] || name="${ip##*.}"
+    # 已带国旗的名称原样保留；协议+端口后缀避免同机多节点重名。
+    [[ $name == [🇦-🇿]* || $name == 🌐* ]] || name="${flag}_${name}"
     port=${f##*/}; port=${port#*-}; port=${port%.env}
     suffix=$(_sbx_env_suffix "$f")
     printf '%s-%s-%s\n' "$name" "$suffix" "$port"
@@ -5843,7 +6227,7 @@ Requires=$FW_SERVICE.service
 ExecStart=$SBX_BIN run -c $SBX_CONF
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65536
+LimitNOFILE=1000000
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -6613,7 +6997,7 @@ ddns_log() {
 }
 
 # HTML 转义：CF 接口返回/日志可能含 < > &，HTML 模式下不转义会导致整条消息发不出
-ddns_html_escape() {
+_html_escape() {
     local s="$1"
     # 用 \& 转义：bash 5.2+ 默认开启 patsub_replacement，替换串中的 & 会被当作匹配文本
     s="${s//&/\&amp;}"; s="${s//</\&lt;}"; s="${s//>/\&gt;}"
@@ -6679,7 +7063,7 @@ ddns_notify_health() {
     local _ip="$1"
     local _src="未知"; [[ -f "$DDNS_SOURCE_FILE" ]] && _src=$(cat "$DDNS_SOURCE_FILE" 2>/dev/null || echo "未知")
     local _logs="暂无日志"
-    [[ -f "$DDNS_LOG_FILE" ]] && _logs=$(ddns_html_escape "$(tail -n 5 "$DDNS_LOG_FILE" 2>/dev/null || true)")
+    [[ -f "$DDNS_LOG_FILE" ]] && _logs=$(_html_escape "$(tail -n 5 "$DDNS_LOG_FILE" 2>/dev/null || true)")
     local _node; _node=$(get_node_id)
     local _msg
     _msg="🟢 <b>DDNS 每日健康检查</b>
@@ -6711,7 +7095,7 @@ ddns_notify_error() {
         _msg="❌ <b>DDNS 运行异常告警</b>
 👤 主机: ${_node}
 🌍 域名: <code>${DDNS_RECORD_NAME}</code>
-⚠️ 错误: $(ddns_html_escape "$_err")
+⚠️ 错误: $(_html_escape "$_err")
 🕒 时间: $(date '+%Y-%m-%d %H:%M:%S')"
         send_telegram "$_msg" || true
         echo "$_now" > "$_f"
@@ -7404,7 +7788,8 @@ show_menu() {
     # ── 系统管理区 ────────────────────────────────────────────────
     # 动态状态
     local _tm_label="切换测试模式"
-    _fw_has_element test_tcp 5201 && _tm_label="测试端口开放中（最多 2h，再按 4 关闭）"
+    local _test_until
+    if _test_until=$(_fw_test_deadline); then _tm_label="测试中（${_test_until} 关闭，再按 4 提前关闭）"; fi
 
 
 
