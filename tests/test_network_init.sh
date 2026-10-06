@@ -27,6 +27,41 @@ for caller in do_retune_bandwidth _do_full_init; do
     declare -f "$caller" | grep -Fq '_apply_fq "$_def_if" "$_fq_maxrate"'
 done
 declare -f do_retune_bandwidth | grep -Fq '/etc/sysctl.d/99-custom-tuning.conf'
+# A fresh image can open the dashboard before menu 1 installs jq/nftables.
+for missing_dependency in jq nft; do
+(
+    command() {
+        [[ $1 != -v || ${2:-} != "$missing_dependency" ]] || return 1
+        builtin command "$@"
+    }
+    nft() { echo 'FAIL: unexpected nft call before dependency check' >&2; return 99; }
+    jq() { echo 'FAIL: unexpected jq call before dependency check' >&2; return 99; }
+    status=0
+    output=$(_fw_test_deadline 2>&1) || status=$?
+    assert_eq 1 "$status" "test deadline unavailable without $missing_dependency"
+    assert_eq '' "$output" "no startup error without $missing_dependency"
+    output=$(_fw_show_status 2>&1)
+    if [[ $missing_dependency == jq ]]; then
+        assert_eq '   防火墙状态缺少 jq（菜单 1 安装依赖）' "$output" 'missing jq hint'
+    else
+        assert_eq '   nftables 未安装（菜单 1 初始化）' "$output" 'missing nft hint'
+    fi
+)
+done
+# Kernel-created fq queues have handle 0:; change cannot configure these.
+(
+    _is_container() { return 1; }
+    tc() {
+        if [[ $* == '-j qdisc show dev boot-test' ]]; then printf '%s\n' "$qdiscs"
+        else printf '%s\n' "$*"; fi
+    }
+    qdiscs='[{"kind":"fq","handle":"0:","root":true}]'
+    assert_eq 'qdisc replace dev boot-test root fq maxrate 80mbit flow_limit 250' \
+        "$(_apply_fq boot-test 80)" 'implicit root fq needs create-or-change'
+    qdiscs='[{"kind":"mq","handle":"10:","root":true},{"kind":"fq","handle":"0:","parent":"10:1"},{"kind":"fq","handle":"0:","parent":"10:2"}]'
+    assert_eq $'qdisc replace dev boot-test parent 10:1 fq maxrate 80mbit flow_limit 250\nqdisc replace dev boot-test parent 10:2 fq maxrate 80mbit flow_limit 250' \
+        "$(_apply_fq boot-test 80)" 'implicit mq leaves need create-or-change'
+)
 # One entry, no mode question: containers also reach the shared full workflow.
 (
     _do_full_init() { echo full; }
@@ -64,9 +99,12 @@ if [[ ${1:-} == --netns ]]; then
     _is_container() { return 1; } # These dummy interfaces are in a disposable namespace.
     ip link add vps-test type dummy
     ip link set vps-test up
-    tc qdisc add dev vps-test root handle 1: fq maxrate 100mbit flow_limit 250
+    tc qdisc add dev vps-test root handle 1: fq limit 1234 maxrate 100mbit flow_limit 250
     _apply_fq vps-test "$(_fq_maxrate_mbps 80)"
     tc qdisc show dev vps-test | grep -Eq 'fq 1:.*flow_limit 250p.*maxrate 80Mbit'
+    assert_eq 1234 "$(tc -j qdisc show dev vps-test | jq '.[0].options.limit')" 'existing fq options preserved'
+    _apply_fq vps-test 120
+    tc qdisc show dev vps-test | grep -Eq 'fq 1:.*limit 1234p.*flow_limit 250p.*maxrate 120Mbit'
     tc qdisc replace dev vps-test root fq_codel
     _apply_fq vps-test 80
     tc qdisc show dev vps-test | grep -Eq 'qdisc fq .*flow_limit 250p.*maxrate 80Mbit'
@@ -76,8 +114,10 @@ if [[ ${1:-} == --netns ]]; then
     _apply_fq vps-mq 80
     assert_eq 4 "$(tc -j qdisc show dev vps-mq | jq '[.[] | select(.kind=="fq")]|length')" 'all mq leaves use fq'
     assert_eq 4 "$(tc qdisc show dev vps-mq | grep -c 'flow_limit 250p.*maxrate 80Mbit')" 'all mq leaves tuned'
+    handles=$(tc -j qdisc show dev vps-mq | jq -c '[.[] | {kind,handle,parent}]')
     _apply_fq vps-mq 120
     assert_eq 4 "$(tc qdisc show dev vps-mq | grep -c 'maxrate 120Mbit')" 'mq retune changes every leaf'
+    assert_eq "$handles" "$(tc -j qdisc show dev vps-mq | jq -c '[.[] | {kind,handle,parent}]')" 'mq root and leaf handles preserved'
     (
         ip() { echo 'default via 192.0.2.1 dev vps-mq'; }
         clear() { :; }

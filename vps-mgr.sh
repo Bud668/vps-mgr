@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.4"
+readonly SCRIPT_VERSION="2.0.0-beta.5"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1045,6 +1045,8 @@ _fw_show_status() {
     local fw_json policy rules ssh paused color port ssh_color=$C_GREEN cn
     if ! command -v nft >/dev/null; then
         printf '   nftables 未安装（菜单 1 初始化）\n'
+    elif ! command -v jq >/dev/null; then
+        printf '   防火墙状态缺少 jq（菜单 1 安装依赖）\n'
     elif ! nft list tables >/dev/null 2>&1; then
         printf '   nftables 无法读取：检查 root / CAP_NET_ADMIN / 内核支持\n'
     elif fw_json=$(nft -j list table inet "$FW_TABLE" 2>/dev/null); then
@@ -1133,6 +1135,7 @@ _fw_test_mode() {
 }
 
 _fw_test_deadline() {
+    command -v nft >/dev/null && command -v jq >/dev/null || return 1
     local seconds
     seconds=$(nft -j list set inet "$FW_TABLE" test_tcp 2>/dev/null |
         jq -r '[.nftables[].set?.elem[]? | .elem.expires? // 0] | max // 0') || return 1
@@ -2345,14 +2348,14 @@ _effective_mem_mb() {
 do_quick_init() { _do_full_init; }
 
 _apply_fq() {
-    local iface=$1 rate=$2 kind data root parent child
+    local iface=$1 rate=$2 kind data root parent
     [[ -n $iface && $rate =~ ^[0-9]+$ ]] && ((rate > 0)) || return 1
     _is_container && { msg_warn "容器不自动调整 qdisc"; return 1; }
     data=$(tc -j qdisc show dev "$iface") || return 1
     kind=$(jq -r '.[] | select(.root == true) | .kind' <<< "$data") || return 1
     case "$kind" in
-        fq) tc qdisc change dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
-        ""|noqueue|fq_codel) tc qdisc replace dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
+        # 内核默认队列的 handle 为 0:，change 无法修改；replace 同时支持创建和原位更新。
+        ""|noqueue|fq|fq_codel) tc qdisc replace dev "$iface" root fq maxrate "${rate}mbit" flow_limit 250 ;;
         mq)
             root=$(jq -r '.[] | select(.root == true) | .handle' <<< "$data")
             # 保留多队列根，只调整其直接叶子；先检查全部叶子，避免碰到自定义调度时只改一半。
@@ -2361,13 +2364,9 @@ _apply_fq() {
                 length > 0 and all(.kind == "fq" or .kind == "fq_codel")' <<< "$data" >/dev/null || {
                 msg_warn "mq 含自定义/未知叶子队列，未修改；请手动检查 tc qdisc"; return 1;
             }
-            while read -r parent child; do
-                if [[ $child == fq ]]; then
-                    tc qdisc change dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
-                else
-                    tc qdisc replace dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
-                fi
-            done < <(jq -r --arg root "$root" '.[] | select(.parent? | strings | startswith($root)) | [.parent,.kind] | @tsv' <<< "$data") ;;
+            while read -r parent; do
+                tc qdisc replace dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
+            done < <(jq -r --arg root "$root" '.[] | select(.parent? | strings | startswith($root)) | .parent' <<< "$data") ;;
         *) msg_warn "保留已有 qdisc=$kind；未替换"; return 1 ;;
     esac
 }

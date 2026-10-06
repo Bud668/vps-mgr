@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.4-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.5-orange)
 
 </div>
 
@@ -17,20 +17,22 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.4 预发布测试版**，包含本轮老版功能补齐，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.5 预发布测试版**，保留老版功能补齐，并修复首次启动缺 jq 和重启后 fq 调优失败。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
-command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.4/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && \
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.5/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.4。发布页：[v2.0.0-beta.4](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.4)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.5。发布页：[v2.0.0-beta.5](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.5)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
 请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
+
+已完成 beta.4 初始化的测试机不必重装或重跑菜单 1：备份并在原路径替换脚本、验证语法后，执行 `systemctl restart vps-mgr-fq.service` 即可应用本版 fq 修复，沿用原先配置的速率，无需重启服务器。首次打开菜单缺少 jq/nftables 时只提示安装依赖，不再提前调用未安装的命令；完整依赖仍由菜单 1 安装。
 
 ---
 
@@ -151,7 +153,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 **首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；开放模式不等于清空整机规则。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
 
-业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。已有 fq 使用 change 更新；常见 fq_codel 改为 fq，mq 保留多队列根并逐一调整 fq/fq_codel 叶子。自定义队列保持不动并报告未完成。持久化使用 `vps-mgr-fq.service`，同时在已安装的 ifupdown、networkd-dispatcher、NetworkManager 钩子目录加入网络上线后重应用入口。
+业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。fq 使用原生 `tc replace` 创建或更新，兼容重启后内核默认的 `handle 0:` 队列，已配置 fq 的句柄和未指定参数保持不变；常见 fq_codel 改为 fq，mq 保留多队列根并逐一调整 fq/fq_codel 叶子。自定义队列保持不动并报告未完成。持久化使用 `vps-mgr-fq.service`，同时在已安装的 ifupdown、networkd-dispatcher、NetworkManager 钩子目录加入网络上线后重应用入口。
 
 **SSH 加固**
 
