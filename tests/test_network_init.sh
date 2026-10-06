@@ -27,6 +27,20 @@ for caller in do_retune_bandwidth _do_full_init; do
     declare -f "$caller" | grep -Fq '_apply_fq "$_def_if" "$_fq_maxrate"'
 done
 declare -f do_retune_bandwidth | grep -Fq '/etc/sysctl.d/99-custom-tuning.conf'
+# One entry, no mode question: standard VPS keeps the old full initialization.
+(
+    _minimal_setup() { echo container; }
+    _do_full_init() { echo full; }
+    _is_container() { return 1; }
+    assert_eq full "$(do_quick_init </dev/null)" 'normal VPS uses full initialization'
+    _is_container() { return 0; }
+    log_message() { :; }
+    output=$(do_quick_init </dev/null)
+    assert_eq container "${output##*$'\n'}" 'shared-kernel container detected automatically'
+)
+[[ $(declare -f _do_full_init | grep -c 'do_init_firewall') == 1 ]] || {
+    echo 'FAIL: full initialization repeats firewall setup'; exit 1;
+}
 service_writes=0
 systemctl() {
     if [[ $1 == is-active ]]; then [[ ${3:-} == "${managed_firewall:-none}" ]]

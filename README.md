@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.1-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.2-orange)
 
 </div>
 
@@ -17,20 +17,20 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.1 预发布测试版**，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.2 预发布测试版**，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
 command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.1/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.2/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.1。发布页：[v2.0.0-beta.1](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.1)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.2。发布页：[v2.0.0-beta.2](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.2)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
-请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、第二次 SSH 登录和重启恢复仍需在测试机验收。
+请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
 
 ---
 
@@ -139,10 +139,12 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 不预开 80/443（脚本不签证书、不跑 web，需要时菜单手动开）
 - 仅管理 `table inet vps_mgr`，普通修改是原子批次，不清空整个 ruleset
 - 配置存于 `/etc/nftables.d/vps-mgr.nft`，由 `vps-mgr-firewall.service` 恢复；停止该单元不会移除保护
-- 首次应用前建立独立 systemd 回滚定时器，3 分钟内必须从**第二个 SSH 会话**执行屏幕显示的 `firewall-confirm` 命令
-- 未确认不继续安装代理，不启用开机恢复；超时只撤回本次新建表，恢复初始化前的空规则状态
+- 沿用旧版自动流程：识别本机 SSH 端口 → 建立独立 systemd 回滚保护 → 校验/应用规则 → 保存并检查开机恢复 → 自动撤销回滚
+- **不要求新开 SSH、不输入确认码、不重复进入初始化。**应用/保存/启用失败会撤回本次加载的表；异常中断由 3 分钟定时器兜底，恢复失败保留原有配置文件
+- 核对的是本机 SSH 端口规则，不等于实测公网新连接；可自行另开 SSH 验证，但不会阻断安装流程
+- 重复初始化保留现有规则并检查开机恢复；已保存但未加载时使用原配置恢复，不抹掉代理端口、配额暂停或白名单
 
-**已有其他防火墙规则或管理服务时，拒绝初始化并原样保留，不清空、不停用。**读取状态失败也中止。已经初始化的本脚本表重复执行时保持不变；不提供“全开放/清空所有规则”菜单。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
+**首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；不提供“全开放/清空所有规则”菜单。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
 
 业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。已有 fq 使用 change 更新；其他 qdisc 保留不动，持久化使用单独的 `vps-mgr-fq.service`。
 
@@ -201,15 +203,17 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 重装系统后运行 v2 脚本：
 
-1. 选择 **「1. 一键初始化 → 1. 仅代理必需依赖 + nftables」**。
-2. 保留当前 SSH，另开连接执行屏幕中的确认命令。未确认前不要重启机器。
-3. 重新进入菜单 1 的轻量模式确认初始化完成，再进入 **菜单 9** 安装 SS2022。
+1. 选择 **「1. 一键初始化」**，无需再选“完整/简化”。独立 VPS 沿用老版的系统更新 → XanMod → 网络优化 → 防火墙 → TG/Fail2Ban 流程和默认调优档位；此前的低带宽、内存上限、连接重试安全修复保留。
+2. 在同一 SSH 窗口按原来的带宽、角色、TG 等提示完成一轮配置；防火墙自动保存并启用开机恢复。仅安装了新内核时，最后提示重启一次。
+3. 按需选择 **菜单 7 Snell、8 Realm、9 sing-box（SS/SS2022、SOCKS5、Hysteria2）**，没有协议限制。
 4. NAT 容器按实际映射手填端口，例如本机映射也为 24073/24074 时才填写这两个端口；不改供应商 SSH 映射。
 5. 按需配置菜单 2（Fail2Ban）、3（通知）、13（配额）。
 
-轻量模式不升级系统、不改 DNS/IPv6、不换内核、不创建 Swap、不调整 qdisc，也不默认安装专用 TCPing 服务。
+脚本自动识别共享内核容器（如 LXC/OpenVZ），只配置必要依赖和防火墙，不升级系统、不改 DNS/IPv6、不换内核、不创建 Swap、不调整 qdisc；代理功能与独立 VPS 相同。你不需要手动判断或选择环境。NAT 或公网端口数量不能作为容器判据。
 
-独立 VPS 可选择完整调优模式，在防火墙确认后继续系统升级、XanMod 与网络优化。容器强制走轻量路径；参数计算尊重 cgroup 内存上限和真实页大小。
+本版不额外默认安装专用 TCPing 服务；参数计算尊重 cgroup 内存上限和真实页大小。独立 VPS 不再先跑一遍轻量初始化。
+
+**beta.1 重启后防火墙未生效怎么办？**如果是未完成旧版确认，更新测试脚本后选择 **菜单 5 → 1** 即可完成/恢复本脚本防火墙并修复开机加载，不必重跑整套系统优化，也不要求重装。若提示权限不足，应检查容器权限/宿主支持，重试初始化不能补足这些权限。
 
 > 装完 XanMod 需重启一次，重启后 BBR v3 自动生效。
 

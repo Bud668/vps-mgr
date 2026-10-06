@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.1"
+readonly SCRIPT_VERSION="2.0.0-beta.2"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -831,8 +831,12 @@ _quota_reset_baselines() {
 
 _fw_restore() {
     _fw_require || return 1
-    [[ ! -e "$FW_PENDING" ]] || { msg_error "防火墙等待第二个 SSH 会话确认"; return 1; }
+    [[ ! -e "$FW_PENDING" ]] || { msg_error "防火墙初始化未完成，请用菜单 5 → 1 重试"; return 1; }
     nft list table inet "$FW_TABLE" >/dev/null 2>&1 && return 0
+    _fw_load_config
+}
+
+_fw_load_config() {
     [[ -s "$FW_CONF" ]] || { msg_error "请先初始化 nftables 防火墙"; return 1; }
     local tmp ports=""
     tmp=$(mktemp) || return 1
@@ -1001,31 +1005,62 @@ EOF
     systemctl daemon-reload
 }
 
-_fw_confirm() { _state_locked _fw_confirm_locked "$@"; }
-_fw_confirm_locked() {
-    [[ -f "$FW_PENDING" ]] || { msg_error "没有待确认的防火墙"; return 1; }
-    local token origin
-    { read -r token; read -r origin; } < "$FW_PENDING"
-    [[ ${1:-} == "$token" ]] || { msg_error "确认码不匹配"; return 1; }
-    if [[ $origin != console && ( -z ${SSH_CONNECTION:-} || $SSH_CONNECTION == "$origin" ) ]]; then
-        msg_error "请从新建的第二个 SSH 会话执行确认"; return 1
-    fi
-    _fw_persist && systemctl enable "$FW_SERVICE.service" >/dev/null || return 1
-    rm -f "$FW_PENDING"
-    systemctl stop vps-mgr-firewall-revert.timer >/dev/null 2>&1 || true
-    msg_success "nftables 已确认并启用开机恢复"
+_fw_finish_init() {
+    local ports port
+    ports=$(get_current_ssh_port)
+    [[ -n $ports ]] || { msg_error "无法确认本机 SSH 监听端口，未完成初始化"; return 1; }
+    for port in ${ports//,/ }; do
+        _fw_has_element ssh_ports "$port" || { msg_error "SSH 端口 $port 未放行，未完成初始化"; return 1; }
+    done
+    _fw_persist && systemctl enable "$FW_SERVICE.service" >/dev/null &&
+        systemctl is-enabled --quiet "$FW_SERVICE.service" || {
+        msg_error "防火墙保存或开机恢复启用失败，不能视为初始化完成"; return 1;
+    }
+    rm -f "$FW_PENDING" || return 1
+    systemctl stop --no-block vps-mgr-firewall-revert.timer >/dev/null 2>&1 || true
+    msg_success "nftables 已生效；SSH $ports 已放行；规则已保存，开机恢复已启用（无需重连或重启）"
 }
 _fw_rollback() { _state_locked _fw_rollback_locked; }
 _fw_rollback_locked() {
     [[ -e "$FW_PENDING" ]] || return 0
     _fw_require || return 1
+    local mode
+    read -r mode < "$FW_PENDING" || mode=""
     if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
         nft delete table inet "$FW_TABLE" || return 1
     fi
-    rm -f "$FW_PENDING" "$FW_CONF"
+    # A restore attempt must never delete the previously saved configuration.
+    [[ $mode == restore ]] || rm -f "$FW_CONF" || return 1
+    rm -f "$FW_PENDING" || return 1
     systemctl disable "$FW_SERVICE.service" >/dev/null 2>&1 || true
     systemctl stop --no-block vps-mgr-firewall-revert.timer >/dev/null 2>&1 || true
-    msg_warn "未确认新 SSH 连接，已撤回本次新建规则；其他表未修改"
+    msg_warn "初始化未完成，已撤回本次加载的规则并关闭开机加载；其他表未修改"
+}
+
+_fw_show_status() {
+    local fw_json
+    if ! command -v nft >/dev/null; then
+        printf '   nftables 未安装（菜单 1 初始化）\n'
+    elif ! nft list tables >/dev/null 2>&1; then
+        printf '   nftables 无法读取：检查 root / CAP_NET_ADMIN / 内核支持\n'
+    elif fw_json=$(nft -j list table inet "$FW_TABLE" 2>/dev/null); then
+        jq -r '
+            [.nftables[].chain? | select(.name=="input") | .policy][0] as $policy |
+            "   nftables inet vps_mgr  INPUT: \($policy // "unknown")",
+            (.nftables[].set? | select(.name=="ssh_ports" or .name=="tcp_ports" or .name=="udp_ports" or .name=="paused_ports") |
+             "   \(.name): \((.elem // []) | map(tostring) | join(", "))")' <<< "$fw_json"
+        if [[ -e "$FW_PENDING" ]]; then
+            printf '   初始化未完成，回滚保护中（菜单 5 → 1 重试）\n'
+        elif [[ -s "$FW_CONF" ]] && systemctl is-enabled --quiet "$FW_SERVICE.service"; then
+            printf '   规则已保存 · 开机恢复已启用\n'
+        else
+            printf '   仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）\n'
+        fi
+    elif [[ -s "$FW_CONF" ]]; then
+        printf '   已有保存配置，但规则未加载（菜单 5 → 1 恢复，不必重跑整套初始化）\n'
+    else
+        printf '   nftables 尚未初始化（菜单 1 或菜单 5 → 1）\n'
+    fi
 }
 
 _fw_test_mode() {
@@ -1428,39 +1463,45 @@ do_init_firewall() { _state_locked _fw_init_locked; }
 _fw_init_locked() {
     _fw_require || return 1
     if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then
-        [[ ! -e "$FW_PENDING" ]] || { msg_error "请先在第二个 SSH 会话确认"; return 1; }
-        msg_info "已使用原生 nftables；保留现有规则"; return 0
+        msg_info "保留现有 nftables 规则，检查保存和开机恢复"
+        _fw_install_unit && _fw_finish_init
+        return
     fi
-    local state=0
-    _firewall_init_state || state=$?
-    case "$state" in
-        0) ;;
-        1) msg_warn "检测到已有防火墙；本版仅初始化干净系统，不接管或清空其他规则"; return 1 ;;
-        *) msg_error "无法读取防火墙状态，未修改规则"; return 1 ;;
-    esac
-    local ports tmp token script
+    # Finish cleanup of an interrupted attempt before starting a new transaction.
+    [[ ! -e "$FW_PENDING" ]] || _fw_rollback_locked || return 1
+    local state=0 mode=new
+    if [[ -s "$FW_CONF" ]]; then
+        mode=restore
+        msg_info "恢复本脚本已保存的配置；保留业务端口、白名单和其他表"
+    else
+        _firewall_init_state || state=$?
+        case "$state" in
+            0) ;;
+            1) msg_warn "检测到已有防火墙；本版仅初始化干净系统，不接管或清空其他规则"; return 1 ;;
+            *) msg_error "无法读取防火墙状态，未修改规则"; return 1 ;;
+        esac
+    fi
+    local ports tmp script failed=0
     ports=$(get_current_ssh_port)
     [[ -n "$ports" ]] || { msg_error "无法确认 SSH 监听端口"; return 1; }
     tmp=$(mktemp) || return 1
     chmod 600 "$tmp"
     _fw_base_rules "$ports" > "$tmp"
     nft -c -f "$tmp" || { rm -f "$tmp"; return 1; }
-    token=$(openssl rand -hex 12) || { rm -f "$tmp"; return 1; }
     script=$(realpath "$0")
     _fw_install_unit || { rm -f "$tmp"; return 1; }
-    (umask 077; printf '%s\n%s\n' "$token" "${SSH_CONNECTION:-console}" > "$FW_PENDING")
+    (umask 077; printf '%s\n' "$mode" > "$FW_PENDING") || { rm -f "$tmp"; return 1; }
     if ! systemd-run --quiet --collect --unit=vps-mgr-firewall-revert --on-active=180s \
         /bin/bash "$script" firewall-rollback ||
         ! systemctl is-active --quiet vps-mgr-firewall-revert.timer; then
         rm -f "$tmp" "$FW_PENDING"; msg_error "无法启动回滚定时器，未应用规则"; return 1
     fi
-    if ! nft -f "$tmp" || ! _fw_persist; then
+    if [[ $mode == restore ]]; then _fw_load_config || failed=1
+    else nft -f "$tmp" || failed=1; fi
+    if (( failed )) || ! _fw_finish_init; then
         rm -f "$tmp"; _fw_rollback_locked; return 1
     fi
     rm -f "$tmp"
-    printf '\n请保留当前连接，在 3 分钟内新开 SSH 会话执行：\n'
-    printf '  bash %q firewall-confirm %q\n' "$script" "$token"
-    msg_warn "确认前不启用开机恢复，也不继续安装代理；超时仅撤回本次新建规则"
 }
 
 
@@ -1891,7 +1932,7 @@ do_check_all() {
         if [[ -s "$FW_CONF" ]] && systemctl is-enabled --quiet "$FW_SERVICE"; then
             _ck_pass "本脚本防火墙开机恢复已启用"
         else
-            _ck_fail "防火墙未完成确认或未启用开机恢复"
+            _ck_fail "防火墙保存/开机恢复未就绪（菜单 5 → 1 修复）"
         fi
     else
         _ck_fail "无法读取本脚本 nftables 表（未初始化或无权限）"
@@ -2042,20 +2083,17 @@ _minimal_setup() {
             python3 iproute2 procps util-linux tar unzip logrotate || return 1
     setup_log_rotation || return 1
     do_init_firewall || return 1
-    [[ ! -e "$FW_PENDING" ]] || return 1
-    msg_success "轻量初始化完成；菜单 9 可安装 SS2022/SOCKS5/Hy2，不改 DNS、IPv6、内核或 Swap"
+    msg_success "容器初始化完成；防火墙已保存并启用开机恢复，无需重启"
+    msg_info "代理任选：菜单 7 Snell · 8 Realm · 9 SS/SS2022、SOCKS5、Hysteria2"
 }
 
 do_quick_init() {
-    local choice
-    printf '\n1. 仅代理必需依赖 + nftables（默认，容器推荐）\n2. 完整系统调优（仅独立 VPS，涉及系统升级和网络参数）\n0. 返回\n'
-    read -rp '选择 [1]: ' choice || return 1
-    case "${choice:-1}" in
-        1) _minimal_setup ;;
-        2) _do_full_init ;;
-        0) return ;;
-        *) return 1 ;;
-    esac
+    if _is_container; then
+        msg_info "检测到共享内核容器，自动跳过换内核及宿主网络调优；代理功能不受限制"
+        _minimal_setup
+    else
+        _do_full_init
+    fi
 }
 
 _apply_fq() {
@@ -2128,11 +2166,10 @@ do_system_update() {
 
 _do_full_init() {
     if _is_container; then msg_warn "容器仅执行轻量初始化；不修改内核、Swap 或宿主网络"; _minimal_setup; return; fi
-    _minimal_setup || return 1
-    [[ ! -e "$FW_PENDING" ]] || return 1
+    check_system || return 1
     clear
     echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
-    echo -e "  ${CYAN}IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}防火墙${NC} → ${CYAN}TG/Fail2Ban${NC} → ${CYAN}TCPing${NC}"
+    echo -e "  ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}nftables${NC} → ${CYAN}TG/Fail2Ban${NC}"
     echo -e "  带宽须人工确认，安装内核后需重启以启用 BBR v3"
     echo
 
@@ -2142,8 +2179,8 @@ _do_full_init() {
     local _init_srv_name=""
 
     # Preserve the administrator's IPv6 configuration; nftables protects both families.
-    # ── [2/5] 系统更新 & 依赖安装 ───────────────────────────
-    echo -e "\n${L_BLUE}── [2/5] 系统更新 & 依赖安装 ──────────────────────────${NC}"
+    # ── [1/4] 系统更新 & 依赖安装 ───────────────────────────
+    echo -e "\n${L_BLUE}── [1/4] 系统更新 & 依赖安装 ──────────────────────────${NC}"
 
     if ! check_package_manager_lock; then return; fi
 
@@ -2153,7 +2190,7 @@ _do_full_init() {
         curl wget ca-certificates apt-transport-https openssl
         unzip zip tar gzip xz-utils jq gnupg gnupg2 lsb-release
         bc net-tools iproute2 iputils-ping "$_dns_pkg" vim nano htop tree lsof
-        screen psmisc bsdmainutils nftables
+        screen psmisc bsdmainutils nftables python3 util-linux logrotate
         mtr iperf3 isc-dhcp-client conntrack procps systemd-timesyncd
         socat netcat-openbsd fail2ban python3-systemd
     )
@@ -2232,8 +2269,7 @@ _do_full_init() {
         fi
     fi
 
-    systemctl enable --now atd >/dev/null 2>&1 || true
-
+    setup_log_rotation || return 1
 
     # iperf3 服务设为手动模式（避免随机自启监听 5201，需要时手动 iperf3 -s）
     if systemctl list-unit-files iperf3.service &>/dev/null; then
@@ -2322,8 +2358,8 @@ EOF
     echo -ne "  名称 (如 🇯🇵SR_JP_Std，回车自动填): "
     read -r _init_srv_name < /dev/tty || true
 
-    # ── [3/5] XanMod 内核安装 (BBR v3) ──────────────────────
-    echo -e "\n${L_BLUE}── [3/5] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
+    # ── [2/4] XanMod 内核安装 (BBR v3) ──────────────────────
+    echo -e "\n${L_BLUE}── [2/4] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
     if [ "$(uname -m)" != "x86_64" ]; then
         echo -e "  ${YELLOW}⚠ 跳过（XanMod 仅支持 x86_64，当前架构: $(uname -m)）${NC}"
         local _arm_bv; _arm_bv=$(_get_bbr_version)
@@ -2351,7 +2387,7 @@ EOF
             echo -e "  ${CYAN}提示: 升级内存至 512MB+ 后可手动安装${NC}"
         else
             # RAM < 512MB 且无 Swap 时，临时建 512MB Swap 防止安装 OOM
-            # 标志文件让 [4/5] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
+            # 标志文件让 [3/4] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
             if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
                 echo -e "  ${YELLOW}⚠ 内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
                 fallocate -l 512M /swapfile 2>/dev/null || \
@@ -2406,8 +2442,8 @@ EOF
         fi
     fi
 
-    # ── [4/5] 网络优化 (DNS + Swap + sysctl) ────────────────
-    echo -e "\n${L_BLUE}── [4/5] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
+    # ── [3/4] 网络优化 (DNS + Swap + sysctl) ────────────────
+    echo -e "\n${L_BLUE}── [3/4] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
     local phys_mem_mb
     phys_mem_mb=$(_effective_mem_mb)
 
@@ -2491,10 +2527,9 @@ DNSEOF
     _fq_maxrate=$(_fq_maxrate_mbps "$bw_mbps") || return 1
     if _apply_fq "$_def_if" "$_fq_maxrate"; then _persist_fq "$_fq_maxrate" || return 1; fi
 
-    # ── [5/5] 防火墙初始化 ──────────────────────────────────
-    echo -e "\n${L_BLUE}── [5/5] 防火墙初始化 ──────────────────────────────────${NC}"
+    # ── [4/4] 防火墙初始化 ──────────────────────────────────
+    echo -e "\n${L_BLUE}── [4/4] 防火墙初始化 ──────────────────────────────────${NC}"
     do_init_firewall || return 1
-    [[ ! -e "$FW_PENDING" ]] || return 1
     _ok_fw=1
 
     # TG 推送配置
@@ -2543,7 +2578,7 @@ DNSEOF
         && echo -e "  网络优化    ${GREEN}✓${NC}   ${WHITE}${_net_bw}Mbps · rmem ${_rmem_mb}MB · CC: ${_cc}${NC}" \
         || echo -e "  网络优化    ${RED}✗${NC}"
     [ $_ok_fw -eq 1 ] \
-        && echo -e "  防火墙      ${GREEN}✓${NC}" \
+        && echo -e "  防火墙      ${GREEN}✓ 已生效、已保存、开机恢复已启用${NC}" \
         || echo -e "  防火墙      ${YELLOW}跳过${NC}"
     [ $_ok_tg -eq 1 ] \
         && echo -e "  TG 推送     ${GREEN}✓${NC}" \
@@ -2572,6 +2607,7 @@ DNSEOF
         echo -e "  BBR         ${RED}✗${NC}   ${WHITE}内核不支持，当前使用 ${_cc}${NC}"
     fi
     echo -e "${L_PURPLE}─────────────────────────────────────────────────────────${NC}"
+    msg_info "代理任选：菜单 7 Snell · 8 Realm · 9 SS/SS2022、SOCKS5、Hysteria2"
     # 新安装内核后给出重启提示
     if [ "$_xanmod_done" -eq 1 ]; then
         echo
@@ -7221,17 +7257,7 @@ show_menu() {
 
     # ---------- 防火墙状态 ----------
     printf "${C_BLUE}:: 防火墙 & 内核 ::${C_RESET}\n"
-    local fw_json
-    if fw_json=$(nft -j list table inet "$FW_TABLE" 2>/dev/null); then
-        jq -r '
-            [.nftables[].chain? | select(.name=="input") | .policy][0] as $policy |
-            "   nftables inet vps_mgr  INPUT: \($policy // "unknown")",
-            (.nftables[].set? | select(.name=="ssh_ports" or .name=="tcp_ports" or .name=="udp_ports" or .name=="paused_ports") |
-             "   \(.name): \((.elem // []) | map(tostring) | join(", "))")' <<< "$fw_json"
-        [[ ! -f "$FW_PENDING" ]] || printf '   等待第二个 SSH 会话确认；超时自动撤回\n'
-    else
-        printf '   nftables 尚未初始化或无读取权限\n'
-    fi
+    _fw_show_status
     printf '   内核: %s  BBR: %s\n' "$(uname -r)" "$(_get_bbr_version)"
 
     local connection_stats
@@ -7483,7 +7509,7 @@ main() {
     # daemon/daily/quota-* 子命令通常由 systemd 以 root 自动触发；手动以非 root 运行会在
     # iptables / 写系统文件处报错，这里提前给出友好提示而非让其半路失败。
     case "${1:-}" in
-        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-confirm|firewall-rollback|cn-update|apply-fq)
+        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq)
             if [[ $EUID -ne 0 ]]; then
                 echo "错误: '$1' 子命令需要 root 权限（一般由 systemd 自动调用）。请用 sudo 运行。" >&2
                 exit 1
@@ -7493,7 +7519,6 @@ main() {
     case "${1:-}" in
         apply-fq) _apply_fq "$(ip route show default | awk '{print $5; exit}')" "${2:-}"; return ;;
         firewall-restore) _fw_ensure; return ;;
-        firewall-confirm) _fw_confirm "${2:-}"; return ;;
         firewall-rollback) _fw_rollback; return ;;
         cn-update) _sbx_cn_update; return ;;
         auto-update)

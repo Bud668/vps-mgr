@@ -24,11 +24,16 @@ source <(sed \
 log_message() { :; }
 _fw_install_unit() { :; }
 install_quota_services() { :; }
-systemd-run() { :; }
+fail_enable=0 fail_timer=0
+systemd-run() { (( fail_timer == 0 )) && touch "$test_dir/timer"; }
 systemctl() {
     case "$1" in
-        is-active) [[ $* == *vps-mgr-firewall-revert.timer* || $* == *quota-check.timer* ]] ;;
-        enable|disable|stop) return 0 ;;
+        is-active)
+            [[ $* == *quota-check.timer* ]] || [[ $* == *vps-mgr-firewall-revert.timer* && -f "$test_dir/timer" ]] ;;
+        is-enabled) [[ -f "$test_dir/enabled" ]] ;;
+        enable) (( fail_enable == 0 )) && touch "$test_dir/enabled" ;;
+        disable) rm -f "$test_dir/enabled" ;;
+        stop) rm -f "$test_dir/timer" ;;
         *) printf 'Unexpected service write: %s\n' "$*" >&2; return 99 ;;
     esac
 }
@@ -36,13 +41,31 @@ get_current_ssh_port() { echo 22; }
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
 SSH_CONNECTION='192.0.2.2 10000 192.0.2.1 22'
 export SSH_CONNECTION
-do_init_firewall
-token=$(head -1 "$FW_PENDING")
-if _fw_confirm "$token" >/dev/null 2>&1; then echo 'Same-session confirmation accepted' >&2; exit 1; fi
-SSH_CONNECTION='192.0.2.2 10001 192.0.2.1 22'
-_fw_confirm "$token"
+assert test "$(_fw_show_status)" = '   nftables 尚未初始化（菜单 1 或菜单 5 → 1）'
+# Never report completion when rollback scheduling or boot persistence fails.
+fail_timer=1
+if do_init_firewall </dev/null; then echo 'Missing rollback timer accepted'; exit 1; fi
+fail_timer=0 fail_enable=1
+if do_init_firewall </dev/null; then echo 'Boot enable failure accepted'; exit 1; fi
+if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then echo 'Failed setup left rules'; exit 1; fi
+assert test ! -e "$FW_CONF"
 assert test ! -e "$FW_PENDING"
+fail_enable=0
+# The real entry point completes in one session without reading stdin.
+do_init_firewall </dev/null
+assert test ! -e "$FW_PENDING"
+assert test ! -e "$test_dir/timer"
+assert systemctl is-enabled --quiet "$FW_SERVICE.service"
+[[ $(_fw_show_status) == *开机恢复已启用* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
+# Repair a beta.1 interruption/disabled boot unit without replacing live rules.
+printf 'old-confirmation-token\n%s\n' "$SSH_CONNECTION" > "$FW_PENDING"
+systemctl disable "$FW_SERVICE.service"
+before=$(nft list table inet "$FW_TABLE")
+do_init_firewall </dev/null
+assert test "$before" = "$(nft list table inet "$FW_TABLE")"
+assert test ! -e "$FW_PENDING"
+assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 nft add table inet unrelated_test
 open_firewall_port 24073
 open_firewall_port 24073
@@ -188,7 +211,15 @@ assert test "$(quota_get_port_bytes 24073)" = "$resumed_bytes 0"
 # Simulate lost kernel rules/reboot; persisted ACL and paused state survive,
 # temporary ports stay closed, baseline resets without losing accrued traffic.
 nft delete table inet "$FW_TABLE"
-_fw_ensure
+[[ $(_fw_show_status) == *已有保存配置*规则未加载* ]] || exit 1
+fail_enable=1
+if do_init_firewall </dev/null; then echo 'Restore enable failure accepted'; exit 1; fi
+assert test -s "$FW_CONF"
+if nft list table inet "$FW_TABLE" >/dev/null 2>&1; then echo 'Failed restore left rules'; exit 1; fi
+fail_enable=0
+do_init_firewall </dev/null
+assert systemctl is-enabled --quiet "$FW_SERVICE.service"
+assert test ! -e "$FW_PENDING"
 quota_init
 assert _fw_has_element paused_ports 24073
 if _fw_has_element test_tcp 5201; then echo 'Temporary opening persisted' >&2; exit 1; fi
@@ -203,4 +234,8 @@ if _fw_has_element paused_ports 24073 || nft list counter inet "$FW_TABLE" q2407
     grep -q '^24073|' "$QUOTA_CONFIG" "$QUOTA_DATA"; then
     echo 'Deleted quota retained state' >&2; exit 1
 fi
-echo 'PASS: dual-stack quota/ACL/CN/blacklist enforcement, recovery, SSH confirmation, atomic rollback, scoped ownership'
+(
+    nft() { return 1; }
+    [[ $(_fw_show_status) == *无法读取*CAP_NET_ADMIN* ]] || exit 1
+)
+echo 'PASS: automatic single-session setup, boot recovery/failure rollback, dual-stack policies, counters, scoped ownership'
