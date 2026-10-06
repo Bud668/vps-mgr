@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.2"
+readonly SCRIPT_VERSION="2.0.0-beta.3"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1038,29 +1038,40 @@ _fw_rollback_locked() {
 }
 
 _fw_show_status() {
-    local fw_json
+    local fw_json policy rules ssh tcp udp paused color
     if ! command -v nft >/dev/null; then
         printf '   nftables 未安装（菜单 1 初始化）\n'
     elif ! nft list tables >/dev/null 2>&1; then
         printf '   nftables 无法读取：检查 root / CAP_NET_ADMIN / 内核支持\n'
     elif fw_json=$(nft -j list table inet "$FW_TABLE" 2>/dev/null); then
-        jq -r '
-            [.nftables[].chain? | select(.name=="input") | .policy][0] as $policy |
-            "   nftables inet vps_mgr  INPUT: \($policy // "unknown")",
-            (.nftables[].set? | select(.name=="ssh_ports" or .name=="tcp_ports" or .name=="udp_ports" or .name=="paused_ports") |
-             "   \(.name): \((.elem // []) | map(tostring) | join(", "))")' <<< "$fw_json"
+        read -r policy rules ssh tcp udp paused < <(jq -r '
+            def ports($name): [.nftables[].set? | select(.name==$name) | .elem[]? | tostring] |
+                if length == 0 then "-" else join(",") end;
+            [([.nftables[].chain? | select(.name=="input") | .policy][0] // "unknown" | ascii_upcase),
+             ([.nftables[].rule? | select(. != null)] | length),
+             ports("ssh_ports"), ports("tcp_ports"), ports("udp_ports"), ports("paused_ports")] | @tsv
+        ' <<< "$fw_json")
+        color=$C_GREEN; [[ $policy == DROP ]] || color=$C_RED
+        printf '   %b防火墙%b  nftables %b运行中%b   策略 %b%s%b   规则 %s条\n' \
+            "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET" "$color" "$policy" "$C_RESET" "$rules"
         if [[ -e "$FW_PENDING" ]]; then
-            printf '   初始化未完成，回滚保护中（菜单 5 → 1 重试）\n'
+            printf '   %b初始化未完成，回滚保护中（菜单 5 → 1 重试）%b\n' "$C_YELLOW" "$C_RESET"
         elif [[ -s "$FW_CONF" ]] && systemctl is-enabled --quiet "$FW_SERVICE.service"; then
-            printf '   规则已保存 · 开机恢复已启用\n'
+            printf '   %b持久化%b  %b已保存 · 开机恢复已启用%b\n' "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET"
         else
-            printf '   仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）\n'
+            printf '   %b仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）%b\n' "$C_YELLOW" "$C_RESET"
         fi
+        printf '   %b端  口%b  SSH %b%s%b' "$C_BLUE" "$C_RESET" "$C_CYAN" "$ssh" "$C_RESET"
+        [[ $tcp == - ]] || printf '   TCP %b%s%b' "$C_CYAN" "$tcp" "$C_RESET"
+        [[ $udp == - ]] || printf '   UDP %b%s%b' "$C_CYAN" "$udp" "$C_RESET"
+        printf '\n'
+        [[ $paused == - ]] || printf '   %b已暂停%b  %s\n' "$C_YELLOW" "$C_RESET" "$paused"
     elif [[ -s "$FW_CONF" ]]; then
         printf '   已有保存配置，但规则未加载（菜单 5 → 1 恢复，不必重跑整套初始化）\n'
     else
         printf '   nftables 尚未初始化（菜单 1 或菜单 5 → 1）\n'
     fi
+    return 0
 }
 
 _fw_test_mode() {
@@ -1087,39 +1098,52 @@ _fw_test_mode() {
 # 不做的话：开机 ifup 去配 IPv6 地址、撞上 disable_ipv6=1 而失败，networking.service
 # 永久 failed（IPv4 排在前面仍能起来，但故障列表被这条噪音长期占据）。
 # 用标记前缀而非删除 —— 重新启用时要靠这些行读回静态地址。
-# 返回 0 = 确实注释了内容；返回 1 = 无需改动（调用方若不关心须加 || true，本脚本 set -e）
+# 同时处理常用 interfaces.d 配置；无 IPv6 stanza 时无需改动。
 _ipv6_ifaces_off() {
-    local f=/etc/network/interfaces
-    [[ -f "$f" ]] || return 1
-    grep -qE '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6' "$f" || return 1
-    local t; t=$(mktemp) || return 1
-    awk '
+    local f t
+    for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+        [[ -f "$f" ]] || continue
+        grep -qE '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6' "$f" || continue
+        t=$(mktemp) || return 1
+        if ! awk '
         /^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6/ { blk=1; print "#V6OFF# " $0; next }
         blk && /^[[:space:]]+[^[:space:]]/                            { print "#V6OFF# " $0; next }
         { blk=0; print }
-    ' "$f" > "$t" && cat "$t" > "$f"   # cat 而非 mv：保住原 inode 和权限
-    rm -f "$t"
-    return 0
+        ' "$f" > "$t" || ! cat "$t" > "$f"; then
+            rm -f "$t"; return 1
+        fi
+        rm -f "$t"
+    done
 }
 
 _ipv6_ifaces_on() {
-    [[ -f /etc/network/interfaces ]] || return 0
-    sed -i 's/^#V6OFF# //' /etc/network/interfaces
+    local f
+    for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+        [[ -f "$f" ]] || continue
+        sed -i 's/^#V6OFF# //' "$f" || return 1
+    done
 }
 
 _write_disable_ipv6_conf() {
-    _ipv6_ifaces_off || true
-    cat > /etc/sysctl.d/99-disable-ipv6.conf <<'IPVCEOF'
+    if [[ ${SSH_CONNECTION:-} == *:* ]]; then
+        msg_error "当前 SSH 使用 IPv6，未禁用；请通过 IPv4 SSH 或控制台操作"
+        return 1
+    fi
+    # 先验证内核权限；失败不留下下次开机才生效的禁用配置。
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 \
+        net.ipv6.conf.lo.disable_ipv6=1 >/dev/null || {
+        msg_error "IPv6 未能完全禁用，请检查内核支持或容器 sysctl 权限"; return 1;
+    }
+    _ipv6_ifaces_off || { msg_error "IPv6 接口配置处理失败"; return 1; }
+    cat > /etc/sysctl.d/99-disable-ipv6.conf <<'IPVCEOF' || return 1
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 IPVCEOF
     if [ -f "/etc/sysctl.conf" ]; then
-        sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-        sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-        sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
+        sed -i '/net\.ipv6\.conf\.\(all\|default\|lo\)\.disable_ipv6/d' /etc/sysctl.conf || return 1
     fi
-    sysctl --system >/dev/null 2>&1 || true
+    msg_success "IPv6 已禁用并保存，重启后保持关闭；测试时可在菜单 6 → 3 开启"
 }
 
 # Swap 检测与自动创建（未启用时按磁盘剩余空间动态分配）
@@ -1526,7 +1550,7 @@ toggle_ipv6() {
         echo -e "${GREEN}正在开启 IPv6...${NC}"
         
         # 1. 删除禁用配置（先解开 interfaces 里的 IPv6 stanza，下面第 4 步要从中读回静态地址）
-        _ipv6_ifaces_on
+        _ipv6_ifaces_on || return 1
         rm -f /etc/sysctl.d/99-disable-ipv6.conf
         if [ -f "/etc/sysctl.conf" ]; then
             sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
@@ -1553,9 +1577,9 @@ toggle_ipv6() {
             # 从 /etc/network/interfaces 读取静态 IPv6 配置
             local _v6_addr _v6_gw _v6_dns
             _v6_addr=$(awk "/iface ${iface} inet6 static/{f=1} f && /^[[:space:]]*address/{print \$2; exit}" \
-                       /etc/network/interfaces 2>/dev/null || true)
+                       /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true)
             _v6_gw=$(awk  "/iface ${iface} inet6 static/{f=1} f && /^[[:space:]]*gateway/{print \$2; exit}" \
-                       /etc/network/interfaces 2>/dev/null || true)
+                       /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true)
             if [ -n "$_v6_addr" ]; then
                 echo -e "${CYAN}正在应用静态 IPv6 配置 ($iface)...${NC}"
                 ip -6 addr add "$_v6_addr" dev "$iface" 2>/dev/null || true
@@ -1613,14 +1637,7 @@ toggle_ipv6() {
             return
         fi
         echo -e "${YELLOW}正在禁用 IPv6...${NC}"
-        _write_disable_ipv6_conf
-
-        # 暴力强制禁用
-        for i in /proc/sys/net/ipv6/conf/*/disable_ipv6; do 
-            echo 1 > "$i" 2>/dev/null
-        done
-        
-        echo -e "${RED}✓ IPv6 已禁用${NC}"
+        _write_disable_ipv6_conf || return 1
     fi
 }
 
@@ -1856,7 +1873,7 @@ do_check_all() {
     if [ -f "/etc/sysctl.d/99-disable-ipv6.conf" ]; then
         _ck_sysctl net.ipv6.conf.all.disable_ipv6 1 eq "IPv6 已禁用"
     else
-        _ck_warn "IPv6 未禁用（若需禁用请在菜单 [12] 切换）"
+        _ck_warn "IPv6 未禁用（若需禁用请在菜单 6 → 3 切换）"
     fi
 
     # ── 8. Swap ──────────────────────────────────────────
@@ -2082,6 +2099,7 @@ _minimal_setup() {
         apt-get install -y --no-install-recommends nftables jq curl ca-certificates openssl \
             python3 iproute2 procps util-linux tar unzip logrotate || return 1
     setup_log_rotation || return 1
+    _write_disable_ipv6_conf || return 1
     do_init_firewall || return 1
     msg_success "容器初始化完成；防火墙已保存并启用开机恢复，无需重启"
     msg_info "代理任选：菜单 7 Snell · 8 Realm · 9 SS/SS2022、SOCKS5、Hysteria2"
@@ -2169,7 +2187,7 @@ _do_full_init() {
     check_system || return 1
     clear
     echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
-    echo -e "  ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}nftables${NC} → ${CYAN}TG/Fail2Ban${NC}"
+    echo -e "  ${CYAN}关闭IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}nftables${NC} → ${CYAN}TG/Fail2Ban${NC}"
     echo -e "  带宽须人工确认，安装内核后需重启以启用 BBR v3"
     echo
 
@@ -2178,9 +2196,11 @@ _do_full_init() {
     local _xanmod_done=0 _xanmod_pkg="" _xanmod_avx=""
     local _init_srv_name=""
 
-    # Preserve the administrator's IPv6 configuration; nftables protects both families.
-    # ── [1/4] 系统更新 & 依赖安装 ───────────────────────────
-    echo -e "\n${L_BLUE}── [1/4] 系统更新 & 依赖安装 ──────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [1/5] 默认关闭 IPv6 ─────────────────────────────────${NC}"
+    _write_disable_ipv6_conf || return 1
+
+    # ── [2/5] 系统更新 & 依赖安装 ───────────────────────────
+    echo -e "\n${L_BLUE}── [2/5] 系统更新 & 依赖安装 ──────────────────────────${NC}"
 
     if ! check_package_manager_lock; then return; fi
 
@@ -2358,8 +2378,8 @@ EOF
     echo -ne "  名称 (如 🇯🇵SR_JP_Std，回车自动填): "
     read -r _init_srv_name < /dev/tty || true
 
-    # ── [2/4] XanMod 内核安装 (BBR v3) ──────────────────────
-    echo -e "\n${L_BLUE}── [2/4] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
+    # ── [3/5] XanMod 内核安装 (BBR v3) ──────────────────────
+    echo -e "\n${L_BLUE}── [3/5] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
     if [ "$(uname -m)" != "x86_64" ]; then
         echo -e "  ${YELLOW}⚠ 跳过（XanMod 仅支持 x86_64，当前架构: $(uname -m)）${NC}"
         local _arm_bv; _arm_bv=$(_get_bbr_version)
@@ -2387,7 +2407,7 @@ EOF
             echo -e "  ${CYAN}提示: 升级内存至 512MB+ 后可手动安装${NC}"
         else
             # RAM < 512MB 且无 Swap 时，临时建 512MB Swap 防止安装 OOM
-            # 标志文件让 [3/4] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
+            # 标志文件让 [4/5] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
             if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
                 echo -e "  ${YELLOW}⚠ 内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
                 fallocate -l 512M /swapfile 2>/dev/null || \
@@ -2442,8 +2462,8 @@ EOF
         fi
     fi
 
-    # ── [3/4] 网络优化 (DNS + Swap + sysctl) ────────────────
-    echo -e "\n${L_BLUE}── [3/4] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
+    # ── [4/5] 网络优化 (DNS + Swap + sysctl) ────────────────
+    echo -e "\n${L_BLUE}── [4/5] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
     local phys_mem_mb
     phys_mem_mb=$(_effective_mem_mb)
 
@@ -2527,8 +2547,8 @@ DNSEOF
     _fq_maxrate=$(_fq_maxrate_mbps "$bw_mbps") || return 1
     if _apply_fq "$_def_if" "$_fq_maxrate"; then _persist_fq "$_fq_maxrate" || return 1; fi
 
-    # ── [4/4] 防火墙初始化 ──────────────────────────────────
-    echo -e "\n${L_BLUE}── [4/4] 防火墙初始化 ──────────────────────────────────${NC}"
+    # ── [5/5] 防火墙初始化 ──────────────────────────────────
+    echo -e "\n${L_BLUE}── [5/5] 防火墙初始化 ──────────────────────────────────${NC}"
     do_init_firewall || return 1
     _ok_fw=1
 
@@ -2564,6 +2584,7 @@ DNSEOF
     # ── 汇总报告 ─────────────────────────────────────────────
     echo
     echo -e "${L_PURPLE}─────────────────── 初始化汇总 ─────────────────────────${NC}"
+    echo -e "  IPv6        ${GREEN}已禁用（菜单 6 → 3 可手动开启）${NC}"
     [ $_ok_sys -eq 1 ] \
         && echo -e "  系统更新    ${GREEN}✓${NC}" \
         || echo -e "  系统更新    ${RED}✗${NC}"
@@ -2995,7 +3016,7 @@ sys_maintenance_menu() {
         case "$_msub" in
             1) do_system_update || true; pause ;;
             2) do_retune_bandwidth || true; pause ;;
-            3) toggle_ipv6; pause ;;
+            3) toggle_ipv6 || true; pause ;;
             4) do_check_all; pause ;;
             6) _set_server_name; pause ;;
             7) do_tcping_monitor; pause ;;
@@ -7258,7 +7279,22 @@ show_menu() {
     # ---------- 防火墙状态 ----------
     printf "${C_BLUE}:: 防火墙 & 内核 ::${C_RESET}\n"
     _fw_show_status
-    printf '   内核: %s  BBR: %s\n' "$(uname -r)" "$(_get_bbr_version)"
+    local bbr_label bbr_color
+    bbr_label=$(_get_bbr_version)
+    case "$bbr_label" in
+        v3) bbr_label='BBR v3'; bbr_color=$C_GREEN ;;
+        v1) bbr_label='BBR v1'; bbr_color=$C_YELLOW ;;
+        *) bbr_label='BBR 不可用'; bbr_color=$C_DIM ;;
+    esac
+    printf '   %b内  核%b  %b%s%b   %b%s%b\n' \
+        "$C_BLUE" "$C_RESET" "$C_CYAN" "$(uname -r)" "$C_RESET" "$bbr_color" "$bbr_label" "$C_RESET"
+    local ipv6_state
+    ipv6_state=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) || ipv6_state=unknown
+    case "$ipv6_state" in
+        1) printf '   %bIPv6%b    %b已禁用%b\n' "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET" ;;
+        0) printf '   %bIPv6%b    %b已开启%b（菜单 6 → 3 切换）\n' "$C_BLUE" "$C_RESET" "$C_YELLOW" "$C_RESET" ;;
+        *) printf '   %bIPv6%b    无法读取 / 内核不支持\n' "$C_BLUE" "$C_RESET" ;;
+    esac
 
     local connection_stats
     connection_stats=$(get_connection_stats)
@@ -7266,12 +7302,12 @@ show_menu() {
     local conn_details=${connection_stats#*:}
     
     if [[ $total_conns -gt 0 ]]; then
-        printf "   ${C_GREEN}活跃连接: %d${C_RESET}\n" "$total_conns"
+        printf "   ${C_BLUE}代理连接${C_RESET}  ${C_GREEN}%d${C_RESET} (TCP)\n" "$total_conns"
         if [[ -n "$conn_details" ]]; then
             printf "   ${C_YELLOW}详情: %s${C_RESET}\n" "$conn_details"
         fi
     else
-        printf "   ${C_RED}活跃连接: 0${C_RESET}\n"
+        printf "   ${C_BLUE}代理连接${C_RESET}  ${C_DIM}0 (TCP)${C_RESET}\n"
     fi
     if find "$SNELL_CONFIG_DIR" -name "snell-[0-9]*.conf" -type f -print -quit 2>/dev/null | grep -q .; then
         local short_suffix

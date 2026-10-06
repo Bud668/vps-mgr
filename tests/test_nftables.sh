@@ -57,6 +57,9 @@ assert test ! -e "$FW_PENDING"
 assert test ! -e "$test_dir/timer"
 assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 [[ $(_fw_show_status) == *开机恢复已启用* ]] || exit 1
+status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH 22'* ]] || exit 1
+[[ $status != *TCP* && $status != *UDP* && $status != *已暂停* && $status != *ssh_ports* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
 # Repair a beta.1 interruption/disabled boot unit without replacing live rules.
 printf 'old-confirmation-token\n%s\n' "$SSH_CONNECTION" > "$FW_PENDING"
@@ -71,6 +74,8 @@ open_firewall_port 24073
 open_firewall_port 24073
 assert _fw_has_element tcp_ports 24073
 assert _fw_has_element udp_ports 24073
+status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+[[ $status == *'TCP 24073'*'UDP 24073'* ]] || exit 1
 
 mkdir -p "$QUOTA_DIR"
 printf '24073|test|104857600|-|0\n24074|socks|104857600|-|0\n' > "$QUOTA_CONFIG"
@@ -222,6 +227,7 @@ assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 assert test ! -e "$FW_PENDING"
 quota_init
 assert _fw_has_element paused_ports 24073
+[[ $(_fw_show_status) == *已暂停*24073* ]] || exit 1
 if _fw_has_element test_tcp 5201; then echo 'Temporary opening persisted' >&2; exit 1; fi
 assert test "$(quota_get_port_bytes 24073)" = '0 0'
 _quota_commit_port 24073 "$(date +%Y-%m)"

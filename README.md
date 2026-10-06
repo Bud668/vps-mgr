@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.2-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.3-orange)
 
 </div>
 
@@ -17,16 +17,16 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.2 预发布测试版**，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.3 预发布测试版**，仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
 command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.2/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.3/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.2。发布页：[v2.0.0-beta.2](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.2)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.3。发布页：[v2.0.0-beta.3](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.3)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
@@ -203,13 +203,15 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 重装系统后运行 v2 脚本：
 
-1. 选择 **「1. 一键初始化」**，无需再选“完整/简化”。独立 VPS 沿用老版的系统更新 → XanMod → 网络优化 → 防火墙 → TG/Fail2Ban 流程和默认调优档位；此前的低带宽、内存上限、连接重试安全修复保留。
+1. 选择 **「1. 一键初始化」**，无需再选“完整/简化”。独立 VPS 沿用老版的关闭 IPv6 → 系统更新 → XanMod → 网络优化 → 防火墙 → TG/Fail2Ban 流程和默认调优档位；此前的低带宽、内存上限、连接重试安全修复保留。
 2. 在同一 SSH 窗口按原来的带宽、角色、TG 等提示完成一轮配置；防火墙自动保存并启用开机恢复。仅安装了新内核时，最后提示重启一次。
 3. 按需选择 **菜单 7 Snell、8 Realm、9 sing-box（SS/SS2022、SOCKS5、Hysteria2）**，没有协议限制。
 4. NAT 容器按实际映射手填端口，例如本机映射也为 24073/24074 时才填写这两个端口；不改供应商 SSH 映射。
 5. 按需配置菜单 2（Fail2Ban）、3（通知）、13（配额）。
 
-脚本自动识别共享内核容器（如 LXC/OpenVZ），只配置必要依赖和防火墙，不升级系统、不改 DNS/IPv6、不换内核、不创建 Swap、不调整 qdisc；代理功能与独立 VPS 相同。你不需要手动判断或选择环境。NAT 或公网端口数量不能作为容器判据。
+初始化默认关闭 IPv6，立即生效并写入开机配置；需要测试时用 **菜单 6 → 3（IPv6 管理）** 开启，测试后再用同一入口关闭。通过 IPv6 SSH 登录时拒绝直接禁用，避免断开当前管理连接，请先使用 IPv4 SSH 或控制台。主菜单按实际内核状态显示 IPv6 开关。
+
+脚本自动识别共享内核容器（如 LXC/OpenVZ），只配置必要依赖、关闭容器内 IPv6 和防火墙，不升级系统、不改 DNS、不换内核、不创建 Swap、不调整 qdisc；代理功能与独立 VPS 相同。若宿主机禁止 IPv6 sysctl 写入，会明确报错，不假报成功。你不需要手动判断或选择环境。NAT 或公网端口数量不能作为容器判据。
 
 本版不额外默认安装专用 TCPing 服务；参数计算尊重 cgroup 内存上限和真实页大小。独立 VPS 不再先跑一遍轻量初始化。
 
