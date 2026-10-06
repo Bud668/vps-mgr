@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=/dev/null
+source <(sed '/^main "\$@"$/d' "${VPS_MGR_TEST_SCRIPT:-$repo_dir/vps-mgr.sh}")
+assert_eq() {
+    [[ "$1" == "$2" ]] || { printf 'FAIL: %s (expected %s, got %s)\n' "$3" "$1" "$2" >&2; exit 1; }
+}
+assert_state() {
+    local status=0
+    _firewall_init_state || status=$?
+    assert_eq "$1" "$status" "$2"
+}
+for pair in 1:1 10:10 80:80 080:80 100:100 1000:1000 1200:1200 1201:1176 6000:5880; do
+    assert_eq "${pair#*:}" "$(_fq_maxrate_mbps "${pair%:*}")" "fq rate $pair"
+done
+for invalid in '' 0 -1 80mbit 1.5; do
+    if _fq_maxrate_mbps "$invalid" >/dev/null; then echo "FAIL invalid bandwidth $invalid"; exit 1; fi
+done
+for setting in tcp_syn_retries:3:le tcp_retries2:8:ge tcp_orphan_retries:1:eq; do
+    IFS=: read -r key value comparison <<< "$setting"
+    declare -f _write_sysctl_conf | grep -Fq "net.ipv4.$key = $value"
+    declare -f do_check_all | grep -Eq "_ck_pass_file net.ipv4.$key +$value +$comparison( |$)"
+done
+for caller in do_retune_bandwidth _do_full_init; do
+    declare -f "$caller" | grep -Fq '_fq_maxrate_mbps "$bw_mbps"'
+    declare -f "$caller" | grep -Fq '_apply_fq "$_def_if" "$_fq_maxrate"'
+done
+declare -f do_retune_bandwidth | grep -Fq '/etc/sysctl.d/99-custom-tuning.conf'
+service_writes=0
+systemctl() {
+    if [[ $1 == is-active ]]; then [[ ${3:-} == "${managed_firewall:-none}" ]]
+    else service_writes=$((service_writes + 1)); return 99; fi
+}
+log_message() { :; }
+_state_locked() { "$@"; }
+mktemp() { echo 'FAIL: unexpected file write' >&2; return 99; }
+systemd-run() { echo 'FAIL: unexpected scheduler write' >&2; return 99; }
+if [[ ${1:-} == --netns ]]; then
+    [[ $(readlink /proc/self/ns/net) != "$(readlink /proc/1/ns/net)" ]] || {
+        echo 'Run: unshare --net bash tests/test_network_init.sh --netns' >&2; exit 1;
+    }
+    assert_state 0 'empty namespace'
+    nft add table inet business
+    nft add chain inet business input '{ type filter hook input priority 0; policy drop; }'
+    nft add rule inet business input tcp dport 443 accept
+    before=$(nft list ruleset)
+    if do_init_firewall --auto; then echo 'FAIL: unmanaged table accepted' >&2; exit 1; fi
+    assert_eq "$before" "$(nft list ruleset)" 'existing business rules preserved'
+    assert_eq 0 "$service_writes" 'no unrelated service writes'
+    _is_container() { return 1; } # These dummy interfaces are in a disposable namespace.
+    ip link add vps-test type dummy
+    ip link set vps-test up
+    tc qdisc add dev vps-test root handle 1: fq maxrate 100mbit flow_limit 250
+    _apply_fq vps-test "$(_fq_maxrate_mbps 80)"
+    tc qdisc show dev vps-test | grep -Eq 'fq 1:.*flow_limit 250p.*maxrate 80Mbit'
+    tc qdisc replace dev vps-test root handle 2: pfifo limit 1000
+    before=$(tc qdisc show dev vps-test)
+    if _apply_fq vps-test 80; then echo 'FAIL: unrelated qdisc accepted'; exit 1; fi
+    assert_eq "$before" "$(tc qdisc show dev vps-test)" 'unrelated qdisc preserved'
+    printf 'PASS: real native firewall preservation and actual production fq helper\n'
+    exit 0
+fi
+mock_tables=""
+nft_failure=0
+nft() {
+    (( nft_failure == 0 )) || return 1
+    [[ $* == 'list tables' ]] || return 1
+    printf '%s\n' "$mock_tables"
+}
+assert_state 0 'empty firewall'
+mock_tables='table inet business'
+assert_state 1 'other nft table'
+if do_init_firewall --auto >/dev/null; then echo 'FAIL: unrelated firewall accepted'; exit 1; fi
+mock_tables=''
+for managed_firewall in ufw firewalld netfilter-persistent nftables; do
+    assert_state 1 "$managed_firewall active"
+done
+managed_firewall=none
+nft_failure=1
+assert_state 2 'read failure'
+if do_init_firewall --auto >/dev/null 2>&1; then echo 'FAIL: read failure accepted'; exit 1; fi
+assert_eq 0 "$service_writes" 'no service mutations'
+printf 'PASS: network initialization safety regressions\n'
