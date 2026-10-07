@@ -61,7 +61,9 @@ systemctl() {
             esac ;;
         is-failed) return 1 ;;
         is-enabled) [[ ${*: -1} != tcping-monitor || -f "$test_dir/tcping-enabled" ]] ;;
-        enable) [[ $2 != tcping-monitor ]] || touch "$test_dir/tcping-enabled" ;;
+        enable)
+            [[ " $* " == *' --quiet '* ]] || printf 'Created symlink (test service)\n' >&2
+            [[ $2 != tcping-monitor ]] || touch "$test_dir/tcping-enabled" ;;
         disable) [[ $2 != tcping-monitor ]] || rm -f "$test_dir/tcping-enabled" ;;
         restart)
             if [[ $2 == tcping-monitor ]]; then
@@ -112,8 +114,11 @@ assert grep -q '05:00:00 Asia/Shanghai' "$test_dir/etc/systemd/system/vps-mgr-au
 declare -f get_latest_github_release | grep -q '/releases/latest'
 declare -f sbx_install_core | grep -q 'LimitNOFILE=1000000'
 (
-    systemctl() { [[ $1 != enable ]]; }
-    if install_autoupdate; then echo 'Failed timer enable hidden'; exit 1; fi
+    systemctl() {
+        if [[ $1 == enable ]]; then echo 'simulated service enable error' >&2; return 1; fi
+    }
+    if output=$(install_autoupdate 2>&1); then echo 'Failed timer enable hidden'; exit 1; fi
+    [[ $output == *'simulated service enable error'* ]] || { echo 'Service error output hidden'; exit 1; }
 )
 
 # Exim changes are reversible, idempotent, preserve custom macros and roll back.
@@ -179,7 +184,9 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 
 # Exercise both real initialization paths with only OS operations stubbed.
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
-for environment in vps container; do
+assert test "$(declare -f _do_full_init | grep -c '立即重启？')" = 1
+assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
+for environment in vps container partial; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
@@ -191,7 +198,7 @@ for environment in vps container; do
     apt-get() { :; }
     apt-cache() { :; }
     dpkg-query() { printf 'install ok installed'; }
-    _write_disable_ipv6_conf() { record ipv6; [[ $environment == vps ]]; }
+    _write_disable_ipv6_conf() { record ipv6; [[ $environment != container ]]; }
     _exim_ipv6_compat() { :; }
     get_public_ip() { echo 192.0.2.1; }
     get_geo_info() { :; }
@@ -211,26 +218,67 @@ for environment in vps container; do
     _apply_nofile_limits() { record nofile; }
     _apply_journald_limits() { record journald; }
     ip() { echo 'default via 192.0.2.254 dev test0'; }
-    _apply_fq() { record fq; }
+    _apply_fq() { record fq; [[ $environment != partial ]]; }
     _get_bbr_version() { echo v3; }
     do_init_firewall() { record firewall; }
-    _tg_input_tokens() { record telegram; }
-    _install_fail2ban() { record fail2ban; }
-    _tcping_setup_silent() { record tcping; }
-    do_quick_init </dev/null > "$test_dir/init-$environment.log"
+    _tg_input_tokens() { record telegram; [[ $environment != partial ]]; }
+    _install_fail2ban() { record fail2ban; [[ $environment != partial ]]; }
+    _tcping_setup_silent() { record tcping; [[ $environment != partial ]]; }
+    if [[ $environment == partial ]]; then
+        install_autoupdate() { echo 'simulated updater error' >&2; return 1; }
+    fi
+    do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1
     for feature in ipv6 logs nofile journald firewall telegram fail2ban tcping; do
         assert grep -qx "$feature" "$test_dir/calls"
     done
-    assert grep -q 'enable --now vps-mgr-autoupdate.timer' "$test_dir/calls"
+    for step in {1..8}; do
+        assert test "$(grep -Fc "[$step/8]" "$test_dir/init-$environment.log")" = 1
+    done
+    assert test "$(grep -c '初始化结束' "$test_dir/init-$environment.log")" = 1
+    assert test "$(grep -c '代理任选' "$test_dir/init-$environment.log")" = 1
+    if grep -Eq '初始化汇总|Created symlink|── \[\+\]|✓ 端口速度:|✓ 角色:' "$test_dir/init-$environment.log"; then
+        echo 'Repeated initialization output'; exit 1
+    fi
+    if [[ $environment == partial ]]; then
+        assert grep -q '未完成 / 已跳过：.*网络调优.*TG 推送.*Fail2Ban.*TCPing.*每日更新' "$test_dir/init-$environment.log"
+        assert grep -q 'simulated updater error' "$test_dir/init-$environment.log"
+        assert grep -q 'fq 调优或持久化未完成' "$test_dir/init-$environment.log"
+        if grep -q 'fq 已保存\|每日更新已启用' "$test_dir/init-$environment.log"; then
+            echo 'Failed initialization reported success'; exit 1
+        fi
+    else
+        assert grep -q 'enable --now vps-mgr-autoupdate.timer --quiet' "$test_dir/calls"
+        assert test "$(grep -c '每日更新已启用' "$test_dir/init-$environment.log")" = 1
+    fi
     if [[ $environment == container ]]; then
         if grep -qxE 'sysctl|fq' "$test_dir/calls"; then echo 'Container changed host tuning'; exit 1; fi
         assert grep -q 'IPv6.*未禁用' "$test_dir/init-$environment.log"
-    else
+    elif [[ $environment == vps ]]; then
         assert grep -qx fq "$test_dir/calls"
-        assert grep -q 'fq 已保存' "$test_dir/init-$environment.log"
+        assert test "$(grep -c 'fq 已保存' "$test_dir/init-$environment.log")" = 1
+        if grep -q '未完成 / 已跳过' "$test_dir/init-$environment.log"; then echo 'Successful initialization marked incomplete'; exit 1; fi
     fi
 )
 done
+# Keep the SSH policy and ban count, not the verbose Fail2Ban status tree.
+(
+    mkdir -p "$test_dir/etc/fail2ban/jail.d"
+    touch "$test_dir/etc/fail2ban/action.d/nftables-multiport.conf"
+    get_current_ssh_port() { echo 26680; }
+    _f2b_apply_all_nft() { :; }
+    _harden_sshd() { :; }
+    sleep() { :; }
+    fail2ban-client() {
+        if [[ $1 == -t ]]; then echo 'OK: configuration test is successful'
+        else printf 'Status for the jail: sshd\nCurrently banned: 2\n'; fi
+    }
+    output=$(_install_fail2ban 2>&1)
+    [[ $output == *'已封禁 2 IP'* && $output == *'永久封禁  端口: 26680'* ]] || exit 1
+    [[ $output != *'Status for the jail:'* && $output != *'配置 Fail2Ban...'* ]] || exit 1
+    fail2ban-client() { echo 'simulated Fail2Ban configuration error' >&2; return 1; }
+    if output=$(_install_fail2ban 2>&1); then echo 'Invalid Fail2Ban config accepted'; exit 1; fi
+    [[ $output == *'simulated Fail2Ban configuration error'* ]] || exit 1
+)
 (
     journalctl() { sleep 20; }
     export -f journalctl _fw_logs_menu _run_live_log _filter_fw_logs

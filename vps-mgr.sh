@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.5"
+readonly SCRIPT_VERSION="2.0.0-beta.6"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1016,7 +1016,7 @@ _fw_finish_init() {
     for port in ${ports//,/ }; do
         _fw_has_element ssh_ports "$port" || { msg_error "SSH 端口 $port 未放行，未完成初始化"; return 1; }
     done
-    _fw_persist && systemctl enable "$FW_SERVICE.service" >/dev/null &&
+    _fw_persist && systemctl enable "$FW_SERVICE.service" --quiet >/dev/null &&
         systemctl is-enabled --quiet "$FW_SERVICE.service" || {
         msg_error "防火墙保存或开机恢复启用失败，不能视为初始化完成"; return 1;
     }
@@ -1908,7 +1908,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
     if (( rc == 0 )) && systemctl daemon-reload &&
-        systemctl enable "$TCPING_SERVICE_NAME" &&
+        systemctl enable "$TCPING_SERVICE_NAME" --quiet &&
         systemctl restart "$TCPING_SERVICE_NAME" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" &&
         printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
             "$FW_TABLE" "$FW_TABLE" "$monitor_port" | _fw_apply; then
@@ -2393,7 +2393,7 @@ EOF
         printf '%s\n' '#!/bin/sh' 'case "${2:-up}" in up|dhcp4-change|connectivity-change) systemctl start --no-block vps-mgr-fq.service ;; esac' > "$hook" || return 1
         chmod 755 "$hook" || return 1
     done
-    systemctl daemon-reload && systemctl enable vps-mgr-fq.service
+    systemctl daemon-reload && systemctl enable vps-mgr-fq.service --quiet
 }
 
 do_system_update() {
@@ -2442,26 +2442,22 @@ _do_full_init() {
     _is_container && _container=1
     clear
     echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
-    echo -e "  ${CYAN}关闭IPv6${NC} → ${CYAN}系统更新${NC} → ${CYAN}XanMod内核${NC} → ${CYAN}网络优化${NC} → ${CYAN}nftables${NC} → ${CYAN}TG/Fail2Ban${NC}"
     if (( _container )); then
         msg_info "检测到共享内核容器：保留完整用户态功能，跳过换内核、Swap 和宿主网络调优"
-    else
-        echo -e "  带宽须人工确认，安装内核后仅在最后重启一次以启用 BBR v3"
     fi
-    echo
 
-    local _ok_sys=0 _ok_net=0 _ok_fw=0 _ok_f2b=0 _ok_tg=0
+    local _ok_sys=0 _ok_net=0 _ok_f2b=0 _ok_tg=0
     local _net_bw=0 _rmem_mb=0 _cc="cubic"
     local _xanmod_done=0 _xanmod_pkg="" _xanmod_avx=""
     local _init_srv_name=""
 
-    echo -e "\n${L_BLUE}── [1/5] 默认关闭 IPv6 ─────────────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [1/8] 默认关闭 IPv6 ─────────────────────────────────${NC}"
     if _write_disable_ipv6_conf; then _ok_ipv6=1
     elif (( _container )); then msg_warn "IPv6 未禁用（权限或 IPv6 SSH 限制），继续安装其他功能"
     else return 1; fi
 
-    # ── [2/5] 系统更新 & 依赖安装 ───────────────────────────
-    echo -e "\n${L_BLUE}── [2/5] 系统更新 & 依赖安装 ──────────────────────────${NC}"
+    # ── [2/8] 系统更新 & 依赖安装 ───────────────────────────
+    echo -e "\n${L_BLUE}── [2/8] 系统更新 & 依赖安装 ──────────────────────────${NC}"
 
     if ! check_package_manager_lock; then return; fi
 
@@ -2508,7 +2504,7 @@ _do_full_init() {
     if [ ${#_to_install[@]} -eq 0 ]; then
         echo -e "  ${GREEN}✓ 依赖: 共 ${_qi_total} 个，已全部安装${NC}"
     else
-        echo -e "  ${CYAN}⟳ 依赖: ${_qi_installed} 已安装，${#_to_install[@]} 待安装: ${_to_install[*]}${NC}"
+        echo -e "  ${CYAN}⟳ 依赖: ${_qi_installed} 已安装，${#_to_install[@]} 待安装${NC}"
         (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_to_install[@]}" < /dev/null >/dev/null 2>&1) &
         local _inst_pid=$!
         show_spinner $_inst_pid "  安装中"
@@ -2644,8 +2640,8 @@ EOF
     echo -ne "  名称 (如 🇯🇵SR_JP_Std，回车自动填): "
     read -r _init_srv_name < /dev/tty || true
 
-    # ── [3/5] XanMod 内核安装 (BBR v3) ──────────────────────
-    echo -e "\n${L_BLUE}── [3/5] XanMod 内核 (BBR v3) ─────────────────────────${NC}"
+    # ── [3/8] XanMod 内核安装 ──────────────────────────────
+    echo -e "\n${L_BLUE}── [3/8] XanMod 内核 ───────────────────────────────────${NC}"
     if (( _container )); then
         msg_info "容器共用宿主内核，跳过 XanMod 安装"
     elif [ "$(uname -m)" != "x86_64" ]; then
@@ -2675,7 +2671,7 @@ EOF
             echo -e "  ${CYAN}提示: 升级内存至 512MB+ 后可手动安装${NC}"
         else
             # RAM < 512MB 且无 Swap 时，临时建 512MB Swap 防止安装 OOM
-            # 标志文件让 [4/5] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
+            # 标志文件让 [4/8] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
             if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
                 echo -e "  ${YELLOW}⚠ 内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
                 fallocate -l 512M /swapfile 2>/dev/null || \
@@ -2720,7 +2716,7 @@ EOF
                     if wait $_xm_pid; then
                         sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|' /etc/default/grub
                         update-grub >/dev/null 2>&1 || true
-                        echo -e "  ${GREEN}✓ 安装完成，GRUB 已更新，重启后自动加载 XanMod${NC}"
+                        echo -e "  ${GREEN}✓ 内核安装完成，GRUB 已更新${NC}"
                         _xanmod_done=1
                     else
                         echo -e "  ${RED}✗ 安装失败，请手动: apt-get install -y ${_xm_img} ${_xm_hdr}${NC}"
@@ -2730,8 +2726,8 @@ EOF
         fi
     fi
 
-    # ── [4/5] 网络优化 (DNS + Swap + sysctl) ────────────────
-    echo -e "\n${L_BLUE}── [4/5] 网络优化 (DNS + sysctl) ──────────────────────${NC}"
+    # ── [4/8] 网络优化 (DNS + Swap + sysctl) ────────────────
+    echo -e "\n${L_BLUE}── [4/8] 网络优化 (DNS + Swap + sysctl) ───────────────${NC}"
     local phys_mem_mb
     phys_mem_mb=$(_effective_mem_mb)
 
@@ -2772,14 +2768,12 @@ DNSEOF
     local _port_input; read -r _port_input < /dev/tty || true
     _port_input=$(echo "$_port_input" | tr -d '[:space:]')
     [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -gt 0 ] && bw_mbps=$_port_input
-    echo -e "  ${GREEN}✓ 端口速度: ${bw_mbps} Mbps${NC}"
     echo -e "  ${BLUE}请选择机器角色:${NC}"
     echo -e "    ${BLUE}[1]${NC} 优化线路 (中转/高并发)"
     echo -e "    ${BLUE}[2]${NC} 落地     (低并发/单连接给满 BDP)  ${GREEN}[默认]${NC}"
     echo -ne "  ${BLUE}请选择 [2]: ${NC}"
     local _role_in; read -r _role_in < /dev/tty || true
     local _role="edge"; [ "$(echo "$_role_in" | tr -d '[:space:]')" = "1" ] && _role="transit"
-    echo -e "  ${GREEN}✓ 角色: $([ "$_role" = edge ] && echo '落地(单连接给满BDP)' || echo '优化线路(防单连接吃爆池)')${NC}"
 
     # BBR / 拥塞控制
     if [ "$_xanmod_done" -eq 1 ]; then
@@ -2788,19 +2782,14 @@ DNSEOF
         modprobe tcp_bbr 2>/dev/null || true
         sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
         sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-        echo -e "  ${GREEN}✓ BBR v3 待重启后生效 (${_xanmod_pkg}，sysctl 已预写入)${NC}"
     else
         modprobe tcp_bbr 2>/dev/null || true
         if grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
             _cc="bbr"
             sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
             sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-            if [ "$_xanmod_done" -eq 2 ]; then
-                local _bv; _bv=$(_get_bbr_version)
-                echo -e "  ${GREEN}✓ BBR ${_bv} 已生效 (XanMod $(uname -r | cut -d- -f1))${NC}"
-            else
-                echo -e "  ${GREEN}✓ BBR 已加载 (原版内核 BBR v1)${NC}"
-            fi
+            local _bv; _bv=$(_get_bbr_version)
+            echo -e "  ${GREEN}✓ BBR ${_bv} 已加载${NC}"
         else
             echo -e "  ${YELLOW}⚠ BBR 模块不可用，将使用默认拥塞控制 (${_cc})${NC}"
         fi
@@ -2813,13 +2802,13 @@ DNSEOF
     sysctl -w net.ipv4.route.flush=1 >/dev/null 2>&1 || true
     _apply_conntrack_sysctl "$_P_CONNTRACK_MAX"
     _net_bw=$bw_mbps; _rmem_mb=$(( _P_RMEM_MAX / 1048576 ))
-    echo -e "  ${GREEN}✓ sysctl 写入完成  rmem: ${_rmem_mb}MB  CC: ${_cc}${NC}"
 
     local _def_if _fq_maxrate
     _def_if=$(ip route show default | awk '{print $5; exit}')
     _fq_maxrate=$(_fq_maxrate_mbps "$bw_mbps") || return 1
     if _apply_fq "$_def_if" "$_fq_maxrate" && _persist_fq "$_fq_maxrate"; then
         _ok_net=1
+        echo -e "  ${GREEN}✓ 网络: ${_net_bw}Mbps · $([ "$_role" = edge ] && echo '落地' || echo '中转') · rmem ${_rmem_mb}MB · CC: ${_cc} · fq 已保存${NC}"
     else
         msg_warn "sysctl 已写入，但 fq 调优或持久化未完成；请检查后用菜单 6 → 2 重试"
     fi
@@ -2827,13 +2816,12 @@ DNSEOF
     _apply_nofile_limits
     _apply_journald_limits
 
-    # ── [5/5] 防火墙初始化 ──────────────────────────────────
-    echo -e "\n${L_BLUE}── [5/5] 防火墙初始化 ──────────────────────────────────${NC}"
+    # ── [5/8] 防火墙初始化 ──────────────────────────────────
+    echo -e "\n${L_BLUE}── [5/8] 防火墙初始化 ──────────────────────────────────${NC}"
     do_init_firewall || return 1
-    _ok_fw=1
 
     # TG 推送配置
-    echo -e "\n${L_BLUE}── [+] TG 推送 ──────────────────────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [6/8] TG 推送 ───────────────────────────────────────${NC}"
     if [[ -f "$TG_CONF" ]] && grep -q "^TG_BOT_TOKEN=" "$TG_CONF" 2>/dev/null; then
         echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
         _ok_tg=1
@@ -2851,7 +2839,7 @@ DNSEOF
     fi
 
     # Fail2Ban 规则配置
-    echo -e "\n${L_BLUE}── [+] Fail2Ban ─────────────────────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [7/8] Fail2Ban ──────────────────────────────────────${NC}"
     if [[ -f /etc/fail2ban/jail.d/sshd.conf ]] && fail2ban-client status sshd >/dev/null 2>&1; then
         echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
         _ok_f2b=1
@@ -2859,70 +2847,28 @@ DNSEOF
         _install_fail2ban && _ok_f2b=1 || true
     fi
 
-    echo -e "\n${L_BLUE}── [+] TCPing / 每日更新 ─────────────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [8/8] TCPing / 每日更新 ──────────────────────────────${NC}"
     _tcping_setup_silent && _ok_tcping=1 || msg_warn "TCPing 安装未完成，可从菜单 6 → 7 重试"
     install_autoupdate && _ok_update=1 || msg_warn "每日更新未启用，可从菜单 16 重试"
-
-    # ── 汇总报告 ─────────────────────────────────────────────
-    echo
-    echo -e "${L_PURPLE}─────────────────── 初始化汇总 ─────────────────────────${NC}"
-    if (( _ok_ipv6 )); then
-        echo -e "  IPv6        ${GREEN}已禁用（菜单 6 → 3 可手动开启）${NC}"
-    else
-        echo -e "  IPv6        ${YELLOW}未禁用，请检查容器权限或改用 IPv4 SSH${NC}"
-    fi
-    [ $_ok_sys -eq 1 ] \
-        && echo -e "  系统更新    ${GREEN}✓${NC}" \
-        || echo -e "  系统更新    ${RED}✗${NC}"
-    if [ "$_xanmod_done" -eq 1 ]; then
-        echo -e "  XanMod      ${GREEN}✓${NC}   ${WHITE}${_xanmod_pkg} 已安装，重启后生效${NC}"
-    elif [ "$_xanmod_done" -eq 2 ]; then
-        echo -e "  XanMod      ${GREEN}✓${NC}   ${WHITE}已运行 $(uname -r | sed 's/-x64v.*//')${NC}"
-    else
-        echo -e "  XanMod      ${YELLOW}跳过${NC}"
-    fi
-    case $_ok_net in
-        1) echo -e "  网络优化    ${GREEN}✓${NC}   ${WHITE}${_net_bw}Mbps · rmem ${_rmem_mb}MB · CC: ${_cc} · fq 已保存${NC}" ;;
-        2) echo -e "  网络优化    ${YELLOW}容器跳过宿主调优${NC}" ;;
-        *) echo -e "  网络优化    ${YELLOW}部分完成，fq 未完成（菜单 6 → 2）${NC}" ;;
-    esac
-    [ $_ok_fw -eq 1 ] \
-        && echo -e "  防火墙      ${GREEN}✓ 已生效、已保存、开机恢复已启用${NC}" \
-        || echo -e "  防火墙      ${YELLOW}跳过${NC}"
-    [ $_ok_tg -eq 1 ] \
-        && echo -e "  TG 推送     ${GREEN}✓${NC}" \
-        || echo -e "  TG 推送     ${YELLOW}跳过${NC}"
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        local _fb_banned; _fb_banned=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
-        echo -e "  Fail2Ban    ${GREEN}✓${NC}   ${WHITE}封禁 ${_fb_banned} IP${NC}"
-    else
-        echo -e "  Fail2Ban    ${YELLOW}跳过${NC}"
-    fi
-    if (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null; then
-        local _tp; _tp=$(grep "^PORT=" "$TCPING_CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "?")
-        echo -e "  TCPing      ${GREEN}✓${NC}   ${WHITE}端口 ${_tp}${NC}"
-    else
-        echo -e "  TCPing      ${YELLOW}跳过${NC}"
-    fi
     if (( _ok_update )); then
-        echo -e "  每日更新    ${GREEN}✓ 仅跟随正式版，不自动安装 beta${NC}"
-    else
-        echo -e "  每日更新    ${YELLOW}未启用${NC}"
+        echo -e "  ${GREEN}✓ 每日更新已启用（仅正式版，不自动安装 beta）${NC}"
     fi
-    if (( _container )); then
-        echo -e "  BBR         ${CYAN}由宿主提供（当前 $(_get_bbr_version)）${NC}"
-    elif [ "$_cc" = "bbr" ]; then
-        if [ "$_xanmod_done" -eq 1 ]; then
-            echo -e "  BBR v3      ${CYAN}⟳${NC}   ${WHITE}待重启后生效 (sysctl 已预写入)${NC}"
-        elif [ "$_xanmod_done" -eq 2 ]; then
-            echo -e "  BBR v3      ${GREEN}✓${NC}   ${WHITE}已生效 (XanMod 内核)${NC}"
-        else
-            echo -e "  BBR         ${GREEN}✓${NC}   ${WHITE}已启用 (原版内核 BBR v1)${NC}"
-        fi
-    else
-        echo -e "  BBR         ${RED}✗${NC}   ${WHITE}内核不支持，当前使用 ${_cc}${NC}"
+
+    # 成功结果已在各步骤显示，末尾只集中提醒未完成或主动跳过的项目。
+    echo
+    echo -e "${L_PURPLE}─────────────────── 初始化结束 ─────────────────────────${NC}"
+    local _pending=()
+    (( _ok_ipv6 )) || _pending+=("IPv6")
+    (( _ok_sys )) || _pending+=("系统依赖")
+    (( _container || _xanmod_done > 0 )) || _pending+=("XanMod")
+    (( _ok_net )) || _pending+=("网络调优")
+    (( _ok_tg )) || _pending+=("TG 推送")
+    (( _ok_f2b )) && systemctl is-active --quiet fail2ban 2>/dev/null || _pending+=("Fail2Ban")
+    (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null || _pending+=("TCPing")
+    (( _ok_update )) || _pending+=("每日更新")
+    if (( ${#_pending[@]} )); then
+        msg_warn "未完成 / 已跳过：${_pending[*]}（见上方提示，可从对应菜单单独处理）"
     fi
-    echo -e "${L_PURPLE}─────────────────────────────────────────────────────────${NC}"
     msg_info "代理任选：菜单 7 Snell · 8 Realm · 9 SS/SS2022、SOCKS5、Hysteria2"
     # 新安装内核后给出重启提示
     if [ "$_xanmod_done" -eq 1 ]; then
@@ -3064,9 +3010,7 @@ _f2b_reload_whitelist() {
 
 _install_fail2ban() {
     _fw_ensure || return 1
-    if command -v fail2ban-client &>/dev/null; then
-        echo -e "\n${L_CYAN}配置 Fail2Ban...${NC}"
-    else
+    if ! command -v fail2ban-client &>/dev/null; then
         echo -e "\n${L_CYAN}安装 Fail2Ban...${NC}"
         if ! command -v apt-get &>/dev/null; then
             echo -e "${RED}仅支持 apt 系统${NC}"; return 1
@@ -3108,9 +3052,10 @@ EOF
     systemctl restart fail2ban || return 1
     sleep 2
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        echo -e "${GREEN}✓ Fail2Ban 已启动${NC}"
+        local _fb_banned
+        _fb_banned=$(fail2ban-client status sshd 2>/dev/null | awk '/Currently banned:/{print $NF}') || _fb_banned="?"
+        echo -e "${GREEN}✓ Fail2Ban 已启动（已封禁 ${_fb_banned:-?} IP）${NC}"
         echo -e "  SSH 配置: 24小时内失败 3 次 → 永久封禁  端口: ${_ssh_port}"
-        fail2ban-client status sshd 2>/dev/null || true
     else
         echo -e "${RED}✗ fail2ban 启动失败，请检查: journalctl -u fail2ban${NC}"
         return 1
@@ -3217,7 +3162,7 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable "$SSH_TG_SERVICE" &&
+    systemctl daemon-reload && systemctl enable "$SSH_TG_SERVICE" --quiet &&
         systemctl restart "$SSH_TG_SERVICE" || return 1
     systemctl is-active --quiet "$SSH_TG_SERVICE" || return 1
     msg_success "SSH 通知已启用（独立低权限用户、双栈来源地址）"
@@ -5189,7 +5134,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload && systemctl enable --now vps-mgr-autoupdate.timer &&
+    systemctl daemon-reload && systemctl enable --now vps-mgr-autoupdate.timer --quiet &&
         systemctl is-enabled --quiet vps-mgr-autoupdate.timer && systemctl is-active --quiet vps-mgr-autoupdate.timer
 }
 
