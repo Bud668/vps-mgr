@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.7-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.8-orange)
 
 </div>
 
@@ -17,16 +17,16 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.7 预发布测试版**，保留 beta.6 的全部功能与初始化输出精简，恢复老版首页端口样式，修复默认 `mq 0:` 队列调优，新增纯 Google / Cloudflare DNS 选择（3 秒未确认默认 Google）；带宽测速、手动输入和调优参数不变。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.8 预发布测试版**，保留 beta.7 的全部功能与修复，仅将初始化 DNS 改为默认纯 Cloudflare、可选纯 Google，3 秒未确认自动使用 Cloudflare；带宽测速、手动输入和调优参数不变。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
 (command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && \
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.7/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.8/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.7。发布页：[v2.0.0-beta.7](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.7)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.8。发布页：[v2.0.0-beta.8](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.8)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
@@ -221,7 +221,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 初始化默认关闭 IPv6，立即生效并写入开机配置；需要测试时用 **菜单 6 → 3（IPv6 管理）** 开启，测试后再用同一入口关闭。通过 IPv6 SSH 登录时拒绝直接禁用，避免断开当前管理连接，请先使用 IPv4 SSH 或控制台。主菜单按实际内核状态显示 IPv6 开关。
 
-初始化的 DNS 步骤可选 **1 Google（8.8.8.8 / 8.8.4.4，默认）** 或 **2 Cloudflare（1.1.1.1 / 1.0.0.1）**。输入编号并回车确认；直接回车或 3 秒内未确认，自动使用 Google。挂载或只读的容器 DNS 仍保留宿主配置，不弹出选择。
+初始化的 DNS 步骤可选 **1 Cloudflare（1.1.1.1 / 1.0.0.1，默认）** 或 **2 Google（8.8.8.8 / 8.8.4.4）**。输入编号并回车确认；直接回车或 3 秒内未确认，自动使用 Cloudflare。挂载或只读的容器 DNS 仍保留宿主配置，不弹出选择。
 
 脚本自动识别共享内核容器（如 LXC/OpenVZ），与 VPS 共用完整用户态初始化：依赖/软件更新、时区、日志、文件描述符、TG、Fail2Ban、TCPing 和每日更新不再整批跳过。只跳过换内核、Swap、宿主 sysctl/qdisc 和共享时钟修改；挂载或只读 DNS 文件保留宿主设置。若宿主禁止 IPv6 sysctl 写入，会报告“未禁用”并继续其他功能，不假报成功。菜单 2 → 3 可单独安装/修复 Fail2Ban。你不需要手动判断或选择环境，NAT 或公网端口数量不能作为容器判据。
 

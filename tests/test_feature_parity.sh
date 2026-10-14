@@ -186,7 +186,7 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
 assert test "$(declare -f _do_full_init | grep -c '立即重启？')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps cf blank invalid timeout unlocked dns_fail container partial; do
+for environment in vps cf google blank invalid timeout unlocked dns_fail container partial; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
@@ -214,7 +214,8 @@ for environment in vps cf blank invalid timeout unlocked dns_fail container part
             assert test "$*" = '-r -t 3 _dns_choice'
             record dns
             case $environment in
-                cf) _dns_choice=2 ;;
+                cf) _dns_choice=1 ;;
+                google) _dns_choice=2 ;;
                 blank) _dns_choice="" ;;
                 invalid) _dns_choice=wrong ;;
                 timeout) _dns_choice=2; return 142 ;;
@@ -262,15 +263,20 @@ for environment in vps cf blank invalid timeout unlocked dns_fail container part
         if grep -qx dns "$test_dir/calls"; then echo 'Managed container DNS prompted'; exit 1; fi
     else
         assert grep -qx dns "$test_dir/calls"
-        dns_provider=Google
-        dns_expected=$'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions timeout:2 attempts:2'
-        if [[ $environment == cf ]]; then
-            dns_provider=Cloudflare
-            dns_expected=$'nameserver 1.1.1.1\nnameserver 1.0.0.1\noptions timeout:2 attempts:2'
+        assert grep -Fq '[1] Cloudflare  1.1.1.1 / 1.0.0.1（默认）' "$test_dir/init-$environment.log"
+        assert grep -Fq '[2] Google      8.8.8.8 / 8.8.4.4' "$test_dir/init-$environment.log"
+        dns_provider=Cloudflare
+        dns_expected=$'nameserver 1.1.1.1\nnameserver 1.0.0.1\noptions timeout:2 attempts:2'
+        if [[ $environment == google ]]; then
+            dns_provider=Google
+            dns_expected=$'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions timeout:2 attempts:2'
         fi
         assert test "$(cat "$test_dir/etc/resolv.conf")" = "$dns_expected"
+        if [[ $environment == invalid ]]; then
+            assert grep -q '无效选择，使用默认 Cloudflare DNS' "$test_dir/init-$environment.log"
+        fi
         if [[ $environment == unlocked ]]; then
-            assert grep -q 'DNS 已设置为 Google.*文件未锁定' "$test_dir/init-$environment.log"
+            assert grep -q 'DNS 已设置为 Cloudflare.*文件未锁定' "$test_dir/init-$environment.log"
             if grep -q 'DNS:.*已锁定' "$test_dir/init-$environment.log"; then echo 'DNS lock failure hidden'; exit 1; fi
         else
             assert grep -q "DNS: $dns_provider.*已锁定" "$test_dir/init-$environment.log"

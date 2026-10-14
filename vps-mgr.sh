@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.7"
+readonly SCRIPT_VERSION="2.0.0-beta.8"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -2761,16 +2761,16 @@ EOF
     if (( _container )) && { mountpoint -q /etc/resolv.conf || [[ ! -w /etc/resolv.conf ]]; }; then
         msg_info "容器 DNS 文件由宿主管理，保持现有配置"
     else
-    local _dns_choice="" _dns_primary="8.8.8.8" _dns_secondary="8.8.4.4" _dns_provider="Google"
-    printf '  DNS: [1] Google      8.8.8.8 / 8.8.4.4（默认）\n'
-    printf '       [2] Cloudflare  1.1.1.1 / 1.0.0.1\n'
+    local _dns_choice="" _dns_primary="1.1.1.1" _dns_secondary="1.0.0.1" _dns_provider="Cloudflare"
+    printf '  DNS: [1] Cloudflare  1.1.1.1 / 1.0.0.1（默认）\n'
+    printf '       [2] Google      8.8.8.8 / 8.8.4.4\n'
     printf '  请选择 [1/2，回车或 3 秒超时默认 1]: '
     read -r -t 3 _dns_choice 2>/dev/null < /dev/tty || _dns_choice=1
     printf '\n'
     case $_dns_choice in
-        2) _dns_primary="1.1.1.1"; _dns_secondary="1.0.0.1"; _dns_provider="Cloudflare" ;;
+        2) _dns_primary="8.8.8.8"; _dns_secondary="8.8.4.4"; _dns_provider="Google" ;;
         ''|1) ;;
-        *) msg_warn "无效选择，使用默认 Google DNS" ;;
+        *) msg_warn "无效选择，使用默认 Cloudflare DNS" ;;
     esac
     # 若 /etc/resolv.conf 是符号链接（systemd-resolved 系统），先删除再创建真实文件
     # 否则 chattr +i 对 tmpfs 目标静默失败，重启后 DNS 被 systemd-resolved 覆盖
