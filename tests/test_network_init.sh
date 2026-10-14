@@ -51,9 +51,17 @@ done
 # Kernel-created fq queues have handle 0:; change cannot configure these.
 (
     _is_container() { return 1; }
+    log_message() { :; }
     tc() {
         if [[ $* == '-j qdisc show dev boot-test' ]]; then printf '%s\n' "$qdiscs"
-        else printf '%s\n' "$*"; fi
+        else
+            if [[ $* == 'qdisc replace dev boot-test root mq' ]]; then
+                qdiscs=$(jq 'map(if .root then .handle="10:"
+                    elif (.parent | startswith(":")) or (.parent | startswith("0:")) then .parent=("10:" + (.parent | split(":")[1]))
+                    else . end)' <<< "$qdiscs")
+            fi
+            printf '%s\n' "$*"
+        fi
     }
     qdiscs='[{"kind":"fq","handle":"0:","root":true}]'
     assert_eq 'qdisc replace dev boot-test root fq maxrate 80mbit flow_limit 250' \
@@ -61,6 +69,59 @@ done
     qdiscs='[{"kind":"mq","handle":"10:","root":true},{"kind":"fq","handle":"0:","parent":"10:1"},{"kind":"fq","handle":"0:","parent":"10:2"}]'
     assert_eq $'qdisc replace dev boot-test parent 10:1 fq maxrate 80mbit flow_limit 250\nqdisc replace dev boot-test parent 10:2 fq maxrate 80mbit flow_limit 250' \
         "$(_apply_fq boot-test 80)" 'implicit mq leaves need create-or-change'
+    # Kernel-default mq uses handle 0:, but iproute2 may print parents as :1.
+    for major in '' 0; do
+        qdiscs="[{\"kind\":\"mq\",\"handle\":\"0:\",\"root\":true},
+            {\"kind\":\"fq\",\"handle\":\"0:\",\"parent\":\"${major}:1\"},
+            {\"kind\":\"fq_codel\",\"handle\":\"0:\",\"parent\":\"${major}:2\"},
+            {\"kind\":\"ingress\",\"parent\":\"ffff:fff1\"}]"
+        assert_eq "$(printf 'qdisc replace dev boot-test root mq\n'; printf 'qdisc replace dev boot-test parent %s fq maxrate 80mbit flow_limit 250\n' 10:1 10:2)" \
+            "$(_apply_fq boot-test 80)" "default mq parents ${major}:1/${major}:2"
+        configured_leaf=$(jq '.[1].handle="1:"' <<< "$qdiscs")
+        (
+            qdiscs=$configured_leaf
+            if output=$(_apply_fq boot-test 80); then echo 'FAIL: configured default mq leaf accepted'; exit 1; fi
+            [[ $output != *'qdisc replace'* ]] || { echo 'FAIL: configured mq root rebuilt'; exit 1; }
+        )
+        qdiscs=$(jq '.[2].kind="htb"' <<< "$qdiscs")
+        if output=$(_apply_fq boot-test 80); then echo 'FAIL: custom default mq leaf accepted'; exit 1; fi
+        [[ $output != *'qdisc replace'* ]] || { echo 'FAIL: mixed default mq partly modified'; exit 1; }
+    done
+)
+# The dashboard keeps the old SSH dot and compact t/u ports, even before proxies.
+(
+    COLUMNS=120
+    systemctl() { return 0; }
+    get_current_ssh_port() { echo 26680; }
+    _sbx_acl_status() { echo 关闭; }
+    nft() { [[ $* == 'list tables' ]] || printf '%s\n' "$dashboard_rules"; }
+    dashboard_rules='{"nftables":[{"chain":{"name":"input","policy":"drop"}},
+        {"set":{"name":"ssh_ports","elem":[26680,2222]}},
+        {"set":{"name":"tcp_ports","elem":[9999,24073,24075,24076,24077,24078,24079]}},
+        {"set":{"name":"udp_ports","elem":[24073,24074]}},
+        {"set":{"name":"tcping_ports","elem":[9999]}},
+        {"set":{"name":"test_tcp","elem":[{"elem":{"val":5201,"expires":3600}}]}},
+        {"set":{"name":"test_udp","elem":[{"elem":{"val":5201,"expires":3600}}]}}]}'
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $output == *'端  口   ● SSH:26680'* ]] || { echo 'FAIL: SSH port row missing'; exit 1; }
+    for token in '2222(t)' '9999(t)[TCPing]' '5201(t/u)[测试]' '24073(t/u)' '24074(u)'; do
+        [[ $output == *"$token"* ]] || { echo "FAIL: dashboard port $token"; exit 1; }
+    done
+    assert_eq 1 "$(grep -oF '9999(t)' <<< "$output" | wc -l)" 'monitor port deduplicated'
+    assert_eq 3 "$(grep -c '^          [0-9]' <<< "$output")" 'at most four ports per line'
+    COLUMNS=48
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $(grep -c '^          [0-9]' <<< "$output") -gt 3 ]] || { echo 'FAIL: narrow dashboard does not wrap'; exit 1; }
+    get_current_ssh_port() { echo 26680,26682; }
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $output == *'● SSH:26680'*'○ SSH:26682'* ]] || { echo 'FAIL: blocked SSH falsely shown open'; exit 1; }
+    dashboard_rules=$(jq '.nftables[0].chain.policy="accept"' <<< "$dashboard_rules")
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $output == *'● SSH:26682'*'默认放行（ACCEPT；封禁/ACL 仍有效）'* ]] || exit 1
+    dashboard_rules='{"nftables":[{"chain":{"name":"input","policy":"drop"}},{"set":{"name":"ssh_ports","elem":[26680]}}]}'
+    get_current_ssh_port() { echo 26680; }
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $output == *'端  口   ● SSH:26680'* ]] || { echo 'FAIL: no proxy hides port row'; exit 1; }
 )
 # One entry, no mode question: containers also reach the shared full workflow.
 (

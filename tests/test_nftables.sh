@@ -58,7 +58,7 @@ assert test ! -e "$test_dir/timer"
 assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 [[ $(_fw_show_status) == *开机恢复已启用* ]] || exit 1
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH'*'●'*'22'* ]] || exit 1
+[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'端  口   ● SSH:22'* ]] || exit 1
 [[ $status != *TCP* && $status != *UDP* && $status != *已暂停* && $status != *ssh_ports* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
 # Repair a beta.1 interruption/disabled boot unit without replacing live rules.
@@ -75,7 +75,7 @@ open_firewall_port 24073
 assert _fw_has_element tcp_ports 24073
 assert _fw_has_element udp_ports 24073
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'24073/TCP+UDP'* ]] || exit 1
+[[ $status == *'24073(t/u)'* ]] || exit 1
 
 mkdir -p "$QUOTA_DIR"
 printf '24073|test|104857600|-|0\n24074|socks|104857600|-|0\n' > "$QUOTA_CONFIG"
@@ -237,7 +237,7 @@ _fw_test_mode
 assert _fw_has_element test_tcp 5201
 assert test -n "$(_fw_test_deadline)"
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'5201/TCP+UDP[测试]'* && $status == *'24076/TCP[TCPing]'* ]] || exit 1
+[[ $status == *'5201(t/u)[测试]'* && $status == *'24076(t)[TCPing]'* ]] || exit 1
 assert test "$(quota_get_port_bytes 24073)" = "$resumed_bytes 0"
 # Simulate lost kernel rules/reboot; persisted ACL and paused state survive,
 # temporary ports stay closed, baseline resets without losing accrued traffic.

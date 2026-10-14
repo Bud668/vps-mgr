@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.6-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.7-orange)
 
 </div>
 
@@ -17,16 +17,16 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.6 预发布测试版**，保留 beta.5 的全部功能与修复，初始化输出统一为 8 步，精简重复提示和服务刷屏，保留错误与最后一次重启确认；带宽测速、手动输入和调优参数不变。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.7 预发布测试版**，保留 beta.6 的全部功能与初始化输出精简，恢复老版首页端口样式，修复默认 `mq 0:` 队列调优，新增纯 Google / Cloudflare DNS 选择（3 秒未确认默认 Google）；带宽测速、手动输入和调优参数不变。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
 (command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && \
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.6/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.7/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.6。发布页：[v2.0.0-beta.6](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.6)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.7。发布页：[v2.0.0-beta.7](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.7)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
@@ -151,11 +151,11 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 菜单 5 → 9 重建本脚本基础链为 DROP，保留业务端口集合、ACL、配额计数和暂停状态；不会清空整个 ruleset
 - 按链和 nftables `handle` 删除规则，或按端口清理专用集合、ACL 和配额；当前 SSH 规则/监听端口受保护。批量清理只处理精确单端口匹配，范围/多端口规则需用 handle 审阅处理
 - 菜单 5 → 10 管理防火墙 SSH 放行端口，不修改 sshd 本身；菜单 5 → 7 提供静态拦截、实时拦截、实时完整内核日志
-- 详细规则带包/字节计数；首页合并 TCP+UDP 端口、自动换行，并显示 TCPing/测试端口、CN、域名 ACL、SSH 放行标记
+- 详细规则带包/字节计数；首页沿用老版 `● SSH:端口`、`端口(t/u)` 样式，TCP/UDP 合并、每行最多 4 项并按终端宽度换行；未安装代理也保留 SSH 端口行，TCPing/测试端口、暂停、CN 和域名 ACL 标记保留
 
 **首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；开放模式不等于清空整机规则。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
 
-业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。fq 使用原生 `tc replace` 创建或更新，兼容重启后内核默认的 `handle 0:` 队列，已配置 fq 的句柄和未指定参数保持不变；常见 fq_codel 改为 fq，mq 保留多队列根并逐一调整 fq/fq_codel 叶子。自定义队列保持不动并报告未完成。持久化使用 `vps-mgr-fq.service`，同时在已安装的 ifupdown、networkd-dispatcher、NetworkManager 钩子目录加入网络上线后重应用入口。
+业务上线后不要重复执行完整初始化：系统升级、DNS 重写、带宽测速和 sysctl 调整仍可能影响连接。fq 使用原生 `tc replace` 创建或更新，兼容重启后内核默认的 `handle 0:` 队列，已配置 fq 的句柄和未指定参数保持不变；常见 fq_codel 改为 fq，mq 保留多队列结构并逐一调整 fq/fq_codel 叶子，兼容默认父句柄 `0:1` 的 `:1` 简写。无法直接操作的默认 `mq 0:` 仅在叶子全为隐式 fq/fq_codel 时重建为带句柄的 mq；其他自定义队列保持不动并报告未完成。持久化使用 `vps-mgr-fq.service`，同时在已安装的 ifupdown、networkd-dispatcher、NetworkManager 钩子目录加入网络上线后重应用入口。
 
 **SSH 加固**
 
@@ -220,6 +220,8 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 5. 按需配置菜单 2（Fail2Ban）、3（通知）、13（配额）。
 
 初始化默认关闭 IPv6，立即生效并写入开机配置；需要测试时用 **菜单 6 → 3（IPv6 管理）** 开启，测试后再用同一入口关闭。通过 IPv6 SSH 登录时拒绝直接禁用，避免断开当前管理连接，请先使用 IPv4 SSH 或控制台。主菜单按实际内核状态显示 IPv6 开关。
+
+初始化的 DNS 步骤可选 **1 Google（8.8.8.8 / 8.8.4.4，默认）** 或 **2 Cloudflare（1.1.1.1 / 1.0.0.1）**。输入编号并回车确认；直接回车或 3 秒内未确认，自动使用 Google。挂载或只读的容器 DNS 仍保留宿主配置，不弹出选择。
 
 脚本自动识别共享内核容器（如 LXC/OpenVZ），与 VPS 共用完整用户态初始化：依赖/软件更新、时区、日志、文件描述符、TG、Fail2Ban、TCPing 和每日更新不再整批跳过。只跳过换内核、Swap、宿主 sysctl/qdisc 和共享时钟修改；挂载或只读 DNS 文件保留宿主设置。若宿主禁止 IPv6 sysctl 写入，会报告“未禁用”并继续其他功能，不假报成功。菜单 2 → 3 可单独安装/修复 Fail2Ban。你不需要手动判断或选择环境，NAT 或公网端口数量不能作为容器判据。
 

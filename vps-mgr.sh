@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.6"
+readonly SCRIPT_VERSION="2.0.0-beta.7"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1042,7 +1042,7 @@ _fw_rollback_locked() {
 }
 
 _fw_show_status() {
-    local fw_json policy rules ssh paused color port ssh_color=$C_GREEN cn
+    local fw_json policy rules ssh paused color port ssh_color ssh_mark ssh_current cn
     if ! command -v nft >/dev/null; then
         printf '   nftables 未安装（菜单 1 初始化）\n'
     elif ! command -v jq >/dev/null; then
@@ -1067,12 +1067,19 @@ _fw_show_status() {
         else
             printf '   %b仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）%b\n' "$C_YELLOW" "$C_RESET"
         fi
-        while read -r port; do
-            [[ -n $port && ,$ssh, == *,"$port",* ]] || ssh_color=$C_RED
-        done < <(get_current_ssh_port | tr ',' '\n')
-        [[ $policy != ACCEPT ]] || ssh_color=$C_GREEN
-        printf '   %bSSH%b      %b●%b %b%s%b（本机放行端口）\n' "$C_BLUE" "$C_RESET" "$ssh_color" "$C_RESET" "$C_CYAN" "$ssh" "$C_RESET"
-        _fw_port_summary "$fw_json"
+        ssh_current=$(get_current_ssh_port) || ssh_current=""
+        [[ -n $ssh_current ]] || ssh_current=$ssh
+        printf '   %b端  口%b' "$C_BLUE" "$C_RESET"
+        for port in ${ssh_current//,/ }; do
+            ssh_color=$C_RED; ssh_mark=○
+            if [[ $port != - && ( $policy == ACCEPT || ,$ssh, == *,"$port",* ) ]]; then
+                ssh_color=$C_GREEN; ssh_mark=●
+            fi
+            printf '   %b%s SSH:%s%b' "$ssh_color" "$ssh_mark" "$port" "$C_RESET"
+        done
+        printf '\n'
+        _fw_port_summary "$fw_json" "$ssh_current"
+        [[ $policy != ACCEPT ]] || printf '          %b默认放行（ACCEPT；封禁/ACL 仍有效）%b\n' "$C_YELLOW" "$C_RESET"
         [[ $paused == - ]] || printf '   %b已暂停%b  %s\n' "$C_YELLOW" "$C_RESET" "$paused"
         cn=$(jq -r '[.nftables[].set? | select(.name=="cn_ports") | .elem[]? | tostring] | join(",")' <<< "$fw_json")
         if [[ -n $cn ]]; then
@@ -1090,26 +1097,33 @@ _fw_show_status() {
 }
 
 _fw_port_summary() {
-    local token width=${COLUMNS:-80} used=11 first=1
+    local port proto note token proto_color width=${COLUMNS:-80} used=10 col=0
     [[ $width =~ ^[0-9]+$ ]] || width=80
     (( width >= 48 )) || width=48
     (( width <= 120 )) || width=120
-    while IFS= read -r token; do
-        if (( first )); then printf '   %b端  口%b  ' "$C_BLUE" "$C_RESET"; first=0
-        elif (( used + ${#token} + 2 > width )); then printf '\n           '; used=11
+    while IFS=$'\t' read -r port proto note; do
+        token="${port}(${proto})${note:+[$note]}"
+        if (( col == 0 )); then printf '          '
+        elif (( col == 4 || used + ${#token} + 2 > width )); then printf '\n          '; used=10; col=0
         else printf '  '; used=$((used + 2)); fi
-        printf '%b%s%b' "$C_CYAN" "$token" "$C_RESET"
+        case $proto in
+            t) proto_color="${C_CYAN}t" ;;
+            u) proto_color="${C_PURPLE}u" ;;
+            t/u) proto_color="${C_CYAN}t${C_WHITE}/${C_PURPLE}u" ;;
+        esac
+        printf '%b%s%b(%b%b)%b%s%b' "$C_GREEN" "$port" "$C_WHITE" "$proto_color" "$C_WHITE" "$C_DIM" "${note:+[$note]}" "$C_RESET"
         used=$((used + ${#token}))
-    done < <(jq -r '
-        [.nftables[].set? | select(.name == "tcp_ports" or .name == "udp_ports" or
+        col=$((col + 1))
+    done < <(jq -r --arg ssh "${2:-}" '
+        [.nftables[].set? | select(.name == "ssh_ports" or .name == "tcp_ports" or .name == "udp_ports" or
             .name == "tcping_ports" or .name == "test_tcp" or .name == "test_udp") |
             .name as $s | .elem[]? | {port:(if type=="object" then .elem.val else . end),
-            proto:(if $s=="udp_ports" or $s=="test_udp" then "UDP" else "TCP" end),
+            proto:(if $s=="udp_ports" or $s=="test_udp" then "u" else "t" end),
             note:(if $s=="tcping_ports" then "TCPing" elif ($s|startswith("test_")) then "测试" else "" end)}] |
-        sort_by(.port) | group_by(.port)[] |
-        "\(.[0].port)/\([.[].proto]|unique|join("+"))" +
-        ([.[].note|select(.!="")]|unique|if length>0 then "["+join("+")+"]" else "" end)' <<< "$1")
-    (( first )) || printf '\n'
+        sort_by(.port) | group_by(.port)[] | .[0].port as $port |
+        select(($ssh | split(",") | index($port | tostring)) == null) |
+        [$port, ([.[].proto]|unique|join("/")), ([.[].note|select(.!="")]|unique|join("+"))] | @tsv' <<< "$1")
+    (( col == 0 )) || printf '\n'
     return 0
 }
 
@@ -2166,13 +2180,14 @@ do_check_all() {
 
     # ── 10. DNS ──────────────────────────────────────────
     echo -e "\n${L_BLUE}[ DNS ]${NC}"
-    if grep -q "8.8.8.8" /etc/resolv.conf 2>/dev/null && \
-       grep -q "1.1.1.1" /etc/resolv.conf 2>/dev/null && \
-       grep -q "94.140.14.14" /etc/resolv.conf 2>/dev/null; then
-        _ck_pass "DNS 已配置（8.8.8.8 / 1.1.1.1 / 94.140.14.14）"
-    else
-        _ck_fail "DNS 配置异常，resolv.conf 未包含全部目标 DNS（请运行选项 1 重新初始化）"
-    fi
+    local _dns_servers
+    _dns_servers=$(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null | sort -u | paste -sd' ' -) || _dns_servers=""
+    case $_dns_servers in
+        '8.8.4.4 8.8.8.8') _ck_pass "DNS 已配置（Google: 8.8.8.8 / 8.8.4.4）" ;;
+        '1.0.0.1 1.1.1.1') _ck_pass "DNS 已配置（Cloudflare: 1.1.1.1 / 1.0.0.1）" ;;
+        '1.1.1.1 8.8.8.8 94.140.14.14') _ck_pass "DNS 已配置（旧版混合 DNS）" ;;
+        *) _ck_fail "DNS 配置未匹配 Google / Cloudflare，请检查 /etc/resolv.conf" ;;
+    esac
     if [ -L /etc/resolv.conf ]; then
         _ck_warn "resolv.conf 是符号链接，chattr +i 无效（请运行选项 1 重新初始化）"
     else
@@ -2359,14 +2374,25 @@ _apply_fq() {
         mq)
             root=$(jq -r '.[] | select(.root == true) | .handle' <<< "$data")
             # 保留多队列根，只调整其直接叶子；先检查全部叶子，避免碰到自定义调度时只改一半。
+            # tc 将默认 mq 的 0:1 简写为 :1，匹配时补回主句柄 0。
             jq -e --arg root "$root" '
-                [.[] | select(.parent? | strings | startswith($root))] |
+                [.[] | select(.parent? | strings | sub("^:"; "0:") | startswith($root))] |
                 length > 0 and all(.kind == "fq" or .kind == "fq_codel")' <<< "$data" >/dev/null || {
                 msg_warn "mq 含自定义/未知叶子队列，未修改；请手动检查 tc qdisc"; return 1;
             }
+            # 默认 mq 0: 未注册可寻址句柄；仅重建全为隐式叶子的默认根，仍保留 mq。
+            if [[ $root == "0:" ]]; then
+                jq -e '[.[] | select(.parent? | strings | test("^0?:"))] | all(.handle == "0:")' <<< "$data" >/dev/null || {
+                    msg_warn "默认 mq 含已配置的叶子句柄，未修改；请手动检查 tc qdisc"; return 1;
+                }
+                tc qdisc replace dev "$iface" root mq || return 1
+                tc -j qdisc show dev "$iface" | jq -e 'any(.root == true and .kind == "mq" and .handle != "0:")' >/dev/null || return 1
+                _apply_fq "$iface" "$rate"
+                return
+            fi
             while read -r parent; do
                 tc qdisc replace dev "$iface" parent "$parent" fq maxrate "${rate}mbit" flow_limit 250 || return 1
-            done < <(jq -r --arg root "$root" '.[] | select(.parent? | strings | startswith($root)) | .parent' <<< "$data") ;;
+            done < <(jq -r --arg root "$root" '.[] | select(.parent? | strings | sub("^:"; "0:") | startswith($root)) | .parent' <<< "$data") ;;
         *) msg_warn "保留已有 qdisc=$kind；未替换"; return 1 ;;
     esac
 }
@@ -2735,6 +2761,17 @@ EOF
     if (( _container )) && { mountpoint -q /etc/resolv.conf || [[ ! -w /etc/resolv.conf ]]; }; then
         msg_info "容器 DNS 文件由宿主管理，保持现有配置"
     else
+    local _dns_choice="" _dns_primary="8.8.8.8" _dns_secondary="8.8.4.4" _dns_provider="Google"
+    printf '  DNS: [1] Google      8.8.8.8 / 8.8.4.4（默认）\n'
+    printf '       [2] Cloudflare  1.1.1.1 / 1.0.0.1\n'
+    printf '  请选择 [1/2，回车或 3 秒超时默认 1]: '
+    read -r -t 3 _dns_choice 2>/dev/null < /dev/tty || _dns_choice=1
+    printf '\n'
+    case $_dns_choice in
+        2) _dns_primary="1.1.1.1"; _dns_secondary="1.0.0.1"; _dns_provider="Cloudflare" ;;
+        ''|1) ;;
+        *) msg_warn "无效选择，使用默认 Google DNS" ;;
+    esac
     # 若 /etc/resolv.conf 是符号链接（systemd-resolved 系统），先删除再创建真实文件
     # 否则 chattr +i 对 tmpfs 目标静默失败，重启后 DNS 被 systemd-resolved 覆盖
     if [ -L /etc/resolv.conf ]; then
@@ -2742,14 +2779,15 @@ EOF
     fi
     if [ -f /etc/resolv.conf ] || [ ! -e /etc/resolv.conf ]; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
-        cat > /etc/resolv.conf <<'DNSEOF'
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-nameserver 94.140.14.14
-options timeout:2 attempts:2
-DNSEOF
-        chattr +i /etc/resolv.conf 2>/dev/null || true
-        echo -e "  ${GREEN}✓ DNS: 8.8.8.8 / 1.1.1.1 / 94.140.14.14 (已锁定)${NC}"
+        if ! printf 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' \
+            "$_dns_primary" "$_dns_secondary" > /etc/resolv.conf; then
+            msg_error "DNS 写入失败，请检查 /etc/resolv.conf 权限"; return 1
+        fi
+        if chattr +i /etc/resolv.conf 2>/dev/null; then
+            echo -e "  ${GREEN}✓ DNS: ${_dns_provider} · ${_dns_primary} / ${_dns_secondary}（已锁定）${NC}"
+        else
+            msg_warn "DNS 已设置为 ${_dns_provider}（${_dns_primary} / ${_dns_secondary}），但文件未锁定，可能被 DHCP 覆盖"
+        fi
     fi
     fi
 

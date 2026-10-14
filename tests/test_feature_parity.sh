@@ -186,10 +186,11 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
 assert test "$(declare -f _do_full_init | grep -c '立即重启？')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps container partial; do
+for environment in vps cf blank invalid timeout unlocked dns_fail container partial; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
+    printf 'nameserver 192.0.2.53\n' > "$test_dir/etc/resolv.conf"
     _is_container() { [[ $environment == container ]]; }
     check_system() { :; }
     clear() { :; }
@@ -206,7 +207,23 @@ for environment in vps container partial; do
     curl() { echo Asia/Shanghai; }
     timedatectl() { echo NTPSynchronized=yes; }
     crontab() { return 1; }
-    chattr() { :; }
+    chattr() { [[ $environment != unlocked || $1 != +i ]]; }
+    mountpoint() { [[ $environment == container ]]; }
+    read() {
+        if [[ ${*: -1} == _dns_choice ]]; then
+            assert test "$*" = '-r -t 3 _dns_choice'
+            record dns
+            case $environment in
+                cf) _dns_choice=2 ;;
+                blank) _dns_choice="" ;;
+                invalid) _dns_choice=wrong ;;
+                timeout) _dns_choice=2; return 142 ;;
+                *) builtin read "$@"; return ;;
+            esac
+            return 0
+        fi
+        builtin read "$@"
+    }
     uname() { case "$1" in -m) echo x86_64 ;; -r) echo 7.2-xanmod ;; esac; }
     _ensure_swap() { record swap; }
     _effective_mem_mb() { echo 1024; }
@@ -227,7 +244,48 @@ for environment in vps container partial; do
     if [[ $environment == partial ]]; then
         install_autoupdate() { echo 'simulated updater error' >&2; return 1; }
     fi
+    if [[ $environment == dns_fail ]]; then
+        printf() {
+            [[ $1 != 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' ]] || return 1
+            builtin printf "$@"
+        }
+        if do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1; then
+            echo 'Failed DNS write reported success'; exit 1
+        fi
+        assert grep -q 'DNS 写入失败' "$test_dir/init-$environment.log"
+        if grep -qx firewall "$test_dir/calls"; then echo 'Initialization continued after DNS failure'; exit 1; fi
+        exit 0
+    fi
     do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1
+    if [[ $environment == container ]]; then
+        assert test "$(cat "$test_dir/etc/resolv.conf")" = 'nameserver 192.0.2.53'
+        if grep -qx dns "$test_dir/calls"; then echo 'Managed container DNS prompted'; exit 1; fi
+    else
+        assert grep -qx dns "$test_dir/calls"
+        dns_provider=Google
+        dns_expected=$'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions timeout:2 attempts:2'
+        if [[ $environment == cf ]]; then
+            dns_provider=Cloudflare
+            dns_expected=$'nameserver 1.1.1.1\nnameserver 1.0.0.1\noptions timeout:2 attempts:2'
+        fi
+        assert test "$(cat "$test_dir/etc/resolv.conf")" = "$dns_expected"
+        if [[ $environment == unlocked ]]; then
+            assert grep -q 'DNS 已设置为 Google.*文件未锁定' "$test_dir/init-$environment.log"
+            if grep -q 'DNS:.*已锁定' "$test_dir/init-$environment.log"; then echo 'DNS lock failure hidden'; exit 1; fi
+        else
+            assert grep -q "DNS: $dns_provider.*已锁定" "$test_dir/init-$environment.log"
+        fi
+        do_check_all > "$test_dir/dns-check.log" 2>&1 || true
+        assert grep -Fq "DNS 已配置（$dns_provider:" "$test_dir/dns-check.log"
+        if [[ $environment == cf ]]; then
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 94.140.14.14\n' > "$test_dir/etc/resolv.conf"
+            do_check_all > "$test_dir/dns-check.log" 2>&1 || true
+            assert grep -q 'DNS 已配置（旧版混合 DNS）' "$test_dir/dns-check.log"
+            printf '# nameserver 8.8.8.8\n# nameserver 8.8.4.4\nnameserver 192.0.2.53\n' > "$test_dir/etc/resolv.conf"
+            do_check_all > "$test_dir/dns-check.log" 2>&1 || true
+            assert grep -q 'DNS 配置未匹配 Google / Cloudflare' "$test_dir/dns-check.log"
+        fi
+    fi
     for feature in ipv6 logs nofile journald firewall telegram fail2ban tcping; do
         assert grep -qx "$feature" "$test_dir/calls"
     done
