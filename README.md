@@ -9,30 +9,52 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.8-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.9-orange)
 
 </div>
 
 ---
 
+## beta.9：14 项审查修复
+
+本测试版包含以下 14 项修复与优化：
+
+1. 配额到期日校验真实日历日期；错误的已有日期跳过自动暂停/删除并警告。
+2. 手动删除、卸载和到期删除统一清理对应端口的配额、暂停状态、计数器及告警标记，不影响其他端口。
+3. XanMod 检查每个 vCPU 的完整 v2/v3 指令集，不再只看 AVX2；不满足 v2 时保留发行版内核。
+4. 新建 Swap 上限 1GB，按磁盘空间降档/跳过；已有 Swap 不缩小、不拆除重建。
+5. TG/Cloudflare Token 经 curl 私有配置或标准输入传递，不再出现在 curl 进程参数中。
+6. 修复 Debian 12 mawk 将 100G 等大数截断为 32 位整数的问题，同时拒绝非法/超范围流量输入。
+7. Realm 添加规则检查监听和所有待生效/已停止代理配置中的端口，显式端口冲突不会随机换号。
+8. Fail2Ban 删除最后一项白名单时正确保存空文件。
+9. sysctl 应用后读回核验，Snell 启动/放行失败返回失败并清理本次添加；不再假报成功。
+10. 系统更新保留已有 `reboot-required` 标记，不丢失待重启提示。
+11. 安装 XanMod 跟踪元包，手动系统更新允许新增依赖但不移除包，能跟踪新内核包名。
+12. TG 长报告按条目/长度分页，支持两种分隔线、超长单条、中文/emoji；长 HTML 转纯文本后分页，不截断标签、不丢首行。
+13. 新增隔离回归及 Debian 12/13、Ubuntu 22.04/24.04 CI；同时修复最小化镜像 C locale 下国旗转义与分页边界。
+14. 初始化默认开启原生官方安全补丁自动安装，支持停止/修复、失败和待重启提醒，禁止自动重启。
+
+保留原菜单和代理功能；不引入 v1 防火墙迁移或额外初始化选项。
+
+---
+
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.8 预发布测试版**，保留 beta.7 的全部功能与修复，仅将初始化 DNS 改为默认纯 Cloudflare、可选纯 Google，3 秒未确认自动使用 Cloudflare；带宽测速、手动输入和调优参数不变。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.9 预发布测试版**，包含上述 14 项审查修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && \
-curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.8/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.9/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.8。发布页：[v2.0.0-beta.8](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.8)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.9。发布页：[v2.0.0-beta.9](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.9)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
 请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
 
-已完成 beta.5 初始化的测试机只需备份并在原路径替换脚本、验证语法，不必重装、重跑菜单 1 或重启服务器。
+已完成 beta.5–beta.8 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本不会自动调整已有 Swap、内核或安全补丁策略；新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 Token 传递修复。
 
 已完成 beta.4 初始化的测试机不必重装或重跑菜单 1：备份并在原路径替换脚本、验证语法后，执行 `systemctl restart vps-mgr-fq.service` 即可应用 beta.5 起包含的 fq 修复，沿用原先配置的速率，无需重启服务器。首次打开菜单缺少 jq/nftables 时只提示安装依赖，不再提前调用未安装的命令；完整依赖仍由菜单 1 安装。
 
@@ -50,6 +72,7 @@ curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/B
 | 📊 **流量配额** | 按端口计量、超额自动暂停、到期管理 |
 | 📡 **监控告警** | Telegram 话题群推送、SSH 登录通知、流量配额告警 |
 | 🔄 **自更新** | 手动更新 + 初始化默认开启每日正式版检查，带语法校验、备份和防降级 |
+| 🛡️ **系统安全补丁** | 原生 APT 定时安全更新、不自动重启、失败/待重启 TG 提醒 |
 | ☁️ **DDNS** | Cloudflare A 记录自动更新 |
 
 ---
@@ -70,7 +93,7 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 ```
 
-从官方 APT 源安装，自动识别 CPU 指令集（x64v1～v4）选择对应版本，重启后生效。
+从官方 APT 源安装；检查每个 vCPU 的完整指令集，取共同支持的 x64v2 或 x64v3，低于 v2 则保留发行版内核。安装 `linux-xanmod-x64v2/3` 元包，后续手动系统更新能跟踪新 image/header 包；自动安全补丁不更新这个第三方源。安装后检查 GRUB，成功后仅在初始化末尾提示重启。
 
 ---
 
@@ -132,6 +155,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 用量达 75% 预警，每日 Telegram 报告
 - 普通端口放行不重置计数器；暂停同时拦截已有连接，重启/规则恢复时先恢复暂停状态
 - 巡检间隔 5 分钟：超额执行可能有一个巡检间隔的延迟；突然断电可能丢失上次落盘后尚未结算的流量，非计费级精确统计
+- 到期日须为真实日期；已有坏日期不会触发自动暂停/删除。删节点或卸载时同时清理对应配额状态，避免端口复用继承旧限制
 
 ---
 
@@ -164,6 +188,14 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 每来源 IP 的令牌桶限速：15 次/分钟、突发 15；与旧 recent 滑动窗口语义不同
 - Fail2Ban 明确使用 nftables action；管理白名单只豁免 SSH，不绕过业务配额或 ACL
 
+**系统安全补丁**
+
+初始化默认安装/配置 `unattended-upgrades`，复用系统 `apt-daily.timer` / `apt-daily-upgrade.timer`，不另造补丁定时器。只允许 Debian/Ubuntu 官方 `-security` 仓库；不自动更新 XanMod、Snell、Realm、sing-box 或其他第三方源，也不做发行版升级。脚本自身的每日正式版检查是独立功能。
+
+禁止自动重启；软件包维护脚本仍可能重启 SSH 或其他服务，不能承诺业务零中断。更新失败或系统标记需要重启时，通过已配置的 **SSH 话题**提醒，状态不变时每天最多一次；没配置 TG 时只记本地日志。检查原生任务失败状态、本次 APT 日志摘要和 unattended-upgrades 错误日志，不发送正常成功刷屏消息。
+
+**菜单 6 → 8** 可查看策略/定时器状态、启用/修复或停止后续自动安装；停用不强杀正在运行的 APT/dpkg，不停软件源刷新。其他 APT 配置若覆盖了安全仓库或自动重启策略，会报错而非显示启用成功。
+
 **测试模式**
 
 - 通过内核 timeout 临时开放 Ping 和 iperf3，**2 小时自动到期**，不依赖 atd，也不随重启重新开放
@@ -183,6 +215,8 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 | ☁️ DDNS（话题） | IP 变更、健康巡检 |
 
 所有 Token 与 Chat ID **均为运行时输入**，不写进脚本。未启用 SSH 通知时为 root-only；启用后共享配置/国旗缓存为 `root:ssh-tg-monitor`、640，父目录仅给该组遍历权限，其他代理密钥仍不可读。监控以独立用户读取 systemd journal，不再 source 用户配置；卸载 SSH 监控保留配额/DDNS 共用的 TG 配置。
+
+Token 不放入 curl 命令行，防止被本机其他用户通过进程列表读取。长报告按字符分页，配额报告使用纯文本保留别名中的特殊字符；其他长 HTML 消息会转为纯文本分页，保留内容及翻页按钮。
 
 ---
 
@@ -222,6 +256,8 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 初始化默认关闭 IPv6，立即生效并写入开机配置；需要测试时用 **菜单 6 → 3（IPv6 管理）** 开启，测试后再用同一入口关闭。通过 IPv6 SSH 登录时拒绝直接禁用，避免断开当前管理连接，请先使用 IPv4 SSH 或控制台。主菜单按实际内核状态显示 IPv6 开关。
 
 初始化的 DNS 步骤可选 **1 Cloudflare（1.1.1.1 / 1.0.0.1，默认）** 或 **2 Google（8.8.8.8 / 8.8.4.4）**。输入编号并回车确认；直接回车或 3 秒内未确认，自动使用 Cloudflare。挂载或只读的容器 DNS 仍保留宿主配置，不弹出选择。
+
+新建 Swap 按根分区可用空间：**≥3GB 建 1GB，2.5～3GB 建 512MB，<2.5GB 跳过**，创建后至少保留 2GB。已有启用的 Swap（包括 2GB）保持不变；发现未启用的 `/swapfile` 时保留并提示检查，不覆盖。分配、格式化、启用或 fstab 保存失败会明确提示；容器仍跳过。低内存装内核也复用这一规则，不创建后再拆除。
 
 脚本自动识别共享内核容器（如 LXC/OpenVZ），与 VPS 共用完整用户态初始化：依赖/软件更新、时区、日志、文件描述符、TG、Fail2Ban、TCPing 和每日更新不再整批跳过。只跳过换内核、Swap、宿主 sysctl/qdisc 和共享时钟修改；挂载或只读 DNS 文件保留宿主设置。若宿主禁止 IPv6 sysctl 写入，会报告“未禁用”并继续其他功能，不假报成功。菜单 2 → 3 可单独安装/修复 Fail2Ban。你不需要手动判断或选择环境，NAT 或公网端口数量不能作为容器判据。
 
@@ -275,12 +311,16 @@ bash tests/test_safety.sh
 bash tests/test_feature_parity.sh
 bash tests/test_ipv6.sh
 bash tests/test_network_init.sh
+bash tests/test_audit_fixes.sh
+bash tests/test_security_updates.sh
 unshare --net bash tests/test_ipv6.sh --netns
 unshare --net bash tests/test_network_init.sh --netns
 unshare --net bash tests/test_nftables.sh
 ```
 
 网络集成测试只允许在独立 network namespace 中运行，状态文件重定向到临时目录，服务管理被替换为测试桩，不修改宿主防火墙。功能回归覆盖 VPS/容器初始化调用链、TCPing 默认端口/冲突/回退、国旗、清理、通知生成和定时服务。可设置 `VPS_MGR_REAL_SBX=/path/to/sing-box` 让安全回归调用真实核心校验配置；已具备 Exim4 运行环境时，`VPS_MGR_REAL_EXIM=/usr/sbin/exim4` 可核验 IPv6 配置开关。新系统的实际启动、SSH 重连和重启恢复仍需部署后验收。
+
+新增审查回归覆盖非法日期、100G/1T 换算、删除/卸载清理、CPU 指令集、Swap 磁盘阈值及失败回退、令牌进程参数、Realm 占用端口、最后一项白名单、sysctl/Snell 失败、重启标记和长报告。安全补丁测试使用真实 APT 配置解析器及已安装的 unattended-upgrades 仓库匹配器，但不执行真实系统升级。CI 在 Debian 12/13、Ubuntu 22.04/24.04 容器中运行隔离测试，另在网络命名空间中验证原生 nftables/tc；这些不等于完成真实 VPS 重装/重启验收。
 
 ---
 

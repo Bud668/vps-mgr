@@ -8,12 +8,15 @@ trap '[[ $test_dir == /tmp/vps-mgr-parity.* ]] && rm -rf "$test_dir"' EXIT
 source <(sed -e '/^main "\$@"$/d' \
     -e "s|/etc/|$test_dir/etc/|g" \
     -e "s|/usr/local/|$test_dir/usr/local/|g" \
+    -e "s|/usr/share/keyrings/|$test_dir/keyrings/|g" \
     -e "s|/opt/proxy-manager|$test_dir/state|g" \
     -e 's|/dev/tty|/dev/null|g' "$repo_dir/vps-mgr.sh")
 mkdir -p "$SBX_ST" "$REALM_CONFIG_DIR" "$QUOTA_DIR" "$test_dir/etc/systemd/system" \
     "$test_dir/usr/local/bin" "$test_dir/usr/local/lib" "$test_dir/etc/exim4/conf.d/main" \
     "$test_dir/etc/network/if-up.d" "$test_dir/etc/networkd-dispatcher/routable.d" \
-    "$test_dir/etc/NetworkManager/dispatcher.d"
+    "$test_dir/etc/NetworkManager/dispatcher.d" "$test_dir/keyrings" \
+    "$test_dir/etc/apt/sources.list.d" "$test_dir/etc/default"
+touch "$test_dir/keyrings/xanmod-archive-keyring.gpg" "$test_dir/etc/default/grub"
 log_message() { :; }
 record() { printf '%s\n' "$*" >> "$test_dir/calls"; }
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
@@ -165,7 +168,12 @@ printf 'TG_BOT_TOKEN=123:test-token\nTG_CHAT_ID=-100123\nTG_THREAD_SSH=8\nSERVER
 printf 'SERVER_COUNTRY_CODE=US\n' > "$CACHE_FILE"
 mkdir -p "$(dirname "$F2B_WHITELIST")"
 printf '192.0.2.2\n' > "$F2B_WHITELIST"
-curl() { record "curl $*"; printf '{"ok":true}\n'; }
+curl() {
+    [[ $* != *test-token* ]] || { echo 'Token leaked into curl argv' >&2; return 1; }
+    record "curl $*"
+    [[ $* != *'--config -'* ]] || cat >> "$test_dir/calls"
+    printf '{"ok":true}\n'
+}
 journalctl() {
     printf '%s\n' 'Accepted publickey for admin<& from 2001:db8::2 port 1234 ssh2' \
         'Failed password for invalid user test from 192.0.2.2 port 1234 ssh2'
@@ -186,7 +194,7 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
 assert test "$(declare -f _do_full_init | grep -c '立即重启？')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps cf google blank invalid timeout unlocked dns_fail container partial; do
+for environment in vps cf google blank invalid timeout unlocked dns_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
@@ -196,7 +204,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
     clear() { :; }
     check_package_manager_lock() { :; }
     show_spinner() { :; }
-    apt-get() { :; }
+    apt-get() { record "apt-get $*"; [[ $environment != kernel_fail || $* != *linux-xanmod* ]]; }
     apt-cache() { :; }
     dpkg-query() { printf 'install ok installed'; }
     _write_disable_ipv6_conf() { record ipv6; [[ $environment != container ]]; }
@@ -225,14 +233,19 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
         fi
         builtin read "$@"
     }
-    uname() { case "$1" in -m) echo x86_64 ;; -r) echo 7.2-xanmod ;; esac; }
+    uname() { case "$1" in -m) echo x86_64 ;; -r) if [[ $environment == kernel_* ]]; then echo 6.12.0; else echo 7.2-xanmod; fi ;; esac; }
+    _xanmod_cpu_level() { case $environment in kernel_v1) echo 1 ;; kernel_v2) echo 2 ;; *) echo 3 ;; esac; }
+    lsb_release() { echo bookworm; }
+    update-grub() { [[ $environment != kernel_grub_fail ]]; }
+    reboot() { record reboot; }
     _ensure_swap() { record swap; }
     _effective_mem_mb() { echo 1024; }
     _measure_bandwidth() { _BW_MBPS=1000; }
     modprobe() { :; }
     sysctl() { :; }
     _write_sysctl_conf() { record sysctl; }
-    _apply_conntrack_sysctl() { :; }
+    _apply_tuning_sysctl() { :; }
+    _install_security_updates() { record security-updates; }
     _apply_nofile_limits() { record nofile; }
     _apply_journald_limits() { record journald; }
     ip() { echo 'default via 192.0.2.254 dev test0'; }
@@ -292,7 +305,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
             assert grep -q 'DNS 配置未匹配 Google / Cloudflare' "$test_dir/dns-check.log"
         fi
     fi
-    for feature in ipv6 logs nofile journald firewall telegram fail2ban tcping; do
+    for feature in ipv6 logs nofile journald firewall telegram fail2ban tcping security-updates; do
         assert grep -qx "$feature" "$test_dir/calls"
     done
     for step in {1..8}; do
@@ -322,6 +335,14 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
         assert test "$(grep -c 'fq 已保存' "$test_dir/init-$environment.log")" = 1
         if grep -q '未完成 / 已跳过' "$test_dir/init-$environment.log"; then echo 'Successful initialization marked incomplete'; exit 1; fi
     fi
+    case $environment in
+        kernel_v2|kernel_v3)
+            assert grep -qx "apt-get install -y -qq linux-xanmod-x64${environment#kernel_}" "$test_dir/calls"
+            assert grep -qx reboot "$test_dir/calls" ;;
+        kernel_v1|kernel_fail|kernel_grub_fail)
+            if grep -qx reboot "$test_dir/calls"; then echo 'Skipped/failed kernel triggered reboot'; exit 1; fi
+            if [[ $environment != kernel_v1 ]]; then assert grep -q '未完成 / 已跳过：.*XanMod' "$test_dir/init-$environment.log"; fi ;;
+    esac
 )
 done
 # Keep the SSH policy and ban count, not the verbose Fail2Ban status tree.

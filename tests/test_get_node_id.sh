@@ -37,6 +37,7 @@ assert_eq() {
 test_name="Node-LA" test_cc="US" test_ip="203.0.113.42"
 assert_eq "🇺🇸 #Node_LA" "$(get_node_id)" "ASCII name as Telegram tag"
 assert_eq "🇺🇸 Node_LA" "$(get_node_id plain)" "ASCII name in terminal"
+assert_eq "🇺🇸 #Node_LA" "$(LC_ALL=C get_node_id)" "fresh image C locale"
 
 test_name="香港节点"
 assert_eq "香港节点" "$(get_node_id)" "display name containing non-ASCII characters"

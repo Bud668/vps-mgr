@@ -1,0 +1,44 @@
+name: Shell regressions
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+
+jobs:
+  distro:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12-slim, debian:13-slim, ubuntu:22.04, ubuntu:24.04]
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test dependencies (disposable container only)
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash shellcheck jq python3 openssl curl ca-certificates nftables iproute2 util-linux procps systemd unattended-upgrades
+      - name: Syntax and isolated regressions
+        shell: bash
+        run: |
+          bash -n vps-mgr.sh
+          shellcheck -S error vps-mgr.sh tests/*.sh
+          for test in get_node_id safety feature_parity ipv6 network_init audit_fixes security_updates; do
+            bash "tests/test_${test}.sh"
+          done
+
+  network:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Network test dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 jq python3
+      - name: Native nftables and tc in disposable network namespaces
+        run: |
+          sudo unshare --net bash tests/test_ipv6.sh --netns
+          sudo unshare --net bash tests/test_network_init.sh --netns
+          sudo unshare --net bash tests/test_nftables.sh

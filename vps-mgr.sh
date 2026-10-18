@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.8"
+readonly SCRIPT_VERSION="2.0.0-beta.9"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -161,6 +161,7 @@ acquire_lock() {
 }
 
 get_flag_emoji() {
+    local LC_ALL=C.UTF-8  # 最小化镜像常用 C locale，Bash 的 Unicode 转义需要 UTF-8。
     # 由国家码算 Unicode 国旗（区域指示符），支持任意国家，不再靠写死列表。
     # UN = 脚本内部"未知"哨兵、空值、非两位字母 → 一律地球。纯 bash，无需 python。
     local cc="${1:-}"
@@ -336,6 +337,19 @@ _tg_cfg_get() {
     grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true
 }
 
+# 密钥经 stdin 传给 curl，不放入其他本机用户可见的进程参数。
+_tg_api() {
+    local token=$1 method=$2; shift 2
+    [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ && $method =~ ^[A-Za-z]+$ ]] || return 1
+    printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method" | curl --config - "$@"
+}
+
+_cf_curl() {
+    local token=$1; shift
+    [[ $token =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    printf 'header = "Authorization: Bearer %s"\n' "$token" | curl --config - "$@"
+}
+
 # 解析通知通道，设置 TG_BOT_TOKEN / TG_CHAT_ID / TG_THREAD_ID
 # $1 = monitor | quota | ddns —— 三者共用话题群(TG_CHAT_HUB)，各占一个话题
 # 三个通道共用话题群(TG_CHAT_HUB)，各占一个话题
@@ -407,7 +421,7 @@ _tg_input_tokens() {
             printf "  ${C_RED}✗ Token 或 话题群 Chat ID 不能为空，请重新粘贴（q 放弃）${C_RESET}\n"; continue
         fi
         printf "  正在验证 Bot..."
-        _resp=$(curl -s --max-time 8 "https://api.telegram.org/bot${_new_tok}/getMe" 2>/dev/null || true)
+        _resp=$(_tg_api "$_new_tok" getMe -s --max-time 8 2>/dev/null || true)
         if ! echo "$_resp" | grep -q '"ok":true'; then
             printf " ${C_RED}✗ 连接失败（token 错误或网络问题），请重新粘贴（q 放弃）${C_RESET}\n"; continue
         fi
@@ -595,7 +609,7 @@ _do_tg_config() {
 _TG_LAST_MSG_ID=""
 
 _tg_send_chunk() {
-    local text="$1"
+    local text="$1" mode=${2:-HTML}
     _TG_LAST_MSG_ID=""
     local _cfg _old_umask
     _old_umask=$(umask)
@@ -603,8 +617,9 @@ _tg_send_chunk() {
     _cfg=$(mktemp)
     umask "$_old_umask"
     trap "rm -f '$_cfg'" RETURN
-    printf 'max-time = 15\nurl = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\ndata = "parse_mode=HTML"\n' \
+    printf 'max-time = 15\nurl = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\n' \
         "$TG_BOT_TOKEN" "$TG_CHAT_ID" > "$_cfg"
+    [[ $mode != HTML ]] || printf 'data = "parse_mode=HTML"\n' >> "$_cfg"
     [[ -n "${TG_THREAD_ID:-}" ]] && printf 'data = "message_thread_id=%s"\n' "$TG_THREAD_ID" >> "$_cfg"
 
     local attempt resp
@@ -646,74 +661,80 @@ _tg_edit_keyboard() {
 }
 
 send_telegram() {
-    local text="$1"
+    local LC_ALL=C.UTF-8  # 分页按字符而非字节，不能截断中文或 emoji。
+    local text="$1" mode=${3:-HTML}
     local server_label="${2:-}"
     [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]] && return 0
 
     # 消息不超限直接发送
-    if [[ ${#text} -le 4050 ]]; then
-        _tg_send_chunk "$text"
+    if [[ ${#text} -le 1800 ]]; then
+        _tg_send_chunk "$text" "$mode"
         return
     fi
 
-    # 超限时在 ╌ 分隔符处分段，每段同时限制字符数(≤3800)和条目数(≤14)
-    # 14条/页 × <u><b> 双标签 = 28 entities，远低于 Telegram 100 entities/msg 限制
-    local limit=3800 entry_limit=14 chunk="" line sep_count=0
-    local -a chunks=()
+    # 长 HTML 转成纯文本再分页，避免切断标签/实体；1800 字符也容得下双 UTF-16 emoji。
+    if [[ $mode == HTML ]]; then
+        text=$(printf '%s' "$text" | python3 -c '
+import sys
+from html.parser import HTMLParser
+class Text(HTMLParser):
+    def handle_data(self, data): sys.stdout.write(data)
+    def handle_starttag(self, tag, attrs):
+        if tag == "br": sys.stdout.write("\n")
+Text().feed(sys.stdin.read())') || return 1
+        mode=plain
+    fi
+    local limit=1800 chunk="" line block="" piece
+    local -a chunks=() blocks=()
     while IFS= read -r line; do
-        if [[ "$line" =~ ^╌ && -n "$chunk" ]] && \
-           [[ ${#chunk} -gt $limit || $sep_count -ge $entry_limit ]]; then
-            chunks+=("$chunk")
-            chunk="$line"
-            sep_count=1
-        else
-            chunk="${chunk:+${chunk}$'\n'}${line}"
-            [[ "$line" =~ ^╌ ]] && sep_count=$((sep_count + 1))
+        if [[ $line =~ ^[╌━] && -n $block ]]; then
+            blocks+=("$block"); block=""
         fi
+        block+="${block:+$'\n'}$line"
     done <<< "$text"
+    [[ -z $block ]] || blocks+=("$block")
+    for block in "${blocks[@]}"; do
+        if (( ${#chunk} + ${#block} + 1 > limit )) && [[ -n $chunk ]]; then
+            chunks+=("$chunk"); chunk=""
+        fi
+        while (( ${#block} > limit )); do
+            piece=${block:0:limit}
+            [[ $piece != *$'\n'* ]] || piece=${piece%$'\n'*}
+            [[ -n $piece ]] || piece=${block:0:limit}
+            chunks+=("$piece"); block=${block:${#piece}}; block=${block#$'\n'}
+        done
+        [[ -z $block ]] || chunk+="${chunk:+$'\n'}$block"
+    done
     [[ -n "$chunk" ]] && chunks+=("$chunk")
 
     local total=${#chunks[@]}
     # 只有一段（无可用切割点）直接发送
     if [[ $total -eq 1 ]]; then
-        _tg_send_chunk "${chunks[0]}"
+        _tg_send_chunk "${chunks[0]}" "$mode"
         return
     fi
 
-    # 多段：每段首行加「标题 (N/total)」，第二行若是时间行(🕐)也重复
+    # 标题仅作有界页眉，不从正文中删除，长首行也不会丢内容。
     local title_line1 title_line2
-    title_line1=$(printf '%s' "$text" | head -1)
+    title_line1=${text%%$'\n'*}; title_line1=${title_line1:0:120}
     title_line2=$(printf '%s' "$text" | sed -n '2p')
     [[ "$title_line2" != 🕐* ]] && title_line2=""
+    title_line2=${title_line2:0:60}
 
     local -a msg_ids=()
-    local i
+    local i j
     for (( i=0; i<total; i++ )); do
         local part="${chunks[$i]}"
         local label="$((i+1))/${total}"
-        if [[ $i -eq 0 ]]; then
-            if [[ -n "$title_line2" ]]; then
-                local _rest="${part#*$'\n'}"
-                local _body="${_rest#*$'\n'}"
-                part="${title_line1}"$'\n'"${title_line2} (${label})"$'\n'"${_body}"
-            else
-                part="${title_line1} (${label})"$'\n'"${part#*$'\n'}"
-            fi
-        else
-            if [[ -n "$title_line2" ]]; then
-                part="${title_line1}"$'\n'"${title_line2} (${label})"$'\n'"${part}"
-            else
-                part="${title_line1} (${label})"$'\n'"${part}"
-            fi
-        fi
-        _tg_send_chunk "$part" || return 1
+        if (( i == 0 )); then part="(${label})"$'\n'"${part}"
+        else part="${title_line1} (${label})"$'\n'"${title_line2:+${title_line2}$'\n'}${part}"; fi
+        _tg_send_chunk "$part" "$mode" || return 1
         msg_ids+=("$_TG_LAST_MSG_ID")
     done
 
     # 添加翻页按钮（仅限频道，且成功获取到 message_id 时）
     if [[ -n "${msg_ids[0]:-}" && "${TG_CHAT_ID}" == -100* ]]; then
         local channel_num="${TG_CHAT_ID#-100}"
-        local last=$((total - 1))
         local base_url="https://t.me/c/${channel_num}"
         local prefix="${server_label:+${server_label} · }"
         for (( i=0; i<total; i++ )); do
@@ -1365,37 +1386,58 @@ IPVCEOF
 # Swap 检测与自动创建（未启用时按磁盘剩余空间动态分配）
 _ensure_swap() {
     _is_container && { msg_warn "容器跳过 Swap 创建"; return 0; }
-    local _free_kb _free_mb _size_mb=1024
-    # 若存在临时 Swap 标志（XanMod 安装前创建的），先拆除再按实际磁盘重建
-    if [ -f /tmp/.swap_is_temp ]; then
-        echo -e "  ${YELLOW}检测到临时 Swap，按当前磁盘重新计算...${NC}"
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile /tmp/.swap_is_temp
-        sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null || true
+    local free_mb size_mb swap_kb tmp
+    swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo) || return 1
+    if (( ${swap_kb:-0} > 0 )); then
+        printf '  ✓ 已有 Swap %sMB，保持不变\n' "$((swap_kb / 1024))"
+        return 0
     fi
-    local _swap_kb _swap_mb
-    _swap_kb=$(grep SwapTotal /proc/meminfo | awk '{print $2}' || echo 0)
-    _swap_mb=$(( ${_swap_kb:-0} / 1024 ))
-    if [ "$_swap_mb" -gt 0 ]; then
-        echo -e "  Swap 状态: ${GREEN}已启用 (${_swap_mb} MB)${NC}"
-        return
+    if [[ -e /swapfile || -L /swapfile ]]; then
+        msg_warn "发现未启用的 /swapfile，保留原文件，请手动检查后再试"; return 1
     fi
-    _free_kb=$(df -k / | awk 'NR==2 {print $4}' || echo 0)
-    _free_mb=$(( ${_free_kb:-0} / 1024 ))
-    [ "$_free_mb" -ge 20480 ] && _size_mb=2048
-    [ "$_free_mb" -lt 2048  ] && _size_mb=512
-    echo -e "  ${YELLOW}未启用 Swap，磁盘剩余 ${_free_mb}MB → 创建 ${_size_mb}MB...${NC}"
-    if [ ! -f /swapfile ]; then
-        fallocate -l "${_size_mb}M" /swapfile 2>/dev/null || \
-            dd if=/dev/zero of=/swapfile bs=1M count="$_size_mb" status=none
+    free_mb=$(df -Pm / | awk 'NR==2 {print $4}') || return 1
+    [[ $free_mb =~ ^[0-9]+$ ]] || return 1
+    if (( free_mb >= 3072 )); then size_mb=1024
+    elif (( free_mb >= 2560 )); then size_mb=512
+    else msg_warn "磁盘仅剩 ${free_mb}MB，跳过 Swap（创建后须保留至少 2GB）"; return 0; fi
+    printf '  创建 Swap %sMB（当前可用 %sMB）...\n' "$size_mb" "$free_mb"
+    tmp=$(mktemp /swapfile.XXXXXX) || return 1
+    if ! { fallocate -l "${size_mb}M" "$tmp" 2>/dev/null ||
+        dd if=/dev/zero of="$tmp" bs=1M count="$size_mb" status=none; } ||
+        ! chmod 600 "$tmp" || ! mkswap "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"; msg_error "Swap 分配或格式化失败，未修改 fstab"; return 1
     fi
-    chmod 600 /swapfile
-    if ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
-        mkswap /swapfile >/dev/null 2>&1 || { echo -e "  ${RED}✗ mkswap 失败${NC}"; return; }
-        swapon /swapfile >/dev/null 2>&1 || { echo -e "  ${RED}✗ swapon 失败${NC}"; return; }
+    # 不覆盖并发创建的文件；只清理本次分配的文件。
+    if ! mv -n "$tmp" /swapfile || [[ -e $tmp ]]; then
+        rm -f "$tmp"; msg_error "/swapfile 已存在或移动失败，未覆盖"; return 1
     fi
-    grep -q '/swapfile' /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-    echo -e "  ${GREEN}✓ /swapfile (${_size_mb}MB) 已创建并挂载${NC}"
+    if ! swapon /swapfile; then
+        rm -f /swapfile; msg_error "Swap 启用失败，已移除本次文件"; return 1
+    fi
+    if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+        printf '/swapfile none swap sw 0 0\n' >> /etc/fstab || {
+            msg_error "Swap 已启用但 fstab 保存失败，文件保留，请检查磁盘/权限"; return 1;
+        }
+    fi
+    printf '  ✓ /swapfile (%sMB) 已启用并保存\n' "$size_mb"
+}
+
+_xanmod_cpu_level() {
+    # 按每个 vCPU 的完整 flags 取最低等级；AVX2 单项不能证明支持 x86-64-v3。
+    awk '
+        function has_all(required, a,n,i) {
+            n=split(required,a," "); for(i=1;i<=n;i++) if(!index(flags," "a[i]" ")) return 0
+            return 1
+        }
+        /^flags[[:space:]]*:/ {
+            sub(/^[^:]*:[[:space:]]*/,""); flags=" "$0" "; level=0
+            if(has_all("lm cmov cx8 fpu fxsr mmx syscall sse2")) level=1
+            if(level==1 && has_all("cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2")) level=2
+            if(level==2 && has_all("avx avx2 bmi1 bmi2 f16c fma abm movbe xsave")) level=3
+            if(!seen++ || level<lowest) lowest=level
+        }
+        END {print lowest+0}
+    ' /proc/cpuinfo
 }
 
 # 8 线程并发测速 → Cloudflare，结果写入全局 _BW_MBPS
@@ -1485,17 +1527,32 @@ _calc_sysctl_params() {
     return 0
 }
 
-# nf_conntrack 模块就绪后逐条强制写入（sysctl --system 不保证模块已初始化）
-_apply_conntrack_sysctl() {
-    local _ctmax=${1:-131072}
-    # 确保模块开机提前加载（在 sysctl --system 之前），防止参数写入失败
-    echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf 2>/dev/null || true
+# 只加载本脚本配置，并核对实际值；新内核尚未启动时只允许 BBR 一项待重启。
+_apply_tuning_sysctl() {
+    local allow_pending=${1:-0} config=/etc/sysctl.d/99-custom-tuning.conf tmp key value live rc=0
+    _TUNING_PENDING_BBR=0
+    printf 'nf_conntrack\n' > /etc/modules-load.d/nf_conntrack.conf || return 1
     modprobe nf_conntrack 2>/dev/null || true
-    sysctl -w net.netfilter.nf_conntrack_max="$_ctmax"               >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=3600 >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=30     >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30      >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=15    >/dev/null 2>&1 || true
+    if [[ $allow_pending == 1 ]] && ! sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+        _TUNING_PENDING_BBR=1
+    fi
+    tmp=$(mktemp -d) || return 1
+    if ! awk -v pending="$_TUNING_PENDING_BBR" '
+        pending && /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {next} {print}
+        ' "$config" > "$tmp/apply.conf" || ! sysctl -p "$tmp/apply.conf" > "$tmp/output" 2>&1; then
+        [[ ! -f $tmp/output ]] || cat "$tmp/output" >&2
+        rm -rf "$tmp"; msg_error "sysctl 应用失败，配置已保存但未完全生效"; return 1
+    fi
+    while IFS='=' read -r key value; do
+        [[ $key != \#* && -n $value ]] || continue
+        key=${key//[[:space:]]/}
+        value=$(awk '{$1=$1; print}' <<< "$value")
+        live=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}') || live=""
+        if [[ $live != "$value" ]]; then msg_warn "$key 未生效（期望 $value，实际 ${live:-不可读}）"; rc=1; fi
+    done < "$tmp/apply.conf"
+    rm -rf "$tmp"
+    (( _TUNING_PENDING_BBR == 0 )) || msg_info "其他 sysctl 已生效；BBR 配置已保存，待重启加载新内核"
+    return "$rc"
 }
 
 # 设置 /etc/security/limits.conf nofile 上限为 512000
@@ -1560,7 +1617,9 @@ _write_sysctl_conf() {
     local _min_free_kb=$(( phys_mem_mb * 1024 * 6 / 100 ))
     [ "$_min_free_kb" -lt 32768  ] && _min_free_kb=32768   # 下限 32MB
     [ "$_min_free_kb" -gt 131072 ] && _min_free_kb=131072  # 上限 128MB
-    cat > /etc/sysctl.d/99-custom-tuning.conf <<EOF
+    local tmp
+    tmp=$(mktemp /etc/sysctl.d/.vps-tuning.XXXXXX) || return 1
+    if ! cat > "$tmp" <<EOF
 # ============================================================
 # 动态调优 | 带宽: ${bw_mbps}Mbps | RAM: ${phys_mem_mb}MB | RTT基准: 200ms
 # 生成时间: $(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
@@ -1642,6 +1701,8 @@ net.core.wmem_default = ${_P_TCP_RMEM_MID}
 # --- UDP 动态计算 (单位: 实际系统内存页) ---
 net.ipv4.udp_mem = ${_P_UDP_MEM_LOW} ${_P_UDP_MEM_PRESSURE} ${_P_UDP_MEM_MAX}
 EOF
+    then rm -f "$tmp"; return 1; fi
+    chmod 644 "$tmp" && mv "$tmp" /etc/sysctl.d/99-custom-tuning.conf || { rm -f "$tmp"; return 1; }
 }
 
 
@@ -2331,9 +2392,8 @@ do_retune_bandwidth() {
 
     echo -e "\n${L_BLUE}[ 1/3 ] 重新计算 sysctl 参数 (角色: ${_role})${NC}"
     _calc_sysctl_params "$_pmem_mb" "$bw_mbps" "$_role"
-    _write_sysctl_conf "$bw_mbps" "$_pmem_mb" "$_cc"
-    sysctl --system >/dev/null 2>&1 || true
-    echo -e "  ${GREEN}✓ sysctl 已更新${NC}"
+    _write_sysctl_conf "$bw_mbps" "$_pmem_mb" "$_cc" && _apply_tuning_sysctl || return 1
+    echo -e "  ${GREEN}✓ sysctl 已更新并验证生效${NC}"
     echo -e "    rmem_max     = ${CYAN}$(( _P_RMEM_MAX / 1048576 )) MB${NC}"
     echo -e "    tcp_rmem mid = ${CYAN}$(( _P_TCP_RMEM_MID / 1048576 )) MB${NC}"
 
@@ -2429,13 +2489,13 @@ do_system_update() {
 
     local _kernel_before
     _kernel_before=$(uname -r)
-    rm -f /var/run/reboot-required /var/run/reboot-required.pkgs 2>/dev/null || true
 
     echo -e "${L_BLUE}[ 1/2 ] apt update${NC}"
     apt-get update || { echo -e "${RED}✗ apt update 失败${NC}"; return 1; }
 
     echo -e "\n${L_BLUE}[ 2/2 ] apt upgrade${NC}"
-    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || { echo -e "${RED}✗ apt upgrade 失败${NC}"; return 1; }
+    # 内核元包每次升级依赖新的 image/header 包；允许新增依赖，但不允许自动移除包。
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade --with-new-pkgs -y || { echo -e "${RED}✗ apt upgrade 失败${NC}"; return 1; }
     echo -e "\n${GREEN}✓ 系统更新完成${NC}"
 
     # 检测是否有新内核
@@ -2448,7 +2508,7 @@ do_system_update() {
 
     if [ $_need_reboot -eq 1 ]; then
         echo
-        echo -e "${YELLOW}━━ 检测到新内核，需要重启 ━━${NC}"
+        echo -e "${YELLOW}━━ 系统有待生效更新，需要重启 ━━${NC}"
         echo -e "  当前运行: ${CYAN}${_kernel_before}${NC}"
         [ -n "$_new_kernel" ] && [ "$_new_kernel" != "$_kernel_before" ] && \
             echo -e "  已安装:   ${GREEN}${_new_kernel}${NC}"
@@ -2458,13 +2518,139 @@ do_system_update() {
         read -r _r
         [[ ! "${_r:-Y}" =~ ^[Nn]$ ]] && { for _i in 3 2 1; do printf "\r${GREEN}%d 秒后重启...${NC}" $_i; sleep 1; done; echo; reboot; }
     else
-        echo -e "  ${GREEN}内核无更新，无需重启${NC}"
+        echo -e "  ${GREEN}未检测到待重启的更新${NC}"
     fi
+}
+
+_security_updates_policy_ok() {
+    local policy
+    policy=$(apt-config dump) || return 1
+    grep -Fqx 'Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";' <<< "$policy" &&
+        grep -Fqx 'Unattended-Upgrade::Origins-Pattern:: "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";' <<< "$policy" &&
+        [[ $(grep -Ec '^Unattended-Upgrade::(Allowed-Origins|Origins-Pattern)::' <<< "$policy") == 2 ]] &&
+        grep -Fqx 'Unattended-Upgrade::Automatic-Reboot "false";' <<< "$policy" &&
+        grep -Fqx 'APT::Periodic::Unattended-Upgrade "1";' <<< "$policy" &&
+        grep -Fqx 'APT::Periodic::Update-Package-Lists "1";' <<< "$policy" &&
+        grep -Fqx 'APT::Periodic::Verbose "1";' <<< "$policy" &&
+        grep -Fqx 'APT::Periodic::Enable "1";' <<< "$policy"
+}
+
+_install_security_updates() {
+    local distro script config=/etc/apt/apt.conf.d/99vps-mgr-security-updates tmp
+    distro=$(_tg_cfg_get /etc/os-release ID)
+    [[ $distro == debian || $distro == ubuntu ]] || { msg_error "自动安全更新仅支持 Debian/Ubuntu"; return 1; }
+    script=$(realpath "$0") || return 1
+    [[ $script != *$'\n'* && $script != *'"'* && $script != *'%'* && $script != *'\'* && $script != *'$'* ]] || return 1
+    # 先原子写入限制策略，再安装/启用，避免首次启用时短暂使用发行版的宽泛默认策略。
+    tmp=$(mktemp -d /etc/apt/apt.conf.d/.vps-security.XXXXXX) || return 1
+    [[ ! -f $config ]] || cp -p "$config" "$tmp/previous" || { rm -rf "$tmp"; return 1; }
+    if ! cat > "$tmp/config" <<'SECURITY_APT'
+// Managed by vps-mgr: official security pockets only; never reboot automatically.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Verbose "1";
+SECURITY_APT
+    then rm -rf "$tmp"; return 1; fi
+    if ! { chmod 644 "$tmp/config" && mv "$tmp/config" "$config"; } || ! _security_updates_policy_ok; then
+        if [[ -f $tmp/previous ]]; then cp -p "$tmp/previous" "$config" || return 1
+        else rm -f "$config"; fi
+        rm -rf "$tmp"; msg_error "安全更新配置未通过校验，已撤回；请检查其他 APT 配置是否覆盖策略"; return 1
+    fi
+    rm -rf "$tmp"
+    command -v unattended-upgrade >/dev/null || apt-get install -y -qq unattended-upgrades || return 1
+    _security_updates_policy_ok || { msg_error "软件包安装后安全更新策略不一致，请检查 APT 配置"; return 1; }
+    mkdir -p /etc/systemd/system/apt-daily.service.d /etc/systemd/system/apt-daily-upgrade.service.d || return 1
+    cat > /etc/systemd/system/vps-mgr-security-update-alert.service <<EOF || return 1
+[Unit]
+Description=Notify about APT security update failures
+[Service]
+Type=oneshot
+ExecStart=/bin/bash "$script" security-update-notify failed
+EOF
+    cat > /etc/systemd/system/apt-daily.service.d/vps-mgr-notify.conf <<EOF || return 1
+[Unit]
+OnFailure=vps-mgr-security-update-alert.service
+[Service]
+ExecStartPost=-/bin/bash "$script" security-update-notify download
+EOF
+    cat > /etc/systemd/system/apt-daily-upgrade.service.d/vps-mgr-notify.conf <<EOF || return 1
+[Unit]
+OnFailure=vps-mgr-security-update-alert.service
+[Service]
+ExecStartPre=-/usr/bin/touch /run/vps-mgr-security-update.started
+ExecStartPost=-/bin/bash "$script" security-update-notify completed
+EOF
+    systemctl daemon-reload && systemctl enable --now apt-daily.timer apt-daily-upgrade.timer --quiet &&
+        systemctl is-active --quiet apt-daily.timer && systemctl is-active --quiet apt-daily-upgrade.timer &&
+        systemctl is-enabled --quiet apt-daily.timer && systemctl is-enabled --quiet apt-daily-upgrade.timer || return 1
+    msg_success "系统安全更新已启用（官方安全补丁，不自动重启；软件包更新可能重启服务）"
+}
+
+_security_updates_notify() {
+    local mode=${1:-completed} failed=0 reboot_needed=0 started since key notice node
+    [[ $mode == completed || $mode == download || $mode == failed ]] || return 1
+    [[ $mode != failed ]] || failed=1
+    # 原生 APT 日任务会吞掉部分失败退出码；只看当前 systemd invocation 的摘要。
+    if [[ -n ${INVOCATION_ID:-} ]] && journalctl --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$INVOCATION_ID" 2>/dev/null |
+        grep -E '\(error\)|error encountered in cron job' >/dev/null; then failed=1; fi
+    started=$(stat -c %Y /run/vps-mgr-security-update.started 2>/dev/null) || started=0
+    # apt.systemd.daily 有时吞掉 unattended-upgrade 的退出码，因此也检查本次日志错误。
+    if [[ $mode == completed ]] && (( started > 0 )) && [[ -f /var/log/unattended-upgrades/unattended-upgrades.log ]]; then
+        since=$(date -d "@$started" '+%Y-%m-%d %H:%M:%S') || return 1
+        if awk -v since="$since" '
+            /^[0-9][0-9][0-9][0-9]-/ {stamp=substr($0,1,19)}
+            stamp>=since && /ERROR|Traceback/ {bad=1} END {exit !bad}' \
+            /var/log/unattended-upgrades/unattended-upgrades.log; then failed=1; fi
+    fi
+    [[ ! -f /var/run/reboot-required ]] || reboot_needed=1
+    (( failed || reboot_needed )) || return 0
+    key="$(TZ="$TZ_DEFAULT" date +%F):$failed:$reboot_needed"
+    [[ ! -f $WORK_DIR/security-update.notice || $(cat "$WORK_DIR/security-update.notice") != "$key" ]] || return 0
+    node=$(get_node_id)
+    notice="🔧 #系统安全更新 ${node}"
+    (( failed == 0 )) || notice+=$'\n⚠️ APT/安全补丁安装失败，请检查 apt-daily、apt-daily-upgrade 日志及 /var/log/unattended-upgrades/'
+    (( reboot_needed == 0 )) || notice+=$'\n⟳ 系统更新待重启生效，请自行安排维护时间；脚本不会自动重启。'
+    log_message WARN "$notice"
+    _tg_resolve_channel ssh
+    [[ -n $TG_BOT_TOKEN && -n $TG_CHAT_ID ]] || return 0
+    send_telegram "$notice" "" plain || return 1
+    mkdir -p "$WORK_DIR" && (umask 077; printf '%s\n' "$key" > "$WORK_DIR/security-update.notice")
+}
+
+_security_updates_menu() {
+    local choice config=/etc/apt/apt.conf.d/99vps-mgr-security-updates
+    printf '\n=== 系统安全补丁 ===\n'
+    if _security_updates_policy_ok && systemctl is-active --quiet apt-daily.timer &&
+        systemctl is-active --quiet apt-daily-upgrade.timer && systemctl is-enabled --quiet apt-daily.timer &&
+        systemctl is-enabled --quiet apt-daily-upgrade.timer; then
+        printf '状态：官方安全更新已启用，不自动重启\n'
+    else printf '状态：未启用或策略/定时器不完整\n'; fi
+    [[ ! -f /var/run/reboot-required ]] || msg_warn "系统存在待重启更新，请安排维护"
+    printf '1. 启用 / 修复\n2. 停止后续自动安装（保留软件源更新）\n0. 返回\n'
+    read -rp '选择: ' choice || return 0
+    case $choice in
+        1) _install_security_updates ;;
+        2) [[ -f $config ]] || { msg_warn "没有本脚本的安全更新配置，未修改其他配置"; return 1; }
+           sed -i 's/APT::Periodic::Unattended-Upgrade "1";/APT::Periodic::Unattended-Upgrade "0";/' "$config" || return 1
+           apt-config dump | grep -Fx 'APT::Periodic::Unattended-Upgrade "0";' >/dev/null || {
+               msg_error "停用策略被其他 APT 配置覆盖，请检查 apt-config dump"; return 1;
+           }
+           msg_info "已停止后续自动安装；正在进行的 APT 任务不会被中断" ;;
+    esac
 }
 
 _do_full_init() {
     check_system || return 1
-    local _container=0 _ok_ipv6=0 _ok_tcping=0 _ok_update=0
+    local _container=0 _ok_ipv6=0 _ok_tcping=0 _ok_update=0 _ok_swap=1 _ok_security=0
     _is_container && _container=1
     clear
     echo -e "${L_PURPLE}══════════════════════ 一键初始化 ══════════════════════${NC}"
@@ -2474,7 +2660,7 @@ _do_full_init() {
 
     local _ok_sys=0 _ok_net=0 _ok_f2b=0 _ok_tg=0
     local _net_bw=0 _rmem_mb=0 _cc="cubic"
-    local _xanmod_done=0 _xanmod_pkg="" _xanmod_avx=""
+    local _xanmod_done=0 _xanmod_pkg="" _xanmod_avx="" _cpu_level
     local _init_srv_name=""
 
     echo -e "\n${L_BLUE}── [1/8] 默认关闭 IPv6 ─────────────────────────────────${NC}"
@@ -2485,7 +2671,7 @@ _do_full_init() {
     # ── [2/8] 系统更新 & 依赖安装 ───────────────────────────
     echo -e "\n${L_BLUE}── [2/8] 系统更新 & 依赖安装 ──────────────────────────${NC}"
 
-    if ! check_package_manager_lock; then return; fi
+    if ! check_package_manager_lock; then return 1; fi
 
     local _dns_pkg="dnsutils"
     apt-cache show bind9-dnsutils >/dev/null 2>&1 && _dns_pkg="bind9-dnsutils"
@@ -2499,15 +2685,16 @@ _do_full_init() {
     )
 
 
+    local _step_ok=1
     (apt-get update -qq < /dev/null >/dev/null 2>&1) &
     local _upd_pid=$!
     show_spinner $_upd_pid "  更新软件源"
-    wait $_upd_pid && echo -e "  ${GREEN}✓ 更新软件源${NC}" || echo -e "  ${YELLOW}⚠ 更新软件源失败（继续）${NC}"
+    wait $_upd_pid && echo -e "  ${GREEN}✓ 更新软件源${NC}" || { _step_ok=0; echo -e "  ${YELLOW}⚠ 更新软件源失败（继续检查依赖）${NC}"; }
 
-    (DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq < /dev/null >/dev/null 2>&1) &
+    (DEBIAN_FRONTEND=noninteractive apt-get upgrade --with-new-pkgs -y -qq < /dev/null >/dev/null 2>&1) &
     local _upg_pid=$!
     show_spinner $_upg_pid "  升级系统组件"
-    wait $_upg_pid && echo -e "  ${GREEN}✓ 升级系统组件${NC}" || echo -e "  ${YELLOW}⚠ 升级系统组件部分失败（继续）${NC}"
+    wait $_upg_pid && echo -e "  ${GREEN}✓ 升级系统组件${NC}" || { _step_ok=0; echo -e "  ${YELLOW}⚠ 升级系统组件部分失败（继续）${NC}"; }
 
     local _to_install=() _pkg _qi_installed=0 _qi_notfound=0
     if apt-cache show software-properties-common >/dev/null 2>&1; then
@@ -2526,9 +2713,9 @@ _do_full_init() {
     done
     local _qi_total=$(( _qi_installed + ${#_to_install[@]} + _qi_notfound ))
 
-    local _step_ok=1
+    if (( _qi_notfound )); then _step_ok=0; msg_warn "软件源中有 ${_qi_notfound} 个依赖不可用，请检查源和系统版本"; fi
     if [ ${#_to_install[@]} -eq 0 ]; then
-        echo -e "  ${GREEN}✓ 依赖: 共 ${_qi_total} 个，已全部安装${NC}"
+        echo -e "  ${GREEN}✓ 依赖: ${_qi_installed}/${_qi_total} 已安装${NC}"
     else
         echo -e "  ${CYAN}⟳ 依赖: ${_qi_installed} 已安装，${#_to_install[@]} 待安装${NC}"
         (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_to_install[@]}" < /dev/null >/dev/null 2>&1) &
@@ -2550,6 +2737,10 @@ _do_full_init() {
             echo -e "  ${YELLOW}  建议手动: apt-get install -y ${_to_install[*]}${NC}"
         fi
     fi
+
+    for _pkg in curl jq nft python3 openssl ip sysctl; do
+        command -v "$_pkg" >/dev/null || { msg_error "缺少关键命令 $_pkg，停止初始化，请修复依赖后重试"; return 1; }
+    done
 
     # 某些镜像/依赖带来 Exim4；保留邮件配置，只处理关闭 IPv6 后的监听兼容性。
     (( _ok_ipv6 == 0 )) || _exim_ipv6_compat || _step_ok=0
@@ -2682,12 +2873,12 @@ EOF
     elif uname -r | grep -qi "xanmod"; then
         echo -e "  ${GREEN}✓ 已运行 XanMod ($(uname -r))，无需重新安装${NC}"
         _xanmod_done=2
+    elif _cpu_level=$(_xanmod_cpu_level) && (( _cpu_level < 2 )); then
+        msg_warn "CPU 不满足 XanMod x86-64-v2 指令集要求，保留发行版内核"
+        _xanmod_done=2
     else
-        if grep -q "avx2" /proc/cpuinfo; then
-            _xanmod_pkg="linux-xanmod-x64v3"; _xanmod_avx="x64v3 (AVX2)"
-        else
-            _xanmod_pkg="linux-xanmod-x64v2"; _xanmod_avx="x64v2 (无AVX2)"
-        fi
+        [[ ${_cpu_level:-} == 2 || ${_cpu_level:-} == 3 ]] || { msg_error "CPU 指令集检测失败，未安装内核"; return 1; }
+        _xanmod_pkg="linux-xanmod-x64v${_cpu_level}"; _xanmod_avx="x64v${_cpu_level}（完整指令集已检查）"
         echo -e "  CPU: ${CYAN}${_xanmod_avx}${NC} → 将安装 ${CYAN}${_xanmod_pkg}${NC}"
         local _pre_mem_mb _pre_swap_mb
         _pre_mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024)
@@ -2696,23 +2887,21 @@ EOF
             echo -e "  ${RED}✗ 跳过（物理内存 ${_pre_mem_mb}MB < 400MB，XanMod 启动时会 OOM Panic）${NC}"
             echo -e "  ${CYAN}提示: 升级内存至 512MB+ 后可手动安装${NC}"
         else
-            # RAM < 512MB 且无 Swap 时，临时建 512MB Swap 防止安装 OOM
-            # 标志文件让 [4/8] _ensure_swap 在 XanMod 装完后按实际磁盘重建正式 Swap
-            if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
-                echo -e "  ${YELLOW}⚠ 内存 ${_pre_mem_mb}MB，临时创建 512MB Swap 供安装使用...${NC}"
-                fallocate -l 512M /swapfile 2>/dev/null || \
-                    dd if=/dev/zero of=/swapfile bs=1M count=512 status=none
-                chmod 600 /swapfile
-                mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile >/dev/null 2>&1 || true
-                touch /tmp/.swap_is_temp
-            fi
             local _xm_ok=1
+            # 低内存安装也走同一磁盘安全检查，后续保留已创建的 Swap，不拆除重建。
+            if [ "$_pre_mem_mb" -lt 512 ] && [ "$_pre_swap_mb" -eq 0 ]; then
+                _ensure_swap || _xm_ok=0
+                _pre_swap_mb=$(awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo) || _xm_ok=0
+                if (( ${_pre_swap_mb:-0} == 0 )); then
+                    msg_warn "低内存且没有可用 Swap，跳过 XanMod 安装以避免 OOM"; _xm_ok=0
+                fi
+            fi
             # Debian 13 默认无 gpg 命令，须先装 gnupg2
             if ! command -v gpg >/dev/null 2>&1; then
                 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg2 < /dev/null >/dev/null 2>&1 || true
             fi
             # 导入 GPG Key
-            if [ ! -f /usr/share/keyrings/xanmod-archive-keyring.gpg ]; then
+            if (( _xm_ok )) && [ ! -f /usr/share/keyrings/xanmod-archive-keyring.gpg ]; then
                 (curl -fsSL https://dl.xanmod.org/archive.key | \
                     gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null) &
                 local _gpg_pid=$!
@@ -2728,25 +2917,17 @@ EOF
                 local _xm_pid=$!
                 show_spinner $_xm_pid "  更新软件源 (含 XanMod)"
                 wait $_xm_pid || true
-                # 安装内核
-                local _xm_img _xm_hdr
-                _xm_img=$(apt-cache show "${_xanmod_pkg}" 2>/dev/null \
-                    | grep -m1 "^Depends:" | grep -oP 'linux-image-\S+' | head -1) || true
-                _xm_hdr="${_xm_img/image/headers}"
-                if [ -z "$_xm_img" ]; then
-                    echo -e "  ${RED}✗ 无法获取内核包名，请手动: apt-get install -y ${_xanmod_pkg}${NC}"
-                else
-                    (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$_xm_img" "$_xm_hdr" < /dev/null >/dev/null 2>&1) &
-                    _xm_pid=$!
-                    show_spinner $_xm_pid "  安装 ${_xm_img}"
-                    if wait $_xm_pid; then
-                        sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|' /etc/default/grub
-                        update-grub >/dev/null 2>&1 || true
-                        echo -e "  ${GREEN}✓ 内核安装完成，GRUB 已更新${NC}"
+                # 安装元包，让后续 apt 更新继续跟踪新的 image/header 包名。
+                (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$_xanmod_pkg" < /dev/null >/dev/null 2>&1) &
+                _xm_pid=$!
+                show_spinner $_xm_pid "  安装 ${_xanmod_pkg}"
+                if wait $_xm_pid; then
+                    if sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|' /etc/default/grub && update-grub >/dev/null 2>&1; then
+                        echo -e "  ${GREEN}✓ 内核元包安装完成，GRUB 已更新${NC}"
                         _xanmod_done=1
-                    else
-                        echo -e "  ${RED}✗ 安装失败，请手动: apt-get install -y ${_xm_img} ${_xm_hdr}${NC}"
-                    fi
+                    else msg_warn "内核已安装，但 GRUB 更新失败；请检查引导配置，暂不自动提示重启"; fi
+                else
+                    echo -e "  ${RED}✗ 安装失败，请手动: apt-get install -y ${_xanmod_pkg}${NC}"
                 fi
             fi
         fi
@@ -2792,7 +2973,7 @@ EOF
     fi
 
     # Swap（幂等，已存在则跳过）
-    _ensure_swap
+    _ensure_swap || _ok_swap=0
 
     if (( _container )); then
         _ok_net=2
@@ -2818,16 +2999,10 @@ EOF
         # XanMod 已安装但未重启；预写 sysctl，重启后 BBR v3 自动生效
         _cc="bbr"
         modprobe tcp_bbr 2>/dev/null || true
-        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-        sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     else
         modprobe tcp_bbr 2>/dev/null || true
         if grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
             _cc="bbr"
-            sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-            sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-            local _bv; _bv=$(_get_bbr_version)
-            echo -e "  ${GREEN}✓ BBR ${_bv} 已加载${NC}"
         else
             echo -e "  ${YELLOW}⚠ BBR 模块不可用，将使用默认拥塞控制 (${_cc})${NC}"
         fi
@@ -2835,18 +3010,18 @@ EOF
 
     # 动态参数计算 & sysctl 写入
     _calc_sysctl_params "$phys_mem_mb" "$bw_mbps" "$_role"
-    _write_sysctl_conf "$bw_mbps" "$phys_mem_mb" "$_cc"
-    sysctl --system >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.route.flush=1 >/dev/null 2>&1 || true
-    _apply_conntrack_sysctl "$_P_CONNTRACK_MAX"
+    local _sysctl_ok=0
+    if _write_sysctl_conf "$bw_mbps" "$phys_mem_mb" "$_cc" && _apply_tuning_sysctl "$_xanmod_done"; then _sysctl_ok=1; fi
     _net_bw=$bw_mbps; _rmem_mb=$(( _P_RMEM_MAX / 1048576 ))
 
     local _def_if _fq_maxrate
     _def_if=$(ip route show default | awk '{print $5; exit}')
     _fq_maxrate=$(_fq_maxrate_mbps "$bw_mbps") || return 1
     if _apply_fq "$_def_if" "$_fq_maxrate" && _persist_fq "$_fq_maxrate"; then
-        _ok_net=1
-        echo -e "  ${GREEN}✓ 网络: ${_net_bw}Mbps · $([ "$_role" = edge ] && echo '落地' || echo '中转') · rmem ${_rmem_mb}MB · CC: ${_cc} · fq 已保存${NC}"
+        if (( _sysctl_ok )); then
+            _ok_net=1
+            echo -e "  ${GREEN}✓ 网络: ${_net_bw}Mbps · $([ "$_role" = edge ] && echo '落地' || echo '中转') · rmem ${_rmem_mb}MB · CC: ${_cc}$([[ ${_TUNING_PENDING_BBR:-0} == 1 ]] && printf '（待重启）') · fq 已保存${NC}"
+        else msg_warn "fq 已保存，但 sysctl 未完全生效；请根据上方错误用菜单 6 → 2 重试"; fi
     else
         msg_warn "sysctl 已写入，但 fq 调优或持久化未完成；请检查后用菜单 6 → 2 重试"
     fi
@@ -2885,12 +3060,13 @@ EOF
         _install_fail2ban && _ok_f2b=1 || true
     fi
 
-    echo -e "\n${L_BLUE}── [8/8] TCPing / 每日更新 ──────────────────────────────${NC}"
+    echo -e "\n${L_BLUE}── [8/8] TCPing / 每日更新 / 安全补丁 ───────────────────${NC}"
     _tcping_setup_silent && _ok_tcping=1 || msg_warn "TCPing 安装未完成，可从菜单 6 → 7 重试"
     install_autoupdate && _ok_update=1 || msg_warn "每日更新未启用，可从菜单 16 重试"
     if (( _ok_update )); then
         echo -e "  ${GREEN}✓ 每日更新已启用（仅正式版，不自动安装 beta）${NC}"
     fi
+    _install_security_updates && _ok_security=1 || msg_warn "系统安全补丁自动更新未完成，可从菜单 6 → 8 修复"
 
     # 成功结果已在各步骤显示，末尾只集中提醒未完成或主动跳过的项目。
     echo
@@ -2900,10 +3076,12 @@ EOF
     (( _ok_sys )) || _pending+=("系统依赖")
     (( _container || _xanmod_done > 0 )) || _pending+=("XanMod")
     (( _ok_net )) || _pending+=("网络调优")
+    (( _ok_swap )) || _pending+=("Swap")
     (( _ok_tg )) || _pending+=("TG 推送")
     (( _ok_f2b )) && systemctl is-active --quiet fail2ban 2>/dev/null || _pending+=("Fail2Ban")
     (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null || _pending+=("TCPing")
     (( _ok_update )) || _pending+=("每日更新")
+    (( _ok_security )) || _pending+=("系统安全补丁")
     if (( ${#_pending[@]} )); then
         msg_warn "未完成 / 已跳过：${_pending[*]}（见上方提示，可从对应菜单单独处理）"
     fi
@@ -3110,7 +3288,7 @@ _setup_ssh_tg_monitor() {
     # Embed the same pure-Bash rendering/parser helpers; no source of user data.
     {
         printf '#!/bin/bash\n'
-        declare -f get_flag_emoji _srv_render _tg_cfg_get _html_escape
+        declare -f get_flag_emoji _srv_render _tg_cfg_get _html_escape _tg_api
         cat <<'NOTIFY_EOF'
 CONF=/etc/ssh-tg-monitor.conf
 TG_BOT_TOKEN=$(_tg_cfg_get "$CONF" TG_BOT_TOKEN)
@@ -3132,8 +3310,8 @@ send_tg() {
     local response
     local -a args=(--data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" --data-urlencode 'parse_mode=HTML')
     [[ -z "$TG_THREAD_SSH" ]] || args+=(--data-urlencode "message_thread_id=$TG_THREAD_SSH")
-    if ! response=$(curl -fsS --connect-timeout 5 --max-time 10 \
-        "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" "${args[@]}" 2>/dev/null) ||
+    if ! response=$(_tg_api "$TG_BOT_TOKEN" sendMessage -fsS --connect-timeout 5 --max-time 10 \
+        "${args[@]}" 2>/dev/null) ||
         ! jq -e '.ok == true' <<< "$response" >/dev/null 2>&1; then
         printf 'Telegram notification failed (transport or API); credentials omitted\n' >&2
         return 1
@@ -3266,7 +3444,10 @@ do_ssh_security() {
                 if [[ -n "$_wl_del" ]]; then
                     if grep -qxF "$_wl_del" "$F2B_WHITELIST" 2>/dev/null; then
                         local _wl_tmp; _wl_tmp=$(mktemp)
-                        grep -vxF -- "$_wl_del" "$F2B_WHITELIST" > "$_wl_tmp" && mv "$_wl_tmp" "$F2B_WHITELIST" || rm -f "$_wl_tmp"
+                        if ! awk -v ip="$_wl_del" '$0 != ip' "$F2B_WHITELIST" > "$_wl_tmp" ||
+                            ! mv "$_wl_tmp" "$F2B_WHITELIST"; then
+                            rm -f "$_wl_tmp"; msg_error "白名单删除失败"; return 1
+                        fi
                         _f2b_reload_whitelist
                         _f2b_nft_accept del "$_wl_del"
                         _fw_persist
@@ -3319,8 +3500,9 @@ sys_maintenance_menu() {
         printf " ${C_GREEN}5.${C_RESET} 查看系统详情\n"
         printf " ${C_GREEN}6.${C_RESET} 修改服务器名称\n"
         printf " ${C_GREEN}7.${C_RESET} TCPing 监控\n"
+        printf " ${C_GREEN}8.${C_RESET} 系统安全补丁（自动更新）\n"
         printf " ${C_GREEN}0.${C_RESET} 返回主菜单\n"
-        printf "\n${C_CYAN}请选择 [0-7]: ${C_RESET}"
+        printf "\n${C_CYAN}请选择 [0-8]: ${C_RESET}"
         read -r _msub
         case "$_msub" in
             1) do_system_update || true; pause ;;
@@ -3329,6 +3511,7 @@ sys_maintenance_menu() {
             4) do_check_all; pause ;;
             6) _set_server_name; pause ;;
             7) do_tcping_monitor || true; pause ;;
+            8) _security_updates_menu || true; pause ;;
             5)
                 clear
                 echo -e "${L_GREEN}--- 系统深度信息 ---${NC}"
@@ -3513,7 +3696,8 @@ validate_realm_config() {
     # 校验 JSON 有效 + endpoints 为数组 + 每个 endpoint 含 listen/remote 字符串字段
     jq -e '
         (.endpoints | type == "array") and
-        ([.endpoints[] | select((.listen | type) != "string" or (.remote | type) != "string")] | length == 0)
+        ([.endpoints[] | select((.listen | type) != "string" or (.remote | type) != "string")] | length == 0) and
+        (([.endpoints[].listen] | length) == ([.endpoints[].listen] | unique | length))
     ' "$config_file" >/dev/null 2>&1
 }
 
@@ -4045,6 +4229,12 @@ uninstall_service() {
     read -r answer
     if [[ "${answer,,}" != "y" ]]; then return; fi
 
+    _state_locked _uninstall_service_locked "$@"
+}
+
+_uninstall_service_locked() {
+    local service_name=$1 user=$2 bin_path=$3 config_dir=$4 service_file_path=$5 config_file=$6
+
     msg_step "正在卸载 ${service_name}..."
     if [[ "$service_name" == "snell" ]]; then
         # 停止并关闭所有 snell@ 实例
@@ -4052,26 +4242,22 @@ uninstall_service() {
         while IFS= read -r _sf; do
             _sp=$(grep -oP 'listen\s*=\s*[^:]+:\K\d+' "$_sf" 2>/dev/null | head -1 || true)
             if [[ -n "$_sp" ]]; then
-                systemctl stop    "snell@${_sp}.service" &>/dev/null || true
-                systemctl disable "snell@${_sp}.service" &>/dev/null || true
-                close_firewall_port "$_sp"
+                _snell_remove_port "$_sp" || return 1
             fi
         done < <(find "$SNELL_CONFIG_DIR" -name "snell-[0-9]*.conf" -type f 2>/dev/null)
     else
-        systemctl stop    "${service_name}.service" &>/dev/null || true
-        systemctl disable "${service_name}.service" &>/dev/null || true
+        systemctl disable --now "${service_name}.service" || return 1
     fi
 
     if [[ "$service_name" != "snell" ]] && [[ -f "$config_file" ]]; then
         if [[ "$service_name" == "realm" ]]; then
             local ports
-            ports=$(jq -r '.endpoints[]?.listen' "$config_file" 2>/dev/null | cut -d: -f2 || true)
-            for p in $ports; do [[ -n "$p" ]] && close_firewall_port "$p"; done
+            ports=$(jq -r '.endpoints[]?.listen | split(":")[-1]' "$config_file") || return 1
+            for p in $ports; do close_firewall_port "$p" && _quota_forget "$p" || return 1; done
         fi
     fi
 
-    rm -f "$bin_path" "$service_file_path"
-    rm -rf "$config_dir"
+    rm -f "$bin_path" "$service_file_path" && rm -rf "$config_dir" || return 1
     if id "$user" &>/dev/null; then userdel "$user" &>/dev/null || true; fi
     systemctl daemon-reload
     msg_success "${service_name} 已成功卸载。"
@@ -4243,7 +4429,7 @@ check_realm_dead_forwards() {
     fi
 
     # 开始检测
-    local dead_indices=()   # 失效的 JSON 索引
+    local dead_ports=()     # 按稳定端口删除，避免探测期间定时任务改变数组索引
     local dead_info=()      # 失效的显示信息
     local i=0
 
@@ -4277,7 +4463,7 @@ check_realm_dead_forwards() {
             printf "${C_GREEN}[正常]${C_RESET}\n"
         else
             printf "${C_RED}[失效]${C_RESET}\n"
-            dead_indices+=("$i")
+            dead_ports+=("$l_port")
             dead_info+=("  本地:${l_port} -> 远端:${r_host}:${r_port}  (${alias})")
         fi
 
@@ -4286,50 +4472,26 @@ check_realm_dead_forwards() {
 
     printf "\n"
 
-    if [[ ${#dead_indices[@]} -eq 0 ]]; then
+    if [[ ${#dead_ports[@]} -eq 0 ]]; then
         msg_success "所有转发规则连採正常，无需清理。"
         return
     fi
 
     # 展示失效列表让用户确认
-    printf "${C_RED}以下 ${#dead_indices[@]} 条规则检测失效:${C_RESET}\n"
+    printf "${C_RED}以下 ${#dead_ports[@]} 条规则检测失效:${C_RESET}\n"
     for info in "${dead_info[@]}"; do
         printf "${C_RED}%s${C_RESET}\n" "$info"
     done
 
-    printf "\n${C_YELLOW}确认删除以上 ${#dead_indices[@]} 条失效规则？ [y/N]: ${C_RESET}"
+    printf "\n${C_YELLOW}确认删除以上 ${#dead_ports[@]} 条失效规则？ [y/N]: ${C_RESET}"
     read -r confirm
     if [[ "${confirm,,}" != "y" ]]; then
         msg_info "已取消，未做任何修改。"
         return
     fi
 
-    # 从后向前删除，避免索引偏移
-    local sorted_indices=()
-    mapfile -t sorted_indices < <(printf '%s\n' "${dead_indices[@]}" | sort -rn)
-
-    for idx in "${sorted_indices[@]}"; do
-        local del_listen del_port
-        del_listen=$(jq -r ".endpoints[$idx].listen" "$REALM_CONFIG_FILE")
-        del_port=$(echo "$del_listen" | cut -d: -f2)
-
-        # 删除 JSON 并关闭防火墙端口
-        local tmp_json
-        tmp_json=$(mktemp)
-        jq "del(.endpoints[$idx])" "$REALM_CONFIG_FILE" > "$tmp_json" && mv "$tmp_json" "$REALM_CONFIG_FILE" || rm -f "$tmp_json"
-        chown "${REALM_USER}:${REALM_USER}" "$REALM_CONFIG_FILE"
-
-        [[ -f "$REALM_META_FILE" ]] && {
-            local meta_tmp
-            meta_tmp=$(mktemp)
-            jq --arg p "$del_port" 'del(.[$p])' "$REALM_META_FILE" > "$meta_tmp" && mv "$meta_tmp" "$REALM_META_FILE" || rm -f "$meta_tmp"
-            chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"
-        }
-
-        close_firewall_port "$del_port" 2>/dev/null || true
-    done
-
-    msg_success "已删除 ${#dead_indices[@]} 条失效规则。"
+    _state_locked _realm_remove_ports "${dead_ports[@]}" || { msg_error "规则清理未完成，请检查后重试"; return 1; }
+    msg_success "已删除 ${#dead_ports[@]} 条失效规则。"
     _realm_restart_hint
 
 }
@@ -4368,6 +4530,71 @@ _realm_safe_restart() {
             msg_error "Realm 恢复失败，请检查日志"
     fi
     msg_error "Realm 未能应用新配置"; return 1
+}
+
+_realm_add_endpoint() {
+    local port=$1 remote=$2 psk=$3 alias=$4 cc=$5 tmp had_meta=0 had_tcp=0 had_udp=0
+    _check_port_available "$port" || { msg_error "端口已被监听或配置占用，未添加"; return 1; }
+    if jq -e --arg r "$remote" 'any(.endpoints[]; .remote==$r)' "$REALM_CONFIG_FILE" >/dev/null; then
+        msg_error "远端地址已存在"; return 1
+    fi
+    tmp=$(mktemp -d "$REALM_CONFIG_DIR/.change.XXXXXX") || return 1
+    cp -p "$REALM_CONFIG_FILE" "$tmp/old_config" || { rm -rf "$tmp"; return 1; }
+    if [[ -f $REALM_META_FILE ]]; then
+        had_meta=1
+        cp -p "$REALM_META_FILE" "$tmp/old_meta" || { rm -rf "$tmp"; return 1; }
+    else printf '{}\n' > "$tmp/old_meta"; fi
+    _fw_has_element tcp_ports "$port" && had_tcp=1
+    _fw_has_element udp_ports "$port" && had_udp=1
+    if jq --arg l "0.0.0.0:$port" --arg r "$remote" '.endpoints += [{listen:$l,remote:$r}]' \
+        "$REALM_CONFIG_FILE" > "$tmp/config" && validate_realm_config "$tmp/config" &&
+        jq --arg p "$port" --arg psk "$psk" --arg alias "$alias" --arg cc "$cc" \
+        '. + {($p): {psk:$psk,alias:$alias,country_code:$cc}}' "$tmp/old_meta" > "$tmp/meta" &&
+        chown "$REALM_USER:$REALM_USER" "$tmp/config" "$tmp/meta" && chmod 600 "$tmp/config" "$tmp/meta" &&
+        open_firewall_port "$port" && mv "$tmp/config" "$REALM_CONFIG_FILE" && mv "$tmp/meta" "$REALM_META_FILE"; then
+        rm -rf "$tmp"; return 0
+    fi
+    cp -p "$tmp/old_config" "$REALM_CONFIG_FILE" || msg_error "Realm 配置恢复失败，备份在 $tmp"
+    if (( had_meta )); then cp -p "$tmp/old_meta" "$REALM_META_FILE" || return 1
+    else rm -f "$REALM_META_FILE"; fi
+    (( had_tcp )) || _fw_element delete tcp_ports "$port" || true
+    (( had_udp )) || _fw_element delete udp_ports "$port" || true
+    msg_error "Realm 添加失败，已尝试恢复配置；检查日志后重试"
+    # 失败备份留给管理员排查，不在恢复失败时删除唯一副本。
+    msg_warn "原配置备份: $tmp"
+    return 1
+}
+
+_realm_remove_ports() {
+    local port ports tmp restart=0
+    [[ ${1:-} != --restart ]] || { restart=1; shift; }
+    for port in "$@"; do _valid_port "$port" || return 1; done
+    ports=$(jq -cn --args '$ARGS.positional' "$@") || return 1
+    tmp=$(mktemp -d "$REALM_CONFIG_DIR/.delete.XXXXXX") || return 1
+    if ! jq --argjson ports "$ports" '.endpoints |= map(select((.listen|split(":")[-1]) as $p | $ports|index($p)|not))' \
+        "$REALM_CONFIG_FILE" > "$tmp/config" || ! validate_realm_config "$tmp/config"; then
+        rm -rf "$tmp"; return 1
+    fi
+    if [[ -f $REALM_META_FILE ]]; then
+        jq --argjson ports "$ports" 'delpaths($ports|map([.]))' "$REALM_META_FILE" > "$tmp/meta" || { rm -rf "$tmp"; return 1; }
+    else printf '{}\n' > "$tmp/meta"; fi
+    chown "$REALM_USER:$REALM_USER" "$tmp/config" "$tmp/meta" && chmod 600 "$tmp/config" "$tmp/meta" || { rm -rf "$tmp"; return 1; }
+    # 自动到期删除须先确认运行配置生效，再撤掉配额暂停；重启失败仍保留原配额供重试。
+    if (( restart )); then
+        cp -p "$REALM_CONFIG_FILE" "$tmp/previous" && mv "$tmp/config" "$REALM_CONFIG_FILE" || { rm -rf "$tmp"; return 1; }
+        if ! _realm_safe_restart; then
+            cp -p "$tmp/previous" "$REALM_CONFIG_FILE" && manage_services restart realm ||
+                msg_error "Realm 恢复失败，备份在 $tmp；配额暂停未清除"
+            return 1
+        fi
+    fi
+    for port in "$@"; do
+        close_firewall_port "$port" && _quota_forget "$port" || { rm -rf "$tmp"; return 1; }
+    done
+    mv "$tmp/meta" "$REALM_META_FILE" && { (( restart )) || mv "$tmp/config" "$REALM_CONFIG_FILE"; } || {
+        msg_error "Realm 文件提交失败，待提交文件保留在 $tmp"; return 1;
+    }
+    rm -rf "$tmp"
 }
 
 _process_realm_rule() {
@@ -4436,7 +4663,10 @@ _process_realm_rule() {
         return 1
     fi
     
+    _valid_port "$remote_port" || { msg_error "远端端口无效"; return 1; }
+    remote_port=$((10#$remote_port))
     local remote_addr="${remote_host}:${remote_port}"
+    [[ $remote_host != *:* ]] || remote_addr="[${remote_host}]:${remote_port}"
 
     # 防止重复添加同一远端地址
     if jq -e --arg r "$remote_addr" '.endpoints[] | select(.remote == $r)' "$REALM_CONFIG_FILE" >/dev/null 2>&1; then
@@ -4446,30 +4676,13 @@ _process_realm_rule() {
 
     local local_port
 
-    # === 端口分配逻辑 ===
-    # 如果配置行里指定了 listening 端口 (且该端口确实可用)，则优先复用
-    if [[ -n "$manual_listening_port" ]] && ! (ss -tln | grep -q ":${manual_listening_port} " || ss -uln | grep -q ":${manual_listening_port} "); then
-         # 双重检查: 确保 config 文件里也没占用 (防止重复添加导致 JSON 冲突)
-         if ! jq -e --argjson p "$manual_listening_port" '.endpoints[] | select(.listen | endswith(":" + ($p|tostring)))' "$REALM_CONFIG_FILE" >/dev/null 2>&1; then
-             local_port="$manual_listening_port"
-         else
-             # 端口已被本配置文件占用，回退到随机
-             local_port=$(get_available_port)
-         fi
+    if [[ -n "$manual_listening_port" ]]; then
+        _valid_port "$manual_listening_port" && _check_port_available "$((10#$manual_listening_port))" || {
+            msg_error "指定的监听端口无效或已占用，未改用随机端口"; return 1;
+        }
+        local_port=$((10#$manual_listening_port))
     else
-         # 未指定或端口已占用，回退到随机
-         local_port=$(get_available_port)
-    fi
-    
-    local listen_addr="0.0.0.0:$local_port"
-
-    # 1. 准备 config.json 临时文件（暂不提交）
-    local temp_json
-    temp_json=$(mktemp)
-    if ! jq --arg l "$listen_addr" --arg r "$remote_addr" \
-       '.endpoints += [{"listen": $l, "remote": $r}]' \
-       "$REALM_CONFIG_FILE" > "$temp_json" || ! jq -e . "$temp_json" >/dev/null 2>&1; then
-        rm -f "$temp_json"; msg_error "生成配置 JSON 失败，已中止。"; return 1
+        local_port=$(get_available_port) || return 1
     fi
 
     # Smart Naming Logic
@@ -4522,30 +4735,9 @@ _process_realm_rule() {
         fi
     fi
 
-    # 2. 准备 metadata 临时文件（暂不提交）
-    if [[ ! -f "$REALM_META_FILE" ]]; then echo '{}' > "$REALM_META_FILE"; chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"; chmod 600 "$REALM_META_FILE"; fi
     local safe_alias
     safe_alias=$(echo "$new_name" | tr -d '"\\')
-    local meta_final
-    meta_final=$(mktemp)
-    if ! jq --arg p "$local_port" \
-            --arg psk "$psk" \
-            --arg alias "$safe_alias" \
-            --arg cc "$remote_country_code" \
-       '. + {($p): {"psk": $psk, "alias": $alias, "country_code": $cc}}' \
-       "$REALM_META_FILE" > "$meta_final"; then
-        rm -f "$temp_json" "$meta_final"; return 1
-    fi
-
-    # 3. 两个文件都就绪后一次性提交，保证原子性
-    mv "$temp_json" "$REALM_CONFIG_FILE"
-    chown "${REALM_USER}:${REALM_USER}" "$REALM_CONFIG_FILE"
-    chmod 600 "$REALM_CONFIG_FILE"
-    mv "$meta_final" "$REALM_META_FILE"
-    chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"
-    chmod 600 "$REALM_META_FILE"
-
-    open_firewall_port "$local_port" || msg_warn "防火墙端口 $local_port 放行失败，节点已添加但外部可能不可达，请手动检查 nftables。"
+    _state_locked _realm_add_endpoint "$local_port" "$remote_addr" "$psk" "$safe_alias" "$remote_country_code" || return 1
 
     if [[ "$silent_mode" == "false" ]]; then
         local display_prefix="$flag"
@@ -4605,21 +4797,8 @@ add_realm_forward() {
     local _restart_mode=${1:-"ask"}  # auto=直接重启（首次安装）  ask=询问（后期添加）
     msg_step "添加 Realm 转发规则 (手动)"
     
-    echo "请输入本地监听端口 (Local Port) [回车自动分配]:"
-    local local_port input_port
-    read -r input_port
-    if [[ -z "$input_port" ]]; then
-        local_port=$(get_available_port)
-    elif [[ "$input_port" =~ ^[0-9]+$ ]] && [[ $input_port -ge 1 ]] && [[ $input_port -le 65535 ]]; then
-        if ss -tln | grep -q ":${input_port} " || ss -uln | grep -q ":${input_port} "; then
-            msg_error "端口 ${input_port} 已被占用，请选择其他端口。"
-            return
-        fi
-        local_port=$input_port
-    else
-        msg_error "端口号无效，请输入 1-65535 之间的数字。"
-        return
-    fi
+    local local_port remote_addr
+    local_port=$(get_port_interactive) || return 1
     
     printf "${C_CYAN}请输入目标地址 (格式 IP:Port, 例如 1.2.3.4:8080): ${C_RESET}"
     read -r remote_addr
@@ -4634,44 +4813,8 @@ add_realm_forward() {
         return
     fi
 
-    local listen_addr="0.0.0.0:$local_port"
-    local temp_json
-    temp_json=$(mktemp)
-
-    # 构建新对象并追加
-    jq --arg l "$listen_addr" --arg r "$remote_addr" \
-       '.endpoints += [{"listen": $l, "remote": $r}]' \
-       "$REALM_CONFIG_FILE" > "$temp_json"
-       
-    if ! jq -e . "$temp_json" >/dev/null; then
-        msg_error "更新配置失败 (JSON 错误)。"
-        rm -f "$temp_json"
-        return
-    fi
-    
-    mv "$temp_json" "$REALM_CONFIG_FILE"
-    chown "${REALM_USER}:${REALM_USER}" "$REALM_CONFIG_FILE"
-    chmod 600 "$REALM_CONFIG_FILE"
-
-    # 同步写入 metadata（别名使用 remote_addr，psk 留空）
-    if [[ ! -f "$REALM_META_FILE" ]]; then
-        echo '{}' > "$REALM_META_FILE"
-        chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"
-        chmod 600 "$REALM_META_FILE"
-    fi
-    local _meta_tmp
-    _meta_tmp=$(mktemp)
-    if jq --arg p "$local_port" --arg alias "$remote_addr" \
-       '. + {($p): {"psk": "", "alias": $alias, "country_code": "UN"}}' \
-       "$REALM_META_FILE" > "$_meta_tmp"; then
-        mv "$_meta_tmp" "$REALM_META_FILE"
-        chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"
-        chmod 600 "$REALM_META_FILE"
-    else
-        rm -f "$_meta_tmp"
-    fi
-
-    open_firewall_port "$local_port" || msg_warn "防火墙端口 $local_port 放行失败，请手动检查 nftables。"
+    _valid_port "${remote_addr##*:}" || { msg_error "远端端口无效"; return 1; }
+    _state_locked _realm_add_endpoint "$local_port" "$remote_addr" "" "$remote_addr" UN || return 1
     msg_success "转发规则已添加: $local_port -> $remote_addr"
     if [[ "$_restart_mode" == "auto" ]]; then
         _realm_safe_restart
@@ -4705,33 +4848,7 @@ delete_realm_forward() {
         return
     fi
 
-    local temp_json
-    temp_json=$(mktemp)
-    if ! jq --arg p "$deleted_port" 'del(.endpoints[] | select(.listen | endswith(":" + $p)))' "$REALM_CONFIG_FILE" > "$temp_json"; then
-        rm -f "$temp_json"; msg_error "删除规则失败 (jq 错误)。"; return
-    fi
-    mv "$temp_json" "$REALM_CONFIG_FILE"
-    chown "${REALM_USER}:${REALM_USER}" "$REALM_CONFIG_FILE"
-    chmod 600 "$REALM_CONFIG_FILE"
-
-    # 清理 metadata
-    if [[ -f "$REALM_META_FILE" ]]; then
-        local meta_temp
-        meta_temp=$(mktemp)
-        if jq --arg p "$deleted_port" 'del(.[$p])' "$REALM_META_FILE" > "$meta_temp"; then
-            if ! mv "$meta_temp" "$REALM_META_FILE"; then
-                msg_warn "metadata.json 更新失败，规则与元数据可能不同步"
-                rm -f "$meta_temp"
-            else
-                chown "${REALM_USER}:${REALM_USER}" "$REALM_META_FILE"
-            fi
-        else
-            rm -f "$meta_temp"
-        fi
-    fi
-    
-    # 自动关闭防火墙端口
-    close_firewall_port "$deleted_port"
+    _state_locked _realm_remove_ports "$deleted_port" || { msg_error "规则清理未完成，请检查后重试"; return 1; }
     
     msg_success "规则已删除。"
     _realm_restart_hint
@@ -4829,28 +4946,12 @@ install_snell() {
     install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$snell_download_url" "zip" || return
 
     # 创建/更新模板服务文件
-    create_snell_template_service
-    systemctl daemon-reload
+    create_snell_template_service && systemctl daemon-reload || return 1
 
     msg_step "生成首个 Snell 节点配置..."
     local port
     port=$(get_port_interactive) || return 1
-    local psk
-    psk=$(openssl rand -base64 32)
-    local node_conf="${SNELL_CONFIG_DIR}/snell-${port}.conf"
-    cat > "$node_conf" <<EOF
-[snell-server]
-listen = 0.0.0.0:${port}
-psk = ${psk}
-ipv6 = false
-EOF
-    chown -R "${SNELL_USER}:${SNELL_USER}" "$SNELL_CONFIG_DIR"
-    chmod 600 "$node_conf"
-
-    systemctl daemon-reload
-    systemctl enable "snell@${port}.service" 2>/dev/null || msg_warn "snell@${port} enable 失败，重启后不会自启。"
-    systemctl start  "snell@${port}.service" || msg_warn "启动 snell@${port} 失败，请检查: journalctl -u snell@${port}.service"
-    open_firewall_port "$port"
+    _state_locked _snell_add_node "$port" || return 1
     msg_success "Snell 安装完成，端口: ${port}"
 }
 
@@ -4860,22 +4961,43 @@ add_snell_node() {
     msg_step "添加新 Snell 节点..."
     local port
     port=$(get_port_interactive) || return 1
-    local psk
-    psk=$(openssl rand -base64 32)
+    _state_locked _snell_add_node "$port" || return 1
+    msg_success "Snell 节点已添加，端口: ${port}"
+}
+
+_snell_add_node() {
+    local port=$1 psk had_tcp=0 had_udp=0
+    _check_port_available "$port" || { msg_error "端口已占用，未创建节点"; return 1; }
+    psk=$(openssl rand -base64 32) || return 1
     local node_conf="${SNELL_CONFIG_DIR}/snell-${port}.conf"
-    cat > "$node_conf" <<EOF
+    _fw_has_element tcp_ports "$port" && had_tcp=1
+    _fw_has_element udp_ports "$port" && had_udp=1
+    (umask 077; cat > "$node_conf" <<EOF
 [snell-server]
 listen = 0.0.0.0:${port}
 psk = ${psk}
 ipv6 = false
 EOF
-    chown "${SNELL_USER}:${SNELL_USER}" "$node_conf"
-    chmod 600 "$node_conf"
-    systemctl daemon-reload
-    systemctl enable "snell@${port}.service" 2>/dev/null || msg_warn "snell@${port} enable 失败，重启后不会自启。"
-    systemctl start  "snell@${port}.service" || msg_warn "启动 snell@${port} 失败，请检查: journalctl -u snell@${port}.service"
-    open_firewall_port "$port"
-    msg_success "Snell 节点已添加，端口: ${port}"
+    ) || { rm -f "$node_conf"; return 1; }
+    if chown "${SNELL_USER}:${SNELL_USER}" "$node_conf" && chmod 600 "$node_conf" &&
+        systemctl enable --now "snell@${port}.service" && sleep 1 &&
+        systemctl is-active --quiet "snell@${port}.service" && open_firewall_port "$port"; then
+        return 0
+    fi
+    msg_error "Snell 启动或防火墙配置失败，未完成安装；请检查 journalctl -u snell@${port}"
+    (( had_tcp )) || _fw_element delete tcp_ports "$port" || true
+    (( had_udp )) || _fw_element delete udp_ports "$port" || true
+    if systemctl disable --now "snell@${port}.service"; then rm -f "$node_conf"
+    else msg_warn "服务停止失败，保留配置 $node_conf 供排查"; fi
+    return 1
+}
+
+_snell_remove_port() {
+    local port=$1
+    _valid_port "$port" || return 1
+    systemctl disable --now "snell@${port}.service" &&
+        close_firewall_port "$port" && _quota_forget "$port" &&
+        rm -f "$SNELL_CONFIG_DIR/snell-${port}.conf"
 }
 
 delete_snell_node() {
@@ -4913,12 +5035,7 @@ delete_snell_node() {
     fi
 
     local target_port="${ports[$((choice - 1))]}"
-    local target_conf="${SNELL_CONFIG_DIR}/snell-${target_port}.conf"
-
-    systemctl stop    "snell@${target_port}.service" &>/dev/null || true
-    systemctl disable "snell@${target_port}.service" &>/dev/null || true
-    rm -f "$target_conf"
-    close_firewall_port "$target_port"
+    _state_locked _snell_remove_port "$target_port" || { msg_error "删除未完成，已保留配置供重试"; return 1; }
     msg_success "Snell 节点已删除，端口: ${target_port}"
 }
 
@@ -5301,15 +5418,24 @@ _qbytes_human() {
 }
 
 _qhuman_to_bytes() {
-    local s="${1^^}" num
-    num=$(echo "$s" | tr -dc '0-9.')
-    [[ -z "$num" || "$num" == "0" ]] && echo 0 && return
-    if   [[ "$s" == *T* ]]; then awk "BEGIN{printf \"%d\", $num*1099511627776}"
-    elif [[ "$s" == *G* ]]; then awk "BEGIN{printf \"%d\", $num*1073741824}"
-    elif [[ "$s" == *M* ]]; then awk "BEGIN{printf \"%d\", $num*1048576}"
-    elif [[ "$s" == *K* ]]; then awk "BEGIN{printf \"%d\", $num*1024}"
-    else echo "${num%%.*}"
-    fi
+    local s="${1^^}" num unit multiplier=1
+    [[ $s =~ ^([0-9]+([.][0-9]+)?)([KMGT]I?B?|B)?$ ]] || return 1
+    num=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[3]}
+    case $unit in
+        K*) multiplier=1024 ;; M*) multiplier=1048576 ;;
+        G*) multiplier=1073741824 ;; T*) multiplier=1099511627776 ;;
+    esac
+    # Debian 12 的 mawk %d 只有 32 位；限制到浮点整数精确范围也避免后续统计溢出。
+    awk -v n="$num" -v m="$multiplier" 'BEGIN {
+        b=n*m; if (b>9007199254740991 || (n>0 && b<1)) exit 1
+        printf "%.0f\n", b
+    }'
+}
+
+_quota_expiry_date() {
+    [[ $1 == - ]] && { printf '%s\n' -; return; }
+    [[ $1 =~ ^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$ ]] || return 1
+    TZ="$TZ_DEFAULT" date -d "$1" +%F 2>/dev/null
 }
 
 # TG notify without dying on missing config (safe for timer/non-interactive use)
@@ -5317,7 +5443,7 @@ _quota_tg_notify() {
     local msg="$1"
     _tg_resolve_channel quota
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return 0
-    send_telegram "$msg" 2>/dev/null || true
+    send_telegram "$msg" "" plain 2>/dev/null || true
 }
 
 # Ensure counting chains exist and are linked to INPUT/OUTPUT
@@ -5481,7 +5607,7 @@ quota_check_all() { _state_locked quota_check_all_locked "$@"; }
 quota_check_all_locked() {
     [[ ! -f "$QUOTA_CONFIG" ]] && return 0
 
-    quota_init
+    quota_init || return 1
     # 清理过期告警标记：.warned_<口>_<月> / .expwarn_<口>_<到期日> 会逐月累积；
     # 超过 35 天的必属往月/已过期（当月标记最多约 31 天），删之不会误清当前有效标记
     find "$QUOTA_DIR" -maxdepth 1 -type f \( -name '.warned_*' -o -name '.expwarn_*' \) \
@@ -5492,9 +5618,13 @@ quota_check_all_locked() {
     node_id=$(get_node_id)
 
     while IFS='|' read -r port alias quota_bytes expiry _bw; do
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        _valid_port "$port" || continue
+        if ! expiry=$(_quota_expiry_date "${expiry:--}"); then
+            msg_warn "端口 $port 的到期日期无效，已跳过自动暂停/删除，请修正配额配置"
+            continue
+        fi
 
-        _quota_commit_port "$port" "$cur_month"
+        _quota_commit_port "$port" "$cur_month" || return 1
         read -r _m _ii _io acc_in acc_out paused pause_reason \
             < <(_quota_read_data "$port")
         local total
@@ -5513,7 +5643,7 @@ quota_check_all_locked() {
         # ── 到期7天自动删除 ──────────────────────────────────────────────
         if [[ "$paused" == "1" && "$pause_reason" == "expiry" && "$expiry" != "-" && -n "$expiry" ]]; then
             local _exp_ts _days_since
-            _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null || echo 0)
+            _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null) || continue
             _days_since=$(( ( $(date +%s) - _exp_ts ) / 86400 ))
             if (( _days_since >= 7 )); then
                 _quota_auto_delete "$port" "$alias"
@@ -5658,6 +5788,8 @@ quota_daily_report_locked() {
 _quota_write_config() { _state_locked _quota_write_config_locked "$@"; }
 _quota_write_config_locked() {
     local port="$1" alias="$2" quota_bytes="$3" expiry="$4" bw_kbps="$5"
+    _valid_port "$port" && [[ $quota_bytes =~ ^[0-9]+$ ]] || return 1
+    expiry=$(_quota_expiry_date "$expiry") || return 1
     local newline="${port}|${alias}|${quota_bytes}|${expiry}|${bw_kbps}"
     local tmpfile
     tmpfile=$(mktemp "$QUOTA_DIR/.state.XXXXXX") || return 1
@@ -5740,7 +5872,8 @@ quota_set_port() {
         printf "端口号: "; read -r port
     fi
 
-    [[ ! "$port" =~ ^[0-9]+$ ]] && { msg_error "无效端口号"; return; }
+    _valid_port "$port" || { msg_error "无效端口号"; return 1; }
+    port=$((10#$port))
 
     # Pre-fill existing values if port already configured
     local old_alias="" old_quota="" old_expiry="" old_bw=""
@@ -5782,9 +5915,9 @@ quota_set_port() {
             quota_bytes=0
         elif [[ "$quota_input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             # 纯数字默认单位 GB
-            quota_bytes=$(_qhuman_to_bytes "${quota_input}GB")
+            quota_bytes=$(_qhuman_to_bytes "${quota_input}GB") || { msg_error "流量数值超出范围"; return 1; }
         else
-            quota_bytes=$(_qhuman_to_bytes "$quota_input")
+            quota_bytes=$(_qhuman_to_bytes "$quota_input") || { msg_error "无效流量，请输入数字或如 500MB、1TB"; return 1; }
         fi
     else
         quota_bytes="${old_quota:-0}"
@@ -5794,13 +5927,7 @@ quota_set_port() {
     if [[ -z "$expiry" ]]; then
         expiry="${old_expiry:--}"
     fi
-    if [[ "$expiry" != "-" ]]; then
-        # 补零：2026-4-3 → 2026-04-03
-        expiry=$(awk -F- '{printf "%04d-%02d-%02d", $1, $2, $3}' <<< "$expiry" 2>/dev/null || true)
-        if [[ ! "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            msg_error "日期格式错误，示例: 2026-05-31"; return
-        fi
-    fi
+    expiry=$(_quota_expiry_date "$expiry") || { msg_error "日期不存在或格式错误，示例: 2026-05-31"; return 1; }
 
     local bw_kbps="${old_bw:-0}"
 
@@ -5879,15 +6006,11 @@ _quota_auto_delete() {
         fi
     done
     if [[ -f "$SNELL_CONFIG_DIR/snell-$port.conf" ]]; then
-        systemctl disable --now "snell@$port.service" || return 1
-        rm -f "$SNELL_CONFIG_DIR/snell-$port.conf"
+        _snell_remove_port "$port" || return 1
     fi
     if [[ -f "$REALM_CONFIG_FILE" ]] &&
         jq -e --arg p "$port" '.endpoints[]? | select(.listen|endswith(":"+$p))' "$REALM_CONFIG_FILE" >/dev/null; then
-        tmp=$(mktemp "$REALM_CONFIG_DIR/.config.XXXXXX") || return 1
-        jq --arg p "$port" '.endpoints |= map(select(.listen|endswith(":"+$p)|not))' "$REALM_CONFIG_FILE" > "$tmp" &&
-            chown "$REALM_USER:$REALM_USER" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$REALM_CONFIG_FILE" || return 1
-        _realm_safe_restart || return 1
+        _realm_remove_ports --restart "$port" || return 1
     fi
     if [[ -f "$REALM_META_FILE" ]]; then
         tmp=$(mktemp "$REALM_CONFIG_DIR/.metadata.XXXXXX") || return 1
@@ -6633,19 +6756,19 @@ _sbx_manage_hy2() {
 }
 
 # ---- 卸载 sing-box（全部协议 + 服务 + 二进制）----
-sbx_uninstall() {
-    systemctl disable --now "$SBX_SVC" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SBX_SVC}.service"
+sbx_uninstall() { _state_locked _sbx_uninstall_locked; }
+_sbx_uninstall_locked() {
+    systemctl disable --now "$SBX_SVC" || return 1
     local _f _p
     for _f in "$SBX_ST"/ss-*.env "$SBX_ST"/socks-*.env "$SBX_ST"/hy2-*.env; do
         [[ -e "$_f" ]] || continue
         _p=$(basename "$_f"); _p=${_p#*-}; _p=${_p%.env}
-        [[ "$(basename "$_f")" == socks-* ]] && _sbx_socks_fw_clear "$_p" 2>/dev/null || true
-        _sbx_cn_disable "$_p" 2>/dev/null || true
-        close_firewall_port "$_p" 2>/dev/null || true
+        if [[ "$(basename "$_f")" == socks-* ]]; then _sbx_socks_fw_clear "$_p" || return 1; fi
+        _fw_element delete cn_ports "$_p" && close_firewall_port "$_p" && _quota_forget "$_p" || return 1
     done
-    rm -rf "$SBX_ETC" "$SBX_ST"
-    rm -f "$SBX_BIN"
+    if ! _sbx_cn_any; then systemctl disable --now ss-cn-update.timer >/dev/null 2>&1 || true; fi
+    rm -rf "$SBX_ETC" "$SBX_ST" || return 1
+    rm -f "$SBX_BIN" "/etc/systemd/system/${SBX_SVC}.service" || return 1
     systemctl daemon-reload
     msg_success "sing-box 已卸载（服务/配置/节点/二进制已清除）。"
 }
@@ -7152,8 +7275,8 @@ ddns_run_check() {
 
     local _zone_id="$_c_zone"
     if [[ -z "$_zone_id" || ${#_zone_id} -le 10 ]]; then
-        _zone_id=$(curl -fsS --connect-timeout 5 --max-time 20 -X GET "https://api.cloudflare.com/client/v4/zones?name=${DDNS_ZONE_NAME}&status=active" \
-            -H "Authorization: Bearer ${DDNS_AUTH_TOKEN}" -H "Content-Type: application/json" 2>/dev/null \
+        _zone_id=$(_cf_curl "$DDNS_AUTH_TOKEN" -fsS --connect-timeout 5 --max-time 20 -X GET "https://api.cloudflare.com/client/v4/zones?name=${DDNS_ZONE_NAME}&status=active" \
+            -H "Content-Type: application/json" 2>/dev/null \
             | jq -r '.result[0].id // empty' 2>/dev/null || true)
         if [[ -z "$_zone_id" || "$_zone_id" == "null" ]]; then
             local _err="无法获取 Zone ID。请检查域名配置或 Token 权限。"
@@ -7165,8 +7288,8 @@ ddns_run_check() {
 
     local _record_id="$_c_record"
     if [[ -z "$_record_id" || ${#_record_id} -le 10 ]]; then
-        _record_id=$(curl -fsS --connect-timeout 5 --max-time 20 -X GET "https://api.cloudflare.com/client/v4/zones/${_zone_id}/dns_records?type=A&name=${DDNS_RECORD_NAME}" \
-            -H "Authorization: Bearer ${DDNS_AUTH_TOKEN}" -H "Content-Type: application/json" 2>/dev/null \
+        _record_id=$(_cf_curl "$DDNS_AUTH_TOKEN" -fsS --connect-timeout 5 --max-time 20 -X GET "https://api.cloudflare.com/client/v4/zones/${_zone_id}/dns_records?type=A&name=${DDNS_RECORD_NAME}" \
+            -H "Content-Type: application/json" 2>/dev/null \
             | jq -r '.result[0].id // empty' 2>/dev/null || true)
         if [[ -z "$_record_id" || "$_record_id" == "null" ]]; then
             local _err="无法获取 Record ID。请确保 Cloudflare 上已存在该 DNS 记录。"
@@ -7177,8 +7300,8 @@ ddns_run_check() {
     fi
 
     local _resp
-    _resp=$(curl -fsS --connect-timeout 5 --max-time 20 -X PUT "https://api.cloudflare.com/client/v4/zones/${_zone_id}/dns_records/${_record_id}" \
-        -H "Authorization: Bearer ${DDNS_AUTH_TOKEN}" -H "Content-Type: application/json" \
+    _resp=$(_cf_curl "$DDNS_AUTH_TOKEN" -fsS --connect-timeout 5 --max-time 20 -X PUT "https://api.cloudflare.com/client/v4/zones/${_zone_id}/dns_records/${_record_id}" \
+        -H "Content-Type: application/json" \
         --data "{\"type\":\"A\",\"name\":\"${DDNS_RECORD_NAME}\",\"content\":\"${_ip}\",\"ttl\":60,\"proxied\":false}" 2>/dev/null || true)
 
     if printf '%s' "$_resp" | jq -e '.success' >/dev/null 2>&1; then
@@ -7330,8 +7453,8 @@ ddns_paste_setup() {
         fi
         # 用 Token 查 zone_id，一并验证 Token 有效 + 对该 zone 有权限
         printf "  正在用 Token 验证主域名 %s ..." "$_zone"
-        _zid=$(curl -s --max-time 10 "https://api.cloudflare.com/client/v4/zones?name=${_zone}&status=active" \
-            -H "Authorization: Bearer ${_tok}" -H "Content-Type: application/json" 2>/dev/null \
+        _zid=$(_cf_curl "$_tok" -s --max-time 10 "https://api.cloudflare.com/client/v4/zones?name=${_zone}&status=active" \
+            -H "Content-Type: application/json" 2>/dev/null \
             | jq -r '.result[0].id // empty' 2>/dev/null || true)
         if [[ -z "$_zid" ]]; then
             printf " ${C_RED}✗ 失败（Token 无效 / 无该 zone 权限 / 主域名拼写错误）。请重贴（q 放弃）${C_RESET}\n"; continue
@@ -7360,8 +7483,8 @@ ddns_paste_setup() {
     # 记录不存在则用 API 自动创建（指向本机当前公网 IP），省去去 CF 手动建
     printf "  正在检查 Cloudflare 上是否已有该 A 记录..."
     local _rid _myip _crt _cferr
-    _rid=$(curl -s --max-time 10 "https://api.cloudflare.com/client/v4/zones/${_zid}/dns_records?type=A&name=${_rec}" \
-        -H "Authorization: Bearer ${_tok}" -H "Content-Type: application/json" 2>/dev/null \
+    _rid=$(_cf_curl "$_tok" -s --max-time 10 "https://api.cloudflare.com/client/v4/zones/${_zid}/dns_records?type=A&name=${_rec}" \
+        -H "Content-Type: application/json" 2>/dev/null \
         | jq -r '.result[0].id // empty' 2>/dev/null || true)
     if [[ -n "$_rid" ]]; then
         printf " ${C_GREEN}✓ 已存在，DDNS 将直接接管更新${C_RESET}\n"
@@ -7371,8 +7494,8 @@ ddns_paste_setup() {
         if [[ ! "$_myip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             msg_warn "无法获取本机公网 IP，跳过自动创建；首次检测会重试，或请手动在 CF 建记录。"
         else
-            _crt=$(curl -s --max-time 10 -X POST "https://api.cloudflare.com/client/v4/zones/${_zid}/dns_records" \
-                -H "Authorization: Bearer ${_tok}" -H "Content-Type: application/json" \
+            _crt=$(_cf_curl "$_tok" -s --max-time 10 -X POST "https://api.cloudflare.com/client/v4/zones/${_zid}/dns_records" \
+                -H "Content-Type: application/json" \
                 --data "{\"type\":\"A\",\"name\":\"${_rec}\",\"content\":\"${_myip}\",\"ttl\":60,\"proxied\":false}" 2>/dev/null || true)
             if printf '%s' "$_crt" | jq -e '.success == true' >/dev/null 2>&1; then
                 msg_success "已在 Cloudflare 创建 A 记录: ${_rec} → ${_myip}"
@@ -7912,7 +8035,7 @@ main() {
     # daemon/daily/quota-* 子命令通常由 systemd 以 root 自动触发；手动以非 root 运行会在
     # iptables / 写系统文件处报错，这里提前给出友好提示而非让其半路失败。
     case "${1:-}" in
-        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq)
+        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq|security-update-notify)
             if [[ $EUID -ne 0 ]]; then
                 echo "错误: '$1' 子命令需要 root 权限（一般由 systemd 自动调用）。请用 sudo 运行。" >&2
                 exit 1
@@ -7920,6 +8043,7 @@ main() {
     esac
 
     case "${1:-}" in
+        security-update-notify) _security_updates_notify "${2:-completed}"; return ;;
         apply-fq) _apply_fq "$(ip route show default | awk '{print $5; exit}')" "${2:-}"; return ;;
         firewall-restore) _fw_ensure; return ;;
         firewall-rollback) _fw_rollback; return ;;
