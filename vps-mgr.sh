@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.9"
+readonly SCRIPT_VERSION="2.0.0-beta.10"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -262,11 +262,19 @@ detect_arch() {
 SNELL_ARCH=$(detect_arch)
 SS_ARCH=$SNELL_ARCH
 
+_valid_ipv4() {
+    [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local octet
+    local -a octets
+    IFS=. read -r -a octets <<< "$1"
+    for octet in "${octets[@]}"; do (( 10#$octet <= 255 )) || return 1; done
+}
+
 get_public_ip() {
     local ip url
     for url in "https://api.ipify.org" "https://ip.sb" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
         ip=$(curl -4 -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        if _valid_ipv4 "$ip"; then
             printf '%s' "$ip"; return 0
         fi
     done
@@ -288,6 +296,39 @@ show_spinner() {
     done
     tput cnorm 2>/dev/null
     printf "\r%s\r" "$(tput el)"
+}
+
+# 初始化的 APT 输出保存在私有日志；成功不刷屏，失败保留原始原因。
+_apt_quiet() {
+    local label=$1; shift
+    local logfile="$WORK_DIR/apt-install.log" pid status=0
+    mkdir -p "$WORK_DIR" || return 1
+    (umask 077; touch "$logfile") && chmod 600 "$logfile" || return 1
+    printf '\n[%s] %s\n' "$(date -Is)" "$label" >> "$logfile" || return 1
+    (DEBIAN_FRONTEND=noninteractive apt-get "$@" < /dev/null >> "$logfile" 2>&1) &
+    pid=$!
+    if [[ -t 1 ]]; then show_spinner "$pid" "  $label" || true; fi
+    wait "$pid" || status=$?
+    if (( status )); then
+        msg_error "$label 失败（退出码 $status）；日志：$logfile"
+        tail -n 20 "$logfile" >&2
+    fi
+    return "$status"
+}
+
+_confirm_reboot() {
+    local answer
+    while :; do
+        printf '  立即重启？[Y/n]: '
+        if ! read -r answer < /dev/tty; then
+            printf '\n'; msg_info "未读取到确认，暂不重启"; return 1
+        fi
+        case ${answer,,} in
+            ''|y|yes) return 0 ;;
+            n|no|q) return 1 ;;
+            *) printf '  请输入 Y 或 N（回车默认 Y，q 取消）\n' ;;
+        esac
+    done
 }
 
 check_package_manager_lock() {
@@ -368,6 +409,18 @@ _tg_resolve_channel() {
     return 0
 }
 
+_tg_config_valid() {
+    local token hub thread key
+    token=$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)
+    hub=$(_tg_cfg_get "$TG_CONF" TG_CHAT_HUB)
+    [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ && $hub =~ ^-?[0-9]+$ &&
+       $(_tg_cfg_get "$TG_CONF" TG_CHAT_ID) == "$hub" ]] || return 1
+    for key in TG_THREAD_SSH TG_THREAD_QUOTA TG_THREAD_DDNS; do
+        thread=$(_tg_cfg_get "$TG_CONF" "$key")
+        [[ $thread =~ ^[0-9]*$ ]] || return 1
+    done
+}
+
 # 写入统一 TG 配置：话题群 + SSH/配额/DDNS 三个话题ID
 # 全部通知统一发到话题群，各占一个话题。TG_CHAT_ID 保留并等于话题群 ID：
 # SSH 监控脚本沿用它作 chat_id，配合 TG_THREAD_SSH 投递到 SSH 话题。
@@ -379,15 +432,15 @@ _write_tg_conf() {
        $_srv != *$'\n'* && $_srv != *$'\r'* ]] || { msg_error "TG 配置格式无效"; return 1; }
     local tmp; tmp=$(mktemp "$(dirname "$TG_CONF")/.tg-conf.XXXXXX") || return 1
     {
-        printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='%s'\nTG_CHAT_HUB='%s'\n" "$_tok" "$_hub" "$_hub"
-        printf 'SERVER_NAME="%s"\n' "$_srv"
+        printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='%s'\nTG_CHAT_HUB='%s'\n" "$_tok" "$_hub" "$_hub" &&
+        printf 'SERVER_NAME="%s"\n' "$_srv" &&
         printf "TG_THREAD_SSH='%s'\nTG_THREAD_QUOTA='%s'\nTG_THREAD_DDNS='%s'\n" "$_th_ssh" "$_th_qt" "$_th_dd"
-    } > "$tmp"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
     chmod 600 "$tmp" && mv "$tmp" "$TG_CONF" || { rm -f "$tmp"; return 1; }
     _tg_permissions
 }
 _tg_input_tokens() {
-    local _srv="${1:-}"
+    local _srv="${1:-}" _first="${2:-}" _failed=0
     local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd
     local _resp _bot _gf _cf
     while :; do
@@ -396,12 +449,16 @@ _tg_input_tokens() {
         printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID\n"
         printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
         printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
-        printf "  ${C_YELLOW}填完后（最少填 Token 和 话题群 Chat ID 两行）连按两次回车结束；输入 q 放弃${C_RESET}\n>>> "
+        printf "  ${C_YELLOW}输入不回显；满 5 行自动确认，仅填 2–4 行时连按两次回车；q 随时放弃${C_RESET}\n>>> "
         _vals=(); _blank=0
         while [[ ${#_vals[@]} -lt 5 ]]; do
-            read -r _vline < /dev/tty || break
+            if [[ -n $_first ]]; then _vline=$_first; _first=""
+            elif ! read -rs _vline < /dev/tty; then
+                printf '\n'; msg_warn "输入已结束，未保存 TG 配置"; return 1
+            fi
             _vline="${_vline#"${_vline%%[![:space:]]*}"}"
             _vline="${_vline%"${_vline##*[![:space:]]}"}"
+            [[ ${_vline,,} != q ]] || { printf '\n'; msg_info "已放弃 TG 配置"; return 1; }
             if [[ -z "$_vline" ]]; then
                 # 已够主频道(≥2行) 时，连续两个空行结束；否则空行仅作分隔忽略
                 if [[ ${#_vals[@]} -ge 2 ]]; then
@@ -416,9 +473,10 @@ _tg_input_tokens() {
         done
         _new_tok="${_vals[0]:-}" _hub="${_vals[1]:-}"
         _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
-        [[ "$_new_tok" == "q" || "$_new_tok" == "Q" ]] && { printf "  ${C_YELLOW}⚠ 已放弃配置${C_RESET}\n"; return 1; }
-        if [[ -z "$_new_tok" || -z "$_hub" ]]; then
-            printf "  ${C_RED}✗ Token 或 话题群 Chat ID 不能为空，请重新粘贴（q 放弃）${C_RESET}\n"; continue
+        printf '\n'
+        if [[ ! $_new_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ || ! $_hub =~ ^-?[0-9]+$ ||
+              ! $_th_ssh =~ ^[0-9]*$ || ! $_th_qt =~ ^[0-9]*$ || ! $_th_dd =~ ^[0-9]*$ ]]; then
+            printf "  ${C_RED}✗ Token、Chat ID 或话题 ID 格式不正确，请重新粘贴（q 放弃）${C_RESET}\n"; continue
         fi
         printf "  正在验证 Bot..."
         _resp=$(_tg_api "$_new_tok" getMe -s --max-time 8 2>/dev/null || true)
@@ -432,33 +490,42 @@ _tg_input_tokens() {
             _srv="${_gf} ${SERVER_COUNTRY_NAME:-Unknown}, ${SERVER_CITY:-Unknown}"
         fi
         printf "  ${C_CYAN}── 待写入内容（请核对）──${C_RESET}\n"
-        printf "  Token   : %s\n" "${_new_tok:0:20}..."
+        printf "  Token   : 已验证（隐藏）\n"
         printf "  话题群  : %s\n" "$_hub"
         printf "    ├ SSH 登录 : 话题 %s\n" "${_th_ssh:-未设置}"
         printf "    ├ 流量配额 : 话题 %s\n" "${_th_qt:-未设置}"
         printf "    └ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
-        printf "  ${C_YELLOW}确认写入？[y=写入 / q=放弃 / 回车=重新粘贴]: ${C_RESET}"
-        read -r _cf < /dev/tty || _cf="q"
-        case "$_cf" in
-            [Yy]) break ;;
-            [Qq]) printf "  ${C_YELLOW}⚠ 已放弃，未写入${C_RESET}\n"; return 1 ;;
-            *)    printf "  ${C_CYAN}↻ 重新粘贴${C_RESET}\n"; continue ;;
-        esac
+        printf "  ${C_YELLOW}确认写入？[y=写入 / r=重新粘贴 / q=放弃]: ${C_RESET}"
+        while :; do
+            read -r _cf < /dev/tty || _cf=q
+            case "${_cf,,}" in
+                y|r) break ;;
+                q) printf "  ${C_YELLOW}⚠ 已放弃，未写入${C_RESET}\n"; return 1 ;;
+                '') continue ;; # 忽略批量粘贴末尾多余的空行，不重新索取 Token。
+                *) printf '  请输入 y、r 或 q: ' ;;
+            esac
+        done
+        [[ ${_cf,,} == y ]] && break
+        printf "  ${C_CYAN}↻ 重新粘贴${C_RESET}\n"
     done
-    _write_tg_conf "$_new_tok" "$_hub" "$_srv" "$_th_ssh" "$_th_qt" "$_th_dd"
+    _write_tg_conf "$_new_tok" "$_hub" "$_srv" "$_th_ssh" "$_th_qt" "$_th_dd" || {
+        msg_error "TG 配置保存失败，未启动监控；请检查磁盘空间和文件权限"; return 1;
+    }
     printf "  ${C_GREEN}✓ 已保存${C_RESET}\n"
     printf "  ${C_CYAN}正在启动各监控服务...${C_RESET}\n"
-    _setup_ssh_tg_monitor || true
+    _setup_ssh_tg_monitor || { msg_error "TG 配置已保存，但 SSH 监控未就绪"; _failed=1; }
     # 先发确认：服务未装时也能立刻验证话题 ID 是否正确
     printf "  ${C_CYAN}正在验证话题群各通道...${C_RESET}\n"
-    _tg_notify_configured "$_srv"
-    [[ -n "$_th_qt" ]] && grep -q '^[0-9]' "$QUOTA_CONFIG" 2>/dev/null && { install_quota_services || true; }
-    return 0
+    _tg_notify_configured "$_srv" || _failed=1
+    if [[ -n "$_th_qt" ]] && grep -q '^[0-9]' "$QUOTA_CONFIG" 2>/dev/null; then
+        install_quota_services || _failed=1
+    fi
+    return "$_failed"
 }
 
 # 配置保存后逐通道发确认，当场暴露话题 ID 填错——否则要等对应服务真触发才发现
 _tg_notify_configured() {
-    local _srv="$1" _entry _ch _label _msg _ts
+    local _srv="$1" _entry _ch _label _msg _ts _failed=0
     _ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
     for _entry in "ssh:SSH 登录" "quota:流量配额" "ddns:DDNS"; do
         _ch="${_entry%%:*}"; _label="${_entry#*:}"
@@ -472,8 +539,10 @@ _tg_notify_configured() {
             printf "${C_GREEN}✓ 已送达话题 %s${C_RESET}\n" "$TG_THREAD_ID"
         else
             printf "${C_RED}✗ 失败（检查话题 ID 是否正确）${C_RESET}\n"
+            _failed=1
         fi
     done
+    return "$_failed"
 }
 
 # 测试单个推送目标；$1=标签 $2=token $3=chat $4=话题ID(可空) $5=时间戳
@@ -520,7 +589,7 @@ _do_tg_config() {
             && _ddns_st="${C_GREEN}运行中${C_RESET}" || _ddns_st="[-]"
 
         local _d
-        _d="${_tok:+${_tok:0:20}...}"; printf "  Token : %s\n\n" "${_d:-未设置}"
+        _d="${_tok:+已配置（隐藏）}"; printf "  Token : %s\n\n" "${_d:-未设置}"
         printf "  ${C_BLUE}[ 话题群 ]${C_RESET}  %b\n" "${_hub:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ SSH 登录 %b  话题 %b\n" "$_ssh_tg_st"  "${_th_ssh:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ 流量配额 %b  话题 %b\n" "$_quota_st" "${_th_qt:-${C_YELLOW}未设置${C_RESET}}"
@@ -763,31 +832,38 @@ Text().feed(sys.stdin.read())') || return 1
 }
 
 
+# 名称与 TG 启用状态无关；保留同一文件里的 Token、话题和访问权限。
+_save_server_name() {
+    local name=$1 tmp
+    [[ -n $name && $name != *$'\n'* && $name != *$'\r'* ]] || return 1
+    [[ $(_tg_cfg_get "$TG_CONF" SERVER_NAME) != "$name" ]] || return 0
+    tmp=$(mktemp "$(dirname "$TG_CONF")/.server-name.XXXXXX") || return 1
+    if [[ -f $TG_CONF ]]; then
+        awk '!/^SERVER_NAME=/' "$TG_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if ! printf 'SERVER_NAME="%s"\n' "$name" >> "$tmp" ||
+        ! chmod 600 "$tmp" || ! mv "$tmp" "$TG_CONF"; then
+        rm -f "$tmp"; return 1
+    fi
+    _tg_permissions || return 1
+    if systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null; then
+        systemctl restart "$SSH_TG_SERVICE" && systemctl is-active --quiet "$SSH_TG_SERVICE" || {
+            msg_error "名称已保存，但 SSH TG 服务重启失败"; return 1;
+        }
+    fi
+}
+
 # 设置/修改服务器名称（统一入口，写入 TG_CONF）
 _set_server_name() {
-    local _cur_name=""
-    [[ -f "$TG_CONF" ]] && _cur_name=$(grep "^SERVER_NAME=" "$TG_CONF" 2>/dev/null | cut -d= -f2- || true)
+    local _cur_name
+    _cur_name=$(_tg_cfg_get "$TG_CONF" SERVER_NAME)
     echo -e "  当前名称: ${C_YELLOW}${_cur_name:-（未设置）}${C_RESET}"
     echo -ne "  输入服务器名称 (格式如 🇭🇰SR_HK_Std，回车跳过): "
     local _new_name
-    read -r _new_name < /dev/tty
+    read -r _new_name < /dev/tty || return 1
     [[ -z "$_new_name" ]] && return 0
-    if [[ -f "$TG_CONF" ]]; then
-        local _tmp_sn; _tmp_sn=$(mktemp)
-        grep -v "^SERVER_NAME=" "$TG_CONF" > "$_tmp_sn" || true
-        printf 'SERVER_NAME=%s\n' "$_new_name" >> "$_tmp_sn"
-        chmod 600 "$_tmp_sn"
-        mv "$_tmp_sn" "$TG_CONF"
-    else
-        printf 'SERVER_NAME=%s\n' "$_new_name" > "$TG_CONF"
-        chmod 600 "$TG_CONF"
-    fi
-    _tg_permissions
+    _save_server_name "$_new_name" || { msg_error "名称设置未完成"; return 1; }
     echo -e "  ${C_GREEN}✓ 服务器名称已设为: ${_new_name}${C_RESET}"
-    if systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null; then
-        systemctl restart "$SSH_TG_SERVICE" 2>/dev/null || true
-        echo -e "  ${C_GREEN}✓ SSH TG 服务已重启${C_RESET}"
-    fi
 }
 
 
@@ -2045,6 +2121,80 @@ do_tcping_monitor() {
 # 一键参数检测
 # ==============================================================================
 
+# 只读检查：配置、常驻服务、定时器与最近执行结果分别判断。
+_check_runtime_services() {
+    local port unit started result state
+    if _tg_config_valid; then
+        if systemctl is-active --quiet "$SSH_TG_SERVICE" && systemctl is-enabled --quiet "$SSH_TG_SERVICE"; then
+            _ck_pass "TG 配置有效，SSH 通知运行中且开机启用（未发送测试消息）"
+        else _ck_fail "TG 已配置，但 SSH 通知未运行或未开机启用（菜单 3）"; fi
+    elif [[ -n $(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN) ]]; then
+        _ck_fail "TG 配置不完整或格式错误（菜单 3）"
+    else _ck_warn "TG 尚未配置（可选，菜单 3）"; fi
+
+    if [[ -f /etc/fail2ban/jail.d/sshd.conf ]]; then
+        if systemctl is-active --quiet fail2ban && systemctl is-enabled --quiet fail2ban &&
+            fail2ban-client status sshd >/dev/null 2>&1; then
+            _ck_pass "Fail2Ban 运行中、开机启用，sshd jail 可用"
+        else _ck_fail "Fail2Ban 服务或 sshd jail 未就绪（菜单 3）"; fi
+    else _ck_warn "Fail2Ban SSH 防护尚未配置（菜单 3）"; fi
+
+    port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
+    if [[ -f $TCPING_CONFIG_FILE ]]; then
+        if _valid_port "$port" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" &&
+            systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" &&
+            ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . &&
+            _fw_has_element tcping_ports "$port"; then
+            _ck_pass "TCPing $port：服务、开机启动、监听和防火墙放行正常（未验证公网映射）"
+        else _ck_fail "TCPing 服务/端口/开机启动/防火墙不一致（菜单 6 → 7）"; fi
+    else _ck_warn "TCPing 尚未配置（菜单 6 → 7）"; fi
+
+    if _is_container; then
+        _ck_warn "容器时间由宿主机管理，跳过宿主 NTP 检查"
+    elif [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; then
+        _ck_pass "NTP 时间已同步"
+    else _ck_warn "NTP 尚未同步，请检查时间同步服务"; fi
+
+    local -a timers=(sync-timezone.timer vps-mgr-autoupdate.timer)
+    if grep -q '^[0-9]' "$QUOTA_CONFIG" 2>/dev/null; then
+        if [[ -f $QUOTA_DIR/.timer_disabled ]]; then _ck_warn "配额巡检已手动停用"
+        else timers+=(quota-check.timer quota-daily.timer); fi
+    fi
+    if [[ -f /etc/apt/apt.conf.d/99vps-mgr-security-updates ]]; then
+        if command -v unattended-upgrade >/dev/null && _security_updates_policy_ok; then
+            _ck_pass "安全补丁策略正确：仅官方安全源、不自动重启"
+        else _ck_fail "安全补丁组件缺失、已停用或策略被覆盖（菜单 6 → 8）"; fi
+        timers+=(apt-daily.timer apt-daily-upgrade.timer)
+        for unit in apt-daily.service apt-daily-upgrade.service; do
+            state=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null) || state=unknown
+            started=$(systemctl show "$unit" -p ExecMainStartTimestamp --value 2>/dev/null) || started=""
+            result=$(systemctl show "$unit" -p Result --value 2>/dev/null) || result=unknown
+            if [[ $state == active || $state == activating ]]; then
+                _ck_warn "$unit 正在执行，尚无本次完成结果"
+            elif [[ $state == failed || $result != success ]]; then
+                _ck_fail "$unit 最近任务失败或结果不可读（Result=$result）"
+            elif [[ -z $started ]]; then
+                _ck_warn "$unit 本次开机尚未执行，暂未验证实际自动更新"
+            else
+                _ck_pass "$unit 最近任务退出成功：$started（不等于已安装新补丁，详见 APT 日志）"
+            fi
+        done
+    else _ck_warn "自动安全补丁尚未配置（菜单 6 → 8）"; fi
+    for unit in "${timers[@]}"; do
+        if systemctl is-active --quiet "$unit" && systemctl is-enabled --quiet "$unit"; then
+            _ck_pass "$unit 已调度且开机启用"
+        else _ck_fail "$unit 未运行或未开机启用"; fi
+    done
+    if [[ -f /etc/systemd/system/vps-mgr-fq.service ]]; then
+        started=$(systemctl show vps-mgr-fq.service -p ExecMainStartTimestamp --value 2>/dev/null) || started=""
+        result=$(systemctl show vps-mgr-fq.service -p Result --value 2>/dev/null) || result=unknown
+        if [[ -n $started && $result == success ]] && systemctl is-enabled --quiet vps-mgr-fq.service; then
+            _ck_pass "fq 开机恢复已成功执行（一次性任务结束后 inactive 正常）"
+        else _ck_warn "fq 开机任务未执行成功或未启用；当前队列以上方实际检测为准"; fi
+    fi
+    [[ ! -f /var/run/reboot-required ]] || _ck_warn "系统有待重启更新，请自行安排维护时间"
+}
+
 do_check_all() {
     clear
     echo -e "${L_PURPLE}================================================${NC}"
@@ -2318,6 +2468,9 @@ do_check_all() {
     fi
     [ $_proxy_found -eq 0 ] && _ck_warn "未检测到代理服务（Snell/SS/Realm）"
 
+    echo -e "\n${L_BLUE}[ 监控、定时任务 & 安全补丁 ]${NC}"
+    _check_runtime_services
+
     # ── 汇总 ─────────────────────────────────────────────
     local _total
     _total=$((_ok + _warn + _fail))
@@ -2519,9 +2672,10 @@ do_system_update() {
             echo -e "  已安装:   ${GREEN}${_new_kernel}${NC}"
         [ -f /var/run/reboot-required.pkgs ] && \
             echo -e "  相关包:   ${WHITE}$(tr '\n' ' ' < /var/run/reboot-required.pkgs)${NC}"
-        echo -ne "${L_PURPLE}立即重启？[Y/n]: ${NC}"
-        read -r _r
-        [[ ! "${_r:-Y}" =~ ^[Nn]$ ]] && { for _i in 3 2 1; do printf "\r${GREEN}%d 秒后重启...${NC}" $_i; sleep 1; done; echo; reboot; }
+        if _confirm_reboot; then
+            for _i in 3 2 1; do printf "\r${GREEN}%d 秒后重启...${NC}" $_i; sleep 1; done
+            echo; reboot || return 1
+        fi
     else
         echo -e "  ${GREEN}未检测到待重启的更新${NC}"
     fi
@@ -2571,7 +2725,7 @@ SECURITY_APT
         rm -rf "$tmp"; msg_error "安全更新配置未通过校验，已撤回；请检查其他 APT 配置是否覆盖策略"; return 1
     fi
     rm -rf "$tmp"
-    command -v unattended-upgrade >/dev/null || apt-get install -y -qq unattended-upgrades || return 1
+    command -v unattended-upgrade >/dev/null || _apt_quiet "安装安全补丁组件" install -y -qq unattended-upgrades || return 1
     _security_updates_policy_ok || { msg_error "软件包安装后安全更新策略不一致，请检查 APT 配置"; return 1; }
     mkdir -p /etc/systemd/system/apt-daily.service.d /etc/systemd/system/apt-daily-upgrade.service.d || return 1
     cat > /etc/systemd/system/vps-mgr-security-update-alert.service <<EOF || return 1
@@ -2663,7 +2817,7 @@ _do_full_init() {
         msg_info "检测到共享内核容器：保留完整用户态功能，跳过换内核、Swap 和宿主网络调优"
     fi
 
-    local _ok_sys=0 _ok_net=0 _ok_f2b=0 _ok_tg=0
+    local _ok_sys=0 _ok_net=0 _ok_f2b=0 _ok_tg=0 _ok_name=1
     local _net_bw=0 _rmem_mb=0 _cc="cubic"
     local _xanmod_done=0 _xanmod_pkg="" _xanmod_avx="" _cpu_level
     local _init_srv_name=""
@@ -2691,15 +2845,9 @@ _do_full_init() {
 
 
     local _step_ok=1
-    (apt-get update -qq < /dev/null >/dev/null 2>&1) &
-    local _upd_pid=$!
-    show_spinner $_upd_pid "  更新软件源"
-    wait $_upd_pid && echo -e "  ${GREEN}✓ 更新软件源${NC}" || { _step_ok=0; echo -e "  ${YELLOW}⚠ 更新软件源失败（继续检查依赖）${NC}"; }
+    _apt_quiet "更新软件源" update -qq && echo -e "  ${GREEN}✓ 更新软件源${NC}" || _step_ok=0
 
-    (DEBIAN_FRONTEND=noninteractive apt-get upgrade --with-new-pkgs -y -qq < /dev/null >/dev/null 2>&1) &
-    local _upg_pid=$!
-    show_spinner $_upg_pid "  升级系统组件"
-    wait $_upg_pid && echo -e "  ${GREEN}✓ 升级系统组件${NC}" || { _step_ok=0; echo -e "  ${YELLOW}⚠ 升级系统组件部分失败（继续）${NC}"; }
+    _apt_quiet "升级系统组件" upgrade --with-new-pkgs -y -qq && echo -e "  ${GREEN}✓ 升级系统组件${NC}" || _step_ok=0
 
     local _to_install=() _pkg _qi_installed=0 _qi_notfound=0
     if apt-cache show software-properties-common >/dev/null 2>&1; then
@@ -2723,10 +2871,7 @@ _do_full_init() {
         echo -e "  ${GREEN}✓ 依赖: ${_qi_installed}/${_qi_total} 已安装${NC}"
     else
         echo -e "  ${CYAN}⟳ 依赖: ${_qi_installed} 已安装，${#_to_install[@]} 待安装${NC}"
-        (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_to_install[@]}" < /dev/null >/dev/null 2>&1) &
-        local _inst_pid=$!
-        show_spinner $_inst_pid "  安装中"
-        wait $_inst_pid || _step_ok=0
+        _apt_quiet "安装依赖" install -y -qq "${_to_install[@]}" || _step_ok=0
 
         local _install_fail=0  # H-02: 改名以区分 do_check_all 中的 _fail
         for _pkg in "${_to_install[@]}"; do
@@ -2838,8 +2983,10 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now sync-timezone.timer >/dev/null 2>&1
-    echo -e "  ${GREEN}✓ 时区自动同步: systemd 每天 03:00（上海时区）${NC}"
+    if systemctl enable --now sync-timezone.timer --quiet &&
+        systemctl is-active --quiet sync-timezone.timer && systemctl is-enabled --quiet sync-timezone.timer; then
+        echo -e "  ${GREEN}✓ 时区自动同步: systemd 每天 03:00（上海时区）${NC}"
+    else _step_ok=0; msg_warn "时区自动同步未启用，请检查 sync-timezone.timer"; fi
 
     # NTP 时间同步
     if (( _container )); then
@@ -2861,6 +3008,9 @@ EOF
     echo -e "\n${L_BLUE}── 服务器名称 ───────────────────────────────────────────${NC}"
     echo -ne "  名称 (如 🇯🇵SR_JP_Std，回车自动填): "
     read -r _init_srv_name < /dev/tty || true
+    [[ -n $_init_srv_name ]] || _init_srv_name=$(_tg_cfg_get "$TG_CONF" SERVER_NAME)
+    [[ -n $_init_srv_name ]] || _init_srv_name="$(get_flag_emoji "$SERVER_COUNTRY_CODE") ${SERVER_COUNTRY_NAME}, ${SERVER_CITY}"
+    _save_server_name "$_init_srv_name" || { _ok_name=0; msg_warn "服务器名称保存或监控同步未完成"; }
 
     # ── [3/8] XanMod 内核安装 ──────────────────────────────
     echo -e "\n${L_BLUE}── [3/8] XanMod 内核 ───────────────────────────────────${NC}"
@@ -2903,7 +3053,7 @@ EOF
             fi
             # Debian 13 默认无 gpg 命令，须先装 gnupg2
             if ! command -v gpg >/dev/null 2>&1; then
-                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg2 < /dev/null >/dev/null 2>&1 || true
+                _apt_quiet "安装 GPG 工具" install -y -qq gnupg2 || _xm_ok=0
             fi
             # 导入 GPG Key
             if (( _xm_ok )) && [ ! -f /usr/share/keyrings/xanmod-archive-keyring.gpg ]; then
@@ -2918,15 +3068,9 @@ EOF
                 local _xm_codename; _xm_codename=$(lsb_release -sc 2>/dev/null || grep -oP 'VERSION_CODENAME=\K\S+' /etc/os-release)
                 echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${_xm_codename} main" \
                     > /etc/apt/sources.list.d/xanmod-release.list
-                (apt-get update -qq < /dev/null >/dev/null 2>&1) &
-                local _xm_pid=$!
-                show_spinner $_xm_pid "  更新软件源 (含 XanMod)"
-                wait $_xm_pid || true
                 # 安装元包，让后续 apt 更新继续跟踪新的 image/header 包名。
-                (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$_xanmod_pkg" < /dev/null >/dev/null 2>&1) &
-                _xm_pid=$!
-                show_spinner $_xm_pid "  安装 ${_xanmod_pkg}"
-                if wait $_xm_pid; then
+                if _apt_quiet "更新软件源 (含 XanMod)" update -qq &&
+                    _apt_quiet "安装 ${_xanmod_pkg}" install -y -qq "$_xanmod_pkg"; then
                     if sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|' /etc/default/grub && update-grub >/dev/null 2>&1; then
                         echo -e "  ${GREEN}✓ 内核元包安装完成，GRUB 已更新${NC}"
                         _xanmod_done=1
@@ -3040,18 +3184,28 @@ EOF
 
     # TG 推送配置
     echo -e "\n${L_BLUE}── [6/8] TG 推送 ───────────────────────────────────────${NC}"
-    if [[ -f "$TG_CONF" ]] && grep -q "^TG_BOT_TOKEN=" "$TG_CONF" 2>/dev/null; then
-        echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
-        _ok_tg=1
+    if _tg_config_valid; then
+        if systemctl is-active --quiet "$SSH_TG_SERVICE" && systemctl is-enabled --quiet "$SSH_TG_SERVICE"; then
+            echo -e "  ${GREEN}✓ 已配置，SSH 通知运行中（跳过）${NC}"
+            _ok_tg=1
+        else
+            _setup_ssh_tg_monitor && _ok_tg=1 || msg_warn "TG 已配置，但 SSH 监控未就绪"
+        fi
     else
         local _tg_ans
         while :; do
-            echo -ne "  是否现在配置 TG 推送？[Y/n]: "
-            read -r _tg_ans < /dev/tty || true
+            echo -ne "  是否现在配置 TG 推送？[Y/n，可直接粘贴配置，输入隐藏]: "
+            if ! read -rs _tg_ans < /dev/tty; then printf '\n'; msg_warn "未读取到输入，跳过 TG 配置"; break; fi
+            printf '\n'
+            _tg_ans="${_tg_ans#"${_tg_ans%%[![:space:]]*}"}"
+            _tg_ans="${_tg_ans%"${_tg_ans##*[![:space:]]}"}"
             case "$_tg_ans" in
-                ""|[Yy]) _tg_input_tokens "$_init_srv_name" && _ok_tg=1 || true; break ;;
-                [Nn])    echo -e "  ${YELLOW}⚠ 跳过（可后续从选项 3 配置）${NC}"; break ;;
-                *)       echo -e "  ${YELLOW}请输入 Y 或 N（回车默认 Y）${NC}" ;;
+                ""|[Yy]|[Yy][Ee][Ss]) _tg_input_tokens "$_init_srv_name" && _ok_tg=1 || true; break ;;
+                [Nn]|[Nn][Oo]|[Qq]) echo -e "  ${YELLOW}⚠ 跳过（可后续从选项 3 配置）${NC}"; break ;;
+                *) if [[ $_tg_ans =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+                       _tg_input_tokens "$_init_srv_name" "$_tg_ans" && _ok_tg=1 || true; break
+                   fi
+                   echo -e "  ${YELLOW}请输入 Y/N，或直接粘贴 TG 配置${NC}" ;;
             esac
         done
     fi
@@ -3079,10 +3233,12 @@ EOF
     local _pending=()
     (( _ok_ipv6 )) || _pending+=("IPv6")
     (( _ok_sys )) || _pending+=("系统依赖")
+    (( _ok_name )) || _pending+=("服务器名称")
     (( _container || _xanmod_done > 0 )) || _pending+=("XanMod")
     (( _ok_net )) || _pending+=("网络调优")
     (( _ok_swap )) || _pending+=("Swap")
-    (( _ok_tg )) || _pending+=("TG 推送")
+    (( _ok_tg )) && _tg_config_valid && systemctl is-active --quiet "$SSH_TG_SERVICE" &&
+        systemctl is-enabled --quiet "$SSH_TG_SERVICE" || _pending+=("TG 推送")
     (( _ok_f2b )) && systemctl is-active --quiet fail2ban 2>/dev/null || _pending+=("Fail2Ban")
     (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null || _pending+=("TCPing")
     (( _ok_update )) || _pending+=("每日更新")
@@ -3095,9 +3251,7 @@ EOF
     if [ "$_xanmod_done" -eq 1 ]; then
         echo
         echo -e "  ${L_PURPLE}★ 请重启服务器以加载 XanMod 内核，BBR v3 方可生效${NC}"
-        echo -ne "  ${L_PURPLE}立即重启？[Y/n]: ${NC}"
-        local _rb_ans; read -r _rb_ans < /dev/tty || true
-        [[ "${_rb_ans:-Y}" =~ ^[Nn]$ ]] || reboot
+        if _confirm_reboot; then reboot || { msg_error "重启命令失败，请手动检查"; return 1; }; fi
     fi
 }
 
@@ -3284,7 +3438,7 @@ EOF
 }
 
 _setup_ssh_tg_monitor() {
-    [[ -n $(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN) && -n $(_tg_cfg_get "$TG_CONF" TG_CHAT_ID) ]] ||
+    _tg_config_valid ||
         { msg_error "请先配置 Telegram"; return 1; }
     id ssh-tg-monitor >/dev/null 2>&1 ||
         useradd --system --no-create-home --shell /usr/sbin/nologin ssh-tg-monitor || return 1
@@ -3323,9 +3477,9 @@ send_tg() {
     fi
 }
 NOTIFY_EOF
-    } > /usr/local/lib/vps-mgr-notify.sh
-    chmod 644 /usr/local/lib/vps-mgr-notify.sh
-    cat > "$SSH_TG_SCRIPT" <<'MONITOR_EOF'
+    } > /usr/local/lib/vps-mgr-notify.sh || return 1
+    chmod 644 /usr/local/lib/vps-mgr-notify.sh || return 1
+    cat > "$SSH_TG_SCRIPT" <<'MONITOR_EOF' || return 1
 #!/bin/bash
 set -uo pipefail
 source /usr/local/lib/vps-mgr-notify.sh
@@ -3348,8 +3502,8 @@ while IFS= read -r line; do
 方式: $method  时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" || true
 done
 MONITOR_EOF
-    chmod 755 "$SSH_TG_SCRIPT"
-    cat > /usr/local/bin/fail2ban-tg-notify.sh <<'F2B_EOF'
+    chmod 755 "$SSH_TG_SCRIPT" || return 1
+    cat > /usr/local/bin/fail2ban-tg-notify.sh <<'F2B_EOF' || return 1
 #!/bin/bash
 source /usr/local/lib/vps-mgr-notify.sh
 send_tg "🚫 #IP已封禁
@@ -3358,13 +3512,13 @@ send_tg "🚫 #IP已封禁
 原因: 登录失败$(_html_escape "$3")次 ($(_html_escape "$2"))
 时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
 F2B_EOF
-    chmod 755 /usr/local/bin/fail2ban-tg-notify.sh
-    cat > /etc/fail2ban/action.d/tg-notify.conf <<'F2B_ACT'
+    chmod 755 /usr/local/bin/fail2ban-tg-notify.sh || return 1
+    cat > /etc/fail2ban/action.d/tg-notify.conf <<'F2B_ACT' || return 1
 [Definition]
 actionban = /usr/local/bin/fail2ban-tg-notify.sh <ip> <name> <failures>
 actionunban =
 F2B_ACT
-    cat > "/etc/systemd/system/$SSH_TG_SERVICE.service" <<EOF
+    cat > "/etc/systemd/system/$SSH_TG_SERVICE.service" <<EOF || return 1
 [Unit]
 Description=SSH Login Telegram Notifier
 After=network-online.target
@@ -3385,7 +3539,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload && systemctl enable "$SSH_TG_SERVICE" --quiet &&
         systemctl restart "$SSH_TG_SERVICE" || return 1
-    systemctl is-active --quiet "$SSH_TG_SERVICE" || return 1
+    systemctl is-active --quiet "$SSH_TG_SERVICE" && systemctl is-enabled --quiet "$SSH_TG_SERVICE" || return 1
     msg_success "SSH 通知已启用（独立低权限用户、双栈来源地址）"
     # 在监听已经启动后测试推送；Telegram 超时不会延迟开始读取 SSH 日志。
     bash -c 'source /usr/local/lib/vps-mgr-notify.sh
@@ -3781,34 +3935,35 @@ _read_cache_value() {
 }
 
 get_server_info() {
+    local _ip _cc _cn _city
     if [[ -f "$CACHE_FILE" ]] && [[ $(($(date +%s) - $(stat -c %Y "$CACHE_FILE"))) -lt $CACHE_TTL ]]; then
-        local _ip _cc _cn _city
         _ip=$(_read_cache_value   "SERVER_IP"           "$CACHE_FILE")
         _cc=$(_read_cache_value   "SERVER_COUNTRY_CODE" "$CACHE_FILE")
         _cn=$(_read_cache_value   "SERVER_COUNTRY_NAME" "$CACHE_FILE")
         _city=$(_read_cache_value "SERVER_CITY"         "$CACHE_FILE")
-        if [[ -n "$_cc" && "$_cc" != "UN" && "$_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        if _valid_ipv4 "$_ip"; then
             SERVER_IP="$_ip"
-            SERVER_COUNTRY_CODE="$_cc"
-            SERVER_COUNTRY_NAME="${_cn:-$_cc}"
+            [[ $_cc =~ ^[A-Za-z]{2}$ ]] || _cc=UN
+            SERVER_COUNTRY_CODE="${_cc^^}"
+            SERVER_COUNTRY_NAME="${_cn:-Unknown}"
             SERVER_CITY="${_city:-Unknown}"
+            return 0
         fi
-    else
-        local _ip
-        _ip=$(get_public_ip 2>/dev/null || true)
-        if [[ "$_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            SERVER_IP="$_ip"
-            get_geo_info "$_ip" || true
-            mkdir -p "$WORK_DIR"
-            {
-                printf 'SERVER_IP=%s\n'           "$SERVER_IP"
-                printf 'SERVER_COUNTRY_CODE=%s\n' "$SERVER_COUNTRY_CODE"
-                printf 'SERVER_COUNTRY_NAME=%s\n' "$SERVER_COUNTRY_NAME"
-                printf 'SERVER_CITY=%s\n'         "$SERVER_CITY"
-            } > "$CACHE_FILE"
-            chmod 600 "$CACHE_FILE"
-            _tg_permissions
-        fi
+    fi
+    _ip=$(get_public_ip 2>/dev/null || true)
+    if _valid_ipv4 "$_ip"; then
+        SERVER_IP="$_ip"
+        SERVER_COUNTRY_CODE=UN; SERVER_COUNTRY_NAME=Unknown; SERVER_CITY=Unknown
+        get_geo_info "$_ip" || true
+        mkdir -p "$WORK_DIR"
+        {
+            printf 'SERVER_IP=%s\n'           "$SERVER_IP"
+            printf 'SERVER_COUNTRY_CODE=%s\n' "$SERVER_COUNTRY_CODE"
+            printf 'SERVER_COUNTRY_NAME=%s\n' "$SERVER_COUNTRY_NAME"
+            printf 'SERVER_CITY=%s\n'         "$SERVER_CITY"
+        } > "$CACHE_FILE"
+        chmod 600 "$CACHE_FILE"
+        _tg_permissions
     fi
 }
 
@@ -4553,7 +4708,7 @@ _realm_add_endpoint() {
     _fw_has_element udp_ports "$port" && had_udp=1
     if jq --arg l "0.0.0.0:$port" --arg r "$remote" '.endpoints += [{listen:$l,remote:$r}]' \
         "$REALM_CONFIG_FILE" > "$tmp/config" && validate_realm_config "$tmp/config" &&
-        jq --arg p "$port" --arg psk "$psk" --arg alias "$alias" --arg cc "$cc" \
+        jq --arg p "$port" --rawfile psk <(printf '%s' "$psk") --arg alias "$alias" --arg cc "$cc" \
         '. + {($p): {psk:$psk,alias:$alias,country_code:$cc}}' "$tmp/old_meta" > "$tmp/meta" &&
         chown "$REALM_USER:$REALM_USER" "$tmp/config" "$tmp/meta" && chmod 600 "$tmp/config" "$tmp/meta" &&
         open_firewall_port "$port" && mv "$tmp/config" "$REALM_CONFIG_FILE" && mv "$tmp/meta" "$REALM_META_FILE"; then
@@ -5446,6 +5601,10 @@ _quota_expiry_date() {
 # TG notify without dying on missing config (safe for timer/non-interactive use)
 _quota_tg_notify() {
     local msg="$1"
+    if [[ -n ${_QUOTA_NOTIFY_QUEUE:-} ]]; then
+        printf '%s\0' "$msg" >> "$_QUOTA_NOTIFY_QUEUE"
+        return
+    fi
     _tg_resolve_channel quota
     [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && return 0
     send_telegram "$msg" "" plain 2>/dev/null || true
@@ -5555,9 +5714,10 @@ _quota_write_data_locked() {
     local tmpfile
     tmpfile=$(mktemp "$QUOTA_DIR/.state.XXXXXX") || return 1
     trap "rm -f '$tmpfile'" RETURN
-    grep -v "^${port}|" "$QUOTA_DATA" > "$tmpfile" 2>/dev/null || true
-    echo "$newline" >> "$tmpfile"
-    mv "$tmpfile" "$QUOTA_DATA"
+    if [[ -f $QUOTA_DATA ]]; then
+        awk -F'|' -v p="$port" '$1 != p' "$QUOTA_DATA" > "$tmpfile" || return 1
+    fi
+    printf '%s\n' "$newline" >> "$tmpfile" && chmod 600 "$tmpfile" && mv "$tmpfile" "$QUOTA_DATA"
 }
 
 # Commit current nftables counters into accumulated data (mutating)
@@ -5591,24 +5751,44 @@ _quota_commit_port_locked() {
 quota_pause_port() { _state_locked _quota_pause_locked "$@"; }
 _quota_pause_locked() {
     local port=$1 reason=${2:-manual}
+    _valid_port "$port" || return 1
     local month prev_in prev_out acc_in acc_out paused previous_reason
     read -r month prev_in prev_out acc_in acc_out paused previous_reason < <(_quota_read_data "$port")
     _quota_write_data "$port" "$month" "$prev_in" "$prev_out" "$acc_in" "$acc_out" 1 "$reason" || return 1
-    _fw_element add paused_ports "$port"
+    if ! _fw_element add paused_ports "$port"; then
+        _quota_write_data "$port" "$month" "$prev_in" "$prev_out" "$acc_in" "$acc_out" "$paused" "$previous_reason" ||
+            msg_error "端口 $port 暂停失败且状态恢复失败，请检查配额文件及 nftables"
+        return 1
+    fi
 }
 
 # Resume a port by removing DROP rules
 quota_resume_port() { _state_locked _quota_resume_locked "$@"; }
 _quota_resume_locked() {
     local port=$1
+    _valid_port "$port" || return 1
     local month prev_in prev_out acc_in acc_out paused reason
     read -r month prev_in prev_out acc_in acc_out paused reason < <(_quota_read_data "$port")
     _quota_write_data "$port" "$month" "$prev_in" "$prev_out" "$acc_in" "$acc_out" 0 - || return 1
-    _fw_element delete paused_ports "$port"
+    if ! _fw_element delete paused_ports "$port"; then
+        _quota_write_data "$port" "$month" "$prev_in" "$prev_out" "$acc_in" "$acc_out" "$paused" "$reason" ||
+            msg_error "端口 $port 恢复失败且状态恢复失败，请检查配额文件及 nftables"
+        return 1
+    fi
 }
 
 # Periodic check: enforce quota/expiry, auto-resume on new month (called by timer)
-quota_check_all() { _state_locked quota_check_all_locked "$@"; }
+quota_check_all() (
+    local queue status=0 notice
+    queue=$(mktemp) || return 1
+    trap 'rm -f "$queue"' EXIT
+    local _QUOTA_NOTIFY_QUEUE=$queue
+    # 锁内只修改状态和收集通知；慢速 TG 重试不能占住防火墙/配额公共锁。
+    _state_locked quota_check_all_locked "$@" || status=$?
+    _QUOTA_NOTIFY_QUEUE=""
+    while IFS= read -r -d '' notice; do _quota_tg_notify "$notice"; done < "$queue"
+    return "$status"
+)
 quota_check_all_locked() {
     [[ ! -f "$QUOTA_CONFIG" ]] && return 0
 
@@ -5617,7 +5797,7 @@ quota_check_all_locked() {
     # 超过 35 天的必属往月/已过期（当月标记最多约 31 天），删之不会误清当前有效标记
     find "$QUOTA_DIR" -maxdepth 1 -type f \( -name '.warned_*' -o -name '.expwarn_*' \) \
         -mtime +35 -delete 2>/dev/null || true
-    local cur_month cur_date node_id
+    local cur_month cur_date node_id failed=0
     cur_month=$(TZ="$TZ_DEFAULT" date +%Y-%m)
     cur_date=$(TZ="$TZ_DEFAULT" date +%Y-%m-%d)
     node_id=$(get_node_id)
@@ -5629,7 +5809,7 @@ quota_check_all_locked() {
             continue
         fi
 
-        _quota_commit_port "$port" "$cur_month" || return 1
+        _quota_commit_port "$port" "$cur_month" || { failed=1; continue; }
         read -r _m _ii _io acc_in acc_out paused pause_reason \
             < <(_quota_read_data "$port")
         local total
@@ -5638,7 +5818,7 @@ quota_check_all_locked() {
         # ── 新月自动恢复 (quota暂停) ─────────────────────────────────────
         if [[ "$paused" == "1" && "$pause_reason" == "quota" ]]; then
             if [[ "${quota_bytes:-0}" -eq 0 || "$total" -lt "${quota_bytes}" ]]; then
-                quota_resume_port "$port"
+                quota_resume_port "$port" || { msg_error "端口 $port 自动恢复失败"; failed=1; continue; }
                 _quota_tg_notify "🟢 流量已重置 ${node_id}
 #${alias} 端口 ${port} 新月份流量已重置，自动恢复运行。"
                 paused=0; pause_reason="-"
@@ -5651,7 +5831,7 @@ quota_check_all_locked() {
             _exp_ts=$(TZ="$TZ_DEFAULT" date -d "$expiry" +%s 2>/dev/null) || continue
             _days_since=$(( ( $(date +%s) - _exp_ts ) / 86400 ))
             if (( _days_since >= 7 )); then
-                _quota_auto_delete "$port" "$alias"
+                _quota_auto_delete "$port" "$alias" || { msg_error "端口 $port 到期删除失败"; failed=1; }
                 continue
             fi
         fi
@@ -5660,7 +5840,7 @@ quota_check_all_locked() {
 
         # ── 到期检查 ─────────────────────────────────────────────────────
         if [[ "$expiry" != "-" && -n "$expiry" && "$cur_date" > "$expiry" ]]; then
-            quota_pause_port "$port" "expiry"
+            quota_pause_port "$port" "expiry" || { msg_error "端口 $port 到期暂停失败"; failed=1; continue; }
             _quota_tg_notify "⏰ 端口已到期 ${node_id}
 #${alias} 端口 ${port} 已于 ${expiry} 到期，已自动暂停。"
             continue
@@ -5679,7 +5859,7 @@ quota_check_all_locked() {
 
         # ── 流量超限检查 ─────────────────────────────────────────────────
         if [[ "${quota_bytes:-0}" -gt 0 && "$total" -ge "$quota_bytes" ]]; then
-            quota_pause_port "$port" "quota"
+            quota_pause_port "$port" "quota" || { msg_error "端口 $port 超额暂停失败"; failed=1; continue; }
             local used_h limit_h
             used_h=$(_qbytes_human "$total")
             limit_h=$(_qbytes_human "$quota_bytes")
@@ -5705,6 +5885,7 @@ quota_check_all_locked() {
         fi
 
     done < <(grep -v '^[[:space:]]*#' "$QUOTA_CONFIG" 2>/dev/null)
+    return "$failed"
 }
 
 # Build a visual progress bar (10 blocks)
@@ -6061,7 +6242,7 @@ quota_manual_pause() { quota_manual_pause_locked; }
 quota_manual_pause_locked() {
     local port
     _quota_pick_port "选择要暂停的端口" || return 0
-    quota_pause_port "$port" "manual"
+    quota_pause_port "$port" "manual" || { msg_error "端口 $port 暂停失败，未确认生效"; return 1; }
     msg_info "端口 ${port} 已手动暂停"
 }
 
@@ -6069,20 +6250,22 @@ quota_manual_resume() { quota_manual_resume_locked; }
 quota_manual_resume_locked() {
     local port
     _quota_pick_port "选择要恢复的端口" || return 0
-    quota_resume_port "$port"
+    quota_resume_port "$port" || { msg_error "端口 $port 恢复失败，未确认生效"; return 1; }
     msg_info "端口 ${port} 已恢复"
 }
 
 # Install/reinstall quota systemd timers
-install_quota_services() {
+install_quota_services() (
     local script_path
-    script_path=$(realpath "$0")
+    script_path=$(realpath "$0") || return 1
+    [[ $script_path != *$'\n'* && $script_path != *'"'* && $script_path != *'%'* &&
+       $script_path != *'\'* && $script_path != *'$'* ]] || return 1
     local _unit_dir="/etc/systemd/system"
     local _tmp
-    _tmp=$(mktemp -d)
-    trap "rm -rf '$_tmp'" RETURN
+    _tmp=$(mktemp -d) || return 1
+    trap 'rm -rf "$_tmp"' EXIT
 
-    cat > "${_tmp}/quota-check.service" <<EOF
+    cat > "${_tmp}/quota-check.service" <<EOF || return 1
 [Unit]
 Description=Proxy Quota Check
 After=network.target $FW_SERVICE.service
@@ -6095,7 +6278,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-    cat > "${_tmp}/quota-check.timer" <<EOF
+    cat > "${_tmp}/quota-check.timer" <<EOF || return 1
 [Unit]
 Description=Proxy Quota Check Timer (every 5 min)
 
@@ -6108,7 +6291,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-    cat > "${_tmp}/quota-daily.service" <<EOF
+    cat > "${_tmp}/quota-daily.service" <<EOF || return 1
 [Unit]
 Description=Proxy Quota Daily Report (21:00)
 After=$FW_SERVICE.service
@@ -6123,7 +6306,7 @@ ProtectSystem=strict
 ReadWritePaths=${WORK_DIR} -/var/log/proxy-manager.log -$FW_LOCK
 EOF
 
-    cat > "${_tmp}/quota-daily.timer" <<EOF
+    cat > "${_tmp}/quota-daily.timer" <<EOF || return 1
 [Unit]
 Description=Proxy Quota Daily Report Timer (21:00)
 
@@ -6136,22 +6319,24 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+    local _f
     for _f in quota-check.service quota-check.timer quota-daily.service quota-daily.timer; do
-        mv "${_tmp}/${_f}" "${_unit_dir}/${_f}"
+        chmod 644 "${_tmp}/${_f}" && mv "${_tmp}/${_f}" "${_unit_dir}/${_f}" || return 1
     done
-    # _tmp will be cleaned by trap RETURN
 
-    systemctl daemon-reload
-    systemctl enable quota-check.timer || msg_warn "启用 quota-check.timer 失败"
-    systemctl enable quota-daily.timer || msg_warn "启用 quota-daily.timer 失败"
-    systemctl start  quota-check.timer || msg_warn "启动 quota-check.timer 失败"
-    systemctl start  quota-daily.timer || msg_warn "启动 quota-daily.timer 失败"
+    systemctl daemon-reload || return 1
+    for _f in quota-check.timer quota-daily.timer; do
+        if ! systemctl enable --now "$_f" --quiet || ! systemctl is-enabled --quiet "$_f" ||
+            ! systemctl is-active --quiet "$_f"; then
+            msg_error "$_f 未就绪，配额定时器安装未完成"; return 1
+        fi
+    done
 
-    rm -f "${QUOTA_DIR}/.timer_disabled"
+    rm -f "${QUOTA_DIR}/.timer_disabled" || return 1
     msg_info "配额检测定时器已启动 → quota-check.timer（每5分钟）"
     msg_info "配额日报定时器已启动 → quota-daily.timer（每日 21:00）"
     printf "\n${C_GREEN}安装完成！每5分钟自动检测，21:00 推送日报到 Telegram。${C_RESET}\n"
-}
+)
 
 uninstall_quota_services() {
     for unit in quota-check quota-daily; do
@@ -6363,20 +6548,20 @@ sbx_render() {
                 port=$(_tg_cfg_get "$f" S_PORT)
                 _valid_port "$port" || { rm -f "$tmp"; return 1; }
                 tags+=("ss-$port")
-                record=$(jq -cn --argjson port "$port" --arg pw "$(_tg_cfg_get "$f" S_PW)" \
+                record=$(jq -cn --argjson port "$port" --rawfile pw <(printf '%s' "$(_tg_cfg_get "$f" S_PW)") \
                     --arg method "$(_tg_cfg_get "$f" S_METHOD)" \
                     '{type:"shadowsocks",tag:("ss-"+($port|tostring)),listen:"::",listen_port:$port,method:$method,password:$pw}') || return 1 ;;
             socks)
                 port=$(_tg_cfg_get "$f" SK_PORT)
                 _valid_port "$port" || { rm -f "$tmp"; return 1; }
-                record=$(jq -cn --argjson port "$port" --arg pw "$(_tg_cfg_get "$f" SK_PW)" \
+                record=$(jq -cn --argjson port "$port" --rawfile pw <(printf '%s' "$(_tg_cfg_get "$f" SK_PW)") \
                     --arg user "$(_tg_cfg_get "$f" SK_USER)" \
                     '{type:"socks",tag:("socks-"+($port|tostring)),listen:"::",listen_port:$port,users:[{username:$user,password:$pw}]}') || return 1 ;;
             hy2)
                 port=$(_tg_cfg_get "$f" H_PORT)
                 _valid_port "$port" || { rm -f "$tmp"; return 1; }
-                record=$(jq -cn --argjson port "$port" --arg pw "$(_tg_cfg_get "$f" H_PW)" \
-                    --arg obfs "$(_tg_cfg_get "$f" H_OBFS)" --argjson up "$(_tg_cfg_get "$f" H_UP)" \
+                record=$(jq -cn --argjson port "$port" --rawfile pw <(printf '%s' "$(_tg_cfg_get "$f" H_PW)") \
+                    --rawfile obfs <(printf '%s' "$(_tg_cfg_get "$f" H_OBFS)") --argjson up "$(_tg_cfg_get "$f" H_UP)" \
                     --argjson down "$(_tg_cfg_get "$f" H_DOWN)" --arg crt "$(_tg_cfg_get "$f" H_CRT)" \
                     --arg key "$(_tg_cfg_get "$f" H_KEY)" \
                     '{type:"hysteria2",tag:("hy2-"+($port|tostring)),listen:"::",listen_port:$port,up_mbps:$up,down_mbps:$down,obfs:{type:"salamander",password:$obfs},users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$crt,key_path:$key}}') || return 1 ;;

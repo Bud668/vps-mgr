@@ -9,9 +9,28 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.9-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.10-orange)
 
 </div>
+
+---
+
+## beta.10：实机审查 10 项修复
+
+本测试版在 beta.9 基础上包含以下 10 项修复与优化；下方安装链接固定为 beta.10。
+
+1. 初始化和手动系统更新共用安全的重启确认：支持 `yes/no/q`，错误输入重问，读取失败不重启。
+2. TG 配置保存、监控启动、通道验证失败会传回初始化汇总；已有配置也检查服务和开机启动。
+3. 配额暂停/恢复失败不再报成功，并恢复原状态记录；配额定时器需启用、运行校验通过才报完成。
+4. 公网 IP 缓存不再依赖国家查询成功；未知地区仍保留有效 IP，坏缓存重新查询。
+5. 配额巡检先完成端口处理、释放公共锁，再发送 TG 通知，网络重试不占用防火墙锁。
+6. SS、SOCKS5、Hysteria2 和 Realm 密钥通过私有管道传给 jq，不再放入进程参数。
+7. TG 询问处可直接粘贴配置，输入不回显；五行自动进入确认，`q` 立即取消，多余空行不会要求重填。
+8. 初始化 APT 和安全补丁组件安装统一安静输出；详细记录保存在 `/opt/proxy-manager/apt-install.log`（600 权限），失败显示日志末尾。
+9. 服务器名称独立保存，跳过 TG 或已有 TG 配置都能生效，改名保留原 Token/话题。
+10. 自检增加 TG、Fail2Ban、TCPing、NTP、定时器和任务执行结果；区分已启用、尚未执行、执行失败及正常结束的一次性任务。
+
+新增隔离故障回归并接入 CI；保留全部代理功能、8 步初始化和末尾一次重启询问，不新增依赖。
 
 ---
 
@@ -42,21 +61,21 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.9 预发布测试版**，包含上述 14 项审查修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.10 预发布测试版**，包含本次 10 项实机审查修复及 beta.9 的全部修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.9/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.10/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.9。发布页：[v2.0.0-beta.9](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.9)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.10。发布页：[v2.0.0-beta.10](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.10)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
 请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
 
-已完成 beta.5–beta.8 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本不会自动调整已有 Swap、内核或安全补丁策略；新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 Token 传递修复。
+已完成 beta.5–beta.9 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本不会自动调整已有 Swap、内核或安全补丁策略；新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 Token 传递修复。
 
 已完成 beta.4 初始化的测试机不必重装或重跑菜单 1：备份并在原路径替换脚本、验证语法后，执行 `systemctl restart vps-mgr-fq.service` 即可应用 beta.5 起包含的 fq 修复，沿用原先配置的速率，无需重启服务器。首次打开菜单缺少 jq/nftables 时只提示安装依赖，不再提前调用未安装的命令；完整依赖仍由菜单 1 安装。
 

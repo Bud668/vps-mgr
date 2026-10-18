@@ -151,7 +151,7 @@ printf 'flags : %s\nflags : %s\n' "$v3" "$v2" > "$test_dir/cpuinfo"
 assert test "$(_xanmod_cpu_level)" = 2
 printf 'flags : avx2\n' > "$test_dir/cpuinfo"
 assert test "$(_xanmod_cpu_level)" = 0
-declare -f _do_full_init | grep -Fq 'apt-get install -y -qq "$_xanmod_pkg"'
+declare -f _do_full_init | grep -Fq '_apt_quiet "安装 ${_xanmod_pkg}" install -y -qq "$_xanmod_pkg"'
 reject grep -q 'apt-cache depends' < <(declare -f _do_full_init)
 
 # 4: real temporary files, mocked allocation/swapon, exact free-space boundaries.

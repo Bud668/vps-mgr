@@ -57,6 +57,7 @@ systemctl() {
     record "systemctl $*"
     case "$1" in
         is-active)
+            if [[ ${environment:-} == tg_existing_fail && ${*: -1} == ssh-tg-monitor ]]; then return 1; fi
             case "${*: -1}" in
                 tcping-monitor) [[ -f "$test_dir/tcping-active" ]] ;;
                 exim4) [[ -f "$test_dir/exim-active" ]] ;;
@@ -164,7 +165,7 @@ assert test ! -s "$test_dir/etc/exim4/conf.d/main/00_vps_mgr_ipv4"
 # Execute the real generated monitor with fake journal/TG endpoints: startup,
 # IPv6 login, HTML escaping and management-IP tags must all survive generation.
 _tg_permissions() { :; }
-printf 'TG_BOT_TOKEN=123:test-token\nTG_CHAT_ID=-100123\nTG_THREAD_SSH=8\nSERVER_NAME=Chi_ATT\n' > "$TG_CONF"
+printf 'TG_BOT_TOKEN=123:test-token\nTG_CHAT_ID=-100123\nTG_CHAT_HUB=-100123\nTG_THREAD_SSH=8\nSERVER_NAME=Chi_ATT\n' > "$TG_CONF"
 printf 'SERVER_COUNTRY_CODE=US\n' > "$CACHE_FILE"
 mkdir -p "$(dirname "$F2B_WHITELIST")"
 printf '192.0.2.2\n' > "$F2B_WHITELIST"
@@ -192,12 +193,13 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 
 # Exercise both real initialization paths with only OS operations stubbed.
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
-assert test "$(declare -f _do_full_init | grep -c '立即重启？')" = 1
+assert test "$(declare -f _do_full_init | grep -c '_confirm_reboot')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps cf google blank invalid timeout unlocked dns_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail; do
+for environment in vps cf google blank invalid timeout unlocked dns_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail tg_direct tg_skip tg_eof tg_existing tg_existing_fail; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
+    if [[ $environment == tg_existing* ]]; then _write_tg_conf 123:offline -100123 Old_name 4 5 6; fi
     printf 'nameserver 192.0.2.53\n' > "$test_dir/etc/resolv.conf"
     _is_container() { [[ $environment == container ]]; }
     check_system() { :; }
@@ -218,6 +220,19 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
     chattr() { [[ $environment != unlocked || $1 != +i ]]; }
     mountpoint() { [[ $environment == container ]]; }
     read() {
+        if [[ ${*: -1} == _init_srv_name && $environment == tg_* ]]; then
+            _init_srv_name="Name_$environment"; return 0
+        fi
+        if [[ ${*: -1} == _tg_ans ]]; then
+            case $environment in
+                tg_direct) _tg_ans=123:direct-paste ;;
+                tg_skip) _tg_ans=n ;;
+                tg_eof) return 1 ;;
+                *) _tg_ans=y ;;
+            esac
+            return 0
+        fi
+        if [[ ${*: -1} == answer ]]; then answer=y; return 0; fi
         if [[ ${*: -1} == _dns_choice ]]; then
             assert test "$*" = '-r -t 3 _dns_choice'
             record dns
@@ -252,7 +267,12 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
     _apply_fq() { record fq; [[ $environment != partial ]]; }
     _get_bbr_version() { echo v3; }
     do_init_firewall() { record firewall; }
-    _tg_input_tokens() { record telegram; [[ $environment != partial ]]; }
+    _tg_input_tokens() {
+        record telegram
+        if [[ $environment == tg_direct ]]; then assert test "${2:-}" = 123:direct-paste; fi
+        _write_tg_conf 123:offline -100123 "${1:-test}" 4 5 6
+        [[ $environment != partial ]]
+    }
     _install_fail2ban() { record fail2ban; [[ $environment != partial ]]; }
     _tcping_setup_silent() { record tcping; [[ $environment != partial ]]; }
     if [[ $environment == partial ]]; then
@@ -305,9 +325,27 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
             assert grep -q 'DNS 配置未匹配 Google / Cloudflare' "$test_dir/dns-check.log"
         fi
     fi
-    for feature in ipv6 logs nofile journald firewall telegram fail2ban tcping security-updates; do
+    for feature in ipv6 logs nofile journald firewall fail2ban tcping security-updates; do
         assert grep -qx "$feature" "$test_dir/calls"
     done
+    case $environment in
+        tg_skip|tg_eof|tg_existing|tg_existing_fail)
+            if grep -qx telegram "$test_dir/calls"; then echo 'Unexpected TG reconfiguration'; exit 1; fi ;;
+        *) assert grep -qx telegram "$test_dir/calls" ;;
+    esac
+    if [[ $environment == tg_* ]]; then
+        assert test "$(_tg_cfg_get "$TG_CONF" SERVER_NAME)" = "Name_$environment"
+    fi
+    if [[ $environment == tg_skip || $environment == tg_eof ]]; then
+        assert test -z "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)"
+        assert grep -q '未完成 / 已跳过：.*TG 推送' "$test_dir/init-$environment.log"
+    elif [[ $environment == tg_existing ]]; then
+        assert test "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)" = 123:offline
+        assert grep -q '已配置，SSH 通知运行中' "$test_dir/init-$environment.log"
+    elif [[ $environment == tg_existing_fail ]]; then
+        assert grep -q 'TG 已配置，但 SSH 监控未就绪' "$test_dir/init-$environment.log"
+        assert grep -q '未完成 / 已跳过：.*TG 推送' "$test_dir/init-$environment.log"
+    fi
     for step in {1..8}; do
         assert test "$(grep -Fc "[$step/8]" "$test_dir/init-$environment.log")" = 1
     done
