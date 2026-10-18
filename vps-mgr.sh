@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.11"
+readonly SCRIPT_VERSION="2.0.0-beta.12"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -449,14 +449,73 @@ _tg_clean_input_line() {
     _tg_line="${_tg_line%"${_tg_line##*[![:space:]]}"}"
 }
 
-_tg_input_tokens() {
+_tg_read_input_line() {
+    local -n _line_ref=$1 _paste_ref=$2 _end_ref=$3
+    local _fd=$4 _auto=$5 _char _escape _rc
+    local -a _timeout
+    _line_ref=""; _end_ref=0
+    while :; do
+        _timeout=()
+        # shortcut: 无粘贴标记时以末项 0.5 秒空闲判定结束；精确边界需终端支持 bracketed paste。
+        if (( _auto && ! _paste_ref )) && [[ -n $_line_ref ]]; then _timeout=(-t 0.5); fi
+        _rc=0
+        IFS= read -rs -N 1 -u "$_fd" "${_timeout[@]}" _char || _rc=$?
+        if (( _rc )); then
+            (( _rc > 128 && ${#_timeout[@]} )) && return 0
+            return 1
+        fi
+        case $_char in
+            $'\e')
+                _escape=""
+                IFS= read -rs -N 5 -t 1 -u "$_fd" _escape || true
+                case $_escape in
+                    '[200~') _paste_ref=1 ;;
+                    '[201~') _paste_ref=0; _end_ref=1; return 0 ;;
+                    *) _line_ref+="$_char$_escape" ;;
+                esac ;;
+            $'\n'|$'\r') return 0 ;;
+            $'\177'|$'\b') _line_ref=${_line_ref%?} ;;
+            $'\025') _line_ref="" ;;
+            $'\004') return 1 ;;
+            *) _line_ref+=$_char ;;
+        esac
+    done
+}
+
+_tg_pending_input_empty() {
+    local _fd=$1 _chunk _pending="" _line
+    [[ -t $_fd ]] || return 0
+    while IFS= read -rs -N 4096 -t 0.05 -u "$_fd" _chunk || [[ -n $_chunk ]]; do
+        _pending+=$_chunk
+    done
+    while IFS= read -r _line; do
+        _tg_clean_input_line _line
+        [[ -z $_line || $_line == \#* ]] || return 1
+    done <<< "$_pending"
+}
+
+_tg_input_tokens() (
     local _srv="${1:-}" _first="${2:-}" _failed=0
     local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd
     local _resp _bot _gf _cf _bad_field
+    local _tty_fd _tty_state="" _pasting=0 _paste_end=0 _auto=0 _burst=0 _cancel=0
+    local -a _fields=(Token 'Chat ID' 'SSH 话题' '配额话题' 'DDNS 话题')
+    local _expected=${#_fields[@]}
+    exec {_tty_fd}< /dev/tty || { msg_warn "未读取到终端，未保存 TG 配置"; return 1; }
+    if [[ -t $_tty_fd ]]; then
+        _tty_state=$(stty -g <&"$_tty_fd") || return 1
+        trap 'stty "$_tty_state" <&"$_tty_fd"; printf "\033[?2004l"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    fi
     while :; do
+        if [[ -n $_tty_state ]]; then
+            stty -echo -icanon min 1 time 0 <&"$_tty_fd" || return 1
+            printf '\033[?2004h'
+        fi
         if [[ -n $_first ]]; then
             printf "  已收到 Token（隐藏），继续读取 Chat ID → SSH / 配额 / DDNS 话题 ID。\n"
-            printf "  已整段粘贴请直接按回车，不要重复粘贴。\n"
+            printf "  已整段粘贴请等待自动验证，不要重复粘贴。\n"
         else
             printf "  粘贴配置，支持 # 注释行和空行分隔，自动跳过:\n"
             printf "  顺序: Bot Token → 话题群 Chat ID\n"
@@ -464,30 +523,47 @@ _tg_input_tokens() {
             printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
             printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
         fi
-        printf "  ${C_YELLOW}输入隐藏；末行也需回车，收齐 5 行后核对；2–4 行连按两次回车；单独输入 q 放弃${C_RESET}\n>>> "
-        _vals=(); _blank=0
-        while [[ ${#_vals[@]} -lt 5 ]]; do
-            if [[ -n $_first ]]; then _vline=$_first; _first=""
-            elif ! read -rs _vline < /dev/tty; then
+        printf "  ${C_YELLOW}输入隐藏；整段粘贴 %s 项自动验证，无需补回车；逐行输入按回车，2–4 项连按两次回车；q 放弃${C_RESET}\n>>> " "$_expected"
+        _vals=(); _blank=0; _burst=0; _cancel=0
+        while :; do
+            _paste_end=0; _auto=0
+            if [[ -n $_tty_state ]] && (( _burst && ${#_vals[@]} == _expected - 1 )); then _auto=1; fi
+            if [[ -n $_first ]]; then
+                _vline=$_first; _first=""
+                [[ $_vline != *$'\e[200~'* ]] || _pasting=1
+                if [[ $_vline == *$'\e[201~'* ]]; then _pasting=0; _paste_end=1; fi
+            elif ! _tg_read_input_line _vline _pasting _paste_end "$_tty_fd" "$_auto"; then
                 printf '\n'; msg_warn "输入已结束，未保存 TG 配置"; return 1
             fi
             _tg_clean_input_line _vline
-            [[ ${_vline,,} != q ]] || { printf '\n'; msg_info "已放弃 TG 配置"; return 1; }
+            [[ ${_vline,,} != q ]] || _cancel=1
+            if (( _cancel && ! _pasting )); then printf '\n'; msg_info "已放弃 TG 配置"; return 1; fi
             if [[ -z "$_vline" ]]; then
                 # 已够主频道(≥2行) 时，连续两个空行结束；否则空行仅作分隔忽略
                 if [[ ${#_vals[@]} -ge 2 ]]; then
                     _blank=$((_blank + 1))
-                    [[ $_blank -ge 2 ]] && break
+                    (( ! _pasting && ( _blank >= 2 || _paste_end ) )) && break
                 fi
-                continue
+            else
+                _blank=0
+                if [[ $_vline != \#* ]]; then
+                    _vals+=("$_vline")
+                    if (( ${#_vals[@]} <= _expected )); then
+                        printf '\r\033[K  已接收 %s/%s 项（%s 已收到，内容隐藏）' "${#_vals[@]}" "$_expected" "${_fields[${#_vals[@]}-1]}"
+                    fi
+                fi
             fi
-            _blank=0
-            [[ "$_vline" =~ ^# ]] && continue
-            _vals+=("$_vline")
+            if (( ! _pasting && ( ${#_vals[@]} >= _expected || (_paste_end && ${#_vals[@]} >= 2) ) )); then break; fi
+            # 同一批仍有输入才启用无标记粘贴兼容；逐行手输保留回车和编辑能力。
+            if [[ -n $_tty_state ]] && IFS= read -r -t 0 -u "$_tty_fd"; then _burst=1; fi
         done
+        printf '\n'
+        if ! _tg_pending_input_empty "$_tty_fd" || (( ${#_vals[@]} > _expected )); then
+            printf '  ✗ 配置超过 %s 项或含多余输入，未保存；请重新粘贴（q 放弃）\n' "$_expected"
+            continue
+        fi
         _new_tok="${_vals[0]:-}" _hub="${_vals[1]:-}"
         _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
-        printf '\n'
         _bad_field=""
         if [[ ! $_new_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then _bad_field="第 1 行 Token"
         elif [[ ! $_hub =~ ^-?[0-9]+$ ]]; then _bad_field="第 2 行 Chat ID"
@@ -504,6 +580,9 @@ _tg_input_tokens() {
         fi
         _bot=$(echo "$_resp" | grep -oP '"username":"\K[^"]+' || echo "?")
         printf " ${C_GREEN}✓ @%s${C_RESET}\n" "$_bot"
+        if ! _tg_pending_input_empty "$_tty_fd"; then
+            msg_warn "验证期间收到多余输入，未保存；请重新粘贴（q 放弃）"; continue
+        fi
         if [[ -z "$_srv" ]]; then
             _gf=$(get_flag_emoji "${SERVER_COUNTRY_CODE:-UN}")
             _srv="${_gf} ${SERVER_COUNTRY_NAME:-Unknown}, ${SERVER_CITY:-Unknown}"
@@ -514,9 +593,13 @@ _tg_input_tokens() {
         printf "    ├ SSH 登录 : 话题 %s\n" "${_th_ssh:-未设置}"
         printf "    ├ 流量配额 : 话题 %s\n" "${_th_qt:-未设置}"
         printf "    └ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
+        if [[ -n $_tty_state ]]; then
+            stty "$_tty_state" <&"$_tty_fd" || return 1
+            printf '\033[?2004l'
+        fi
         printf "  ${C_YELLOW}确认写入？[y=写入 / r=重新粘贴 / q=放弃]: ${C_RESET}"
         while :; do
-            read -r _cf < /dev/tty || _cf=q
+            read -r -u "$_tty_fd" _cf || _cf=q
             _tg_clean_input_line _cf
             case "${_cf,,}" in
                 y|r) break ;;
@@ -541,7 +624,7 @@ _tg_input_tokens() {
         install_quota_services || _failed=1
     fi
     return "$_failed"
-}
+)
 
 # 配置保存后逐通道发确认，当场暴露话题 ID 填错——否则要等对应服务真触发才发现
 _tg_notify_configured() {
@@ -3230,17 +3313,19 @@ EOF
             _setup_ssh_tg_monitor && _ok_tg=1 || msg_warn "TG 已配置，但 SSH 监控未就绪"
         fi
     else
-        local _tg_ans
+        local _tg_ans _tg_raw_ans
         while :; do
+            printf '\033[?2004h'
             echo -ne "  是否现在配置 TG 推送？[Y/n，可直接粘贴配置，输入隐藏]: "
-            if ! read -rs _tg_ans < /dev/tty; then printf '\n'; msg_warn "未读取到输入，跳过 TG 配置"; break; fi
-            printf '\n'
+            if ! read -rs _tg_ans < /dev/tty; then printf '\033[?2004l\n'; msg_warn "未读取到输入，跳过 TG 配置"; break; fi
+            printf '\033[?2004l\n'
+            _tg_raw_ans=$_tg_ans
             _tg_clean_input_line _tg_ans
             case "$_tg_ans" in
                 ""|[Yy]|[Yy][Ee][Ss]) _tg_input_tokens "$_init_srv_name" && _ok_tg=1 || true; break ;;
                 [Nn]|[Nn][Oo]|[Qq]) echo -e "  ${YELLOW}⚠ 跳过（可后续从选项 3 配置）${NC}"; break ;;
                 *) if [[ $_tg_ans =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
-                       _tg_input_tokens "$_init_srv_name" "$_tg_ans" && _ok_tg=1 || true; break
+                       _tg_input_tokens "$_init_srv_name" "$_tg_raw_ans" && _ok_tg=1 || true; break
                    fi
                    echo -e "  ${YELLOW}请输入 Y/N，或直接粘贴 TG 配置${NC}" ;;
             esac

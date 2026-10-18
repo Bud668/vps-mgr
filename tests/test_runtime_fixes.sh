@@ -132,11 +132,13 @@ import time
 code = r'''
 source <(sed '/^main "\$@"$/d' "$1")
 log_message() { :; }
-_tg_api() { printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
+test_scenario=${3:-}
+_tg_api() { [[ $test_scenario != late_extra ]] || sleep 0.3; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
 _write_tg_conf() { printf '\nPTY_SAVED\n'; }
 _setup_ssh_tg_monitor() { :; }
 _tg_notify_configured() { :; }
 install_quota_services() { :; }
+terminal_before=$(stty -g </dev/tty)
 rc=0
 if [[ $2 == init ]]; then
     _tg_config_valid() { return 1; }
@@ -150,24 +152,38 @@ if [[ $2 == init ]]; then
 else
     _tg_input_tokens pty-node || rc=$?
 fi
+[[ $(stty -g </dev/tty) == "$terminal_before" ]] || { printf '\nPTY_TTY_BROKEN\n'; exit 1; }
+printf '\nPTY_TTY_OK\n'
 printf '\nPTY_DONE=%s\n' "$rc"
 '''
-fields = [b'1234567890:pty_fake_secret_With-Dashes_1234567890', b'-1001234567890', b'4', b'5', b'6']
+fields = [b'1234567890:pty_fake_secret_With-Dashes_1234567890', b'-1001234567890', b'4', b'5', b'12345678']
 plain = b'\n'.join(fields)
-cases = [('plain', plain + b'\n\n\ny\n', 0), ('no_final_newline', plain, 0),
+cases = [('plain', plain + b'\n\n\n', 0), ('no_final_newline', plain, 0),
          ('q', b'q\n', 1), ('Q', b'Q\n', 1), ('bracketed_q', b'\x1b[200~Q\x1b[201~\n', 1),
-         ('confirm_q', plain + b'\nQ\n', 1)]
+         ('confirm_q', plain + b'\n', 1),
+         ('extra', plain + b'\n7\ny\n', 1),
+         ('extra_framed', b'\x1b[200~' + plain + b'\ny\n7\x1b[201~', 1),
+         ('late_extra', plain + b'\n', 1),
+         ('split_plain', b'\n'.join(fields[:4]) + b'\n12', 0),
+         ('split_framed', b'\x1b[200~' + b'\n'.join(fields[:4]) + b'\n12', 0),
+         ('comments', b'# comment\n' + plain + b'\n# trailing comment\n', 0),
+         ('minimal', b'\n'.join(fields[:2]) + b'\n\n\n', 0),
+         ('manual', fields[0] + b'\n', 0), ('manual_edit', fields[0] + b'\n', 0)]
 for separator in (b'\n', b'\r', b'\r\n'):
     block = separator.join(fields)
-    cases += [('bracketed', b'\x1b[200~' + block + b'\x1b[201~\ny\n', 0),
-              ('marker_on_next_line', b'\x1b[200~' + block + separator + b'\x1b[201~y\n', 0)]
+    cases += [('bracketed', b'\x1b[200~' + block + b'\x1b[201~', 0),
+              ('marker_on_next_line', b'\x1b[200~' + block + separator + b'\x1b[201~\n', 0)]
 for entry, name, payload, result in [(entry, *case) for entry in ('config', 'init') for case in cases]:
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], entry])
+        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], entry, name])
     output = b''
     sent_at = None
-    final_enter = False
+    tail_sent = False
+    confirm_sent = False
+    cancel_sent = False
+    manual_index = 1
+    last_manual = 0
     prompt = '是否现在配置'.encode() if entry == 'init' else b'>>> '
     deadline = time.monotonic() + 8
     try:
@@ -175,10 +191,39 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
             if sent_at is None and prompt in output and not termios.tcgetattr(fd)[3] & termios.ECHO:
                 os.write(fd, payload)
                 sent_at = time.monotonic()
-            if name == 'no_final_newline' and sent_at is not None and not final_enter and time.monotonic() - sent_at > 0.2:
+                last_manual = sent_at
+            if name.startswith('split_') and sent_at is not None and not tail_sent and time.monotonic() - sent_at > (0.8 if name == 'split_framed' else 0.1):
                 assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
-                os.write(fd, b'\ny\n')
-                final_enter = True
+                os.write(fd, b'345678' + (b'\x1b[201~' if name == 'split_framed' else b''))
+                tail_sent = True
+            if name.startswith('manual') and sent_at is not None and time.monotonic() - last_manual > 0.2:
+                if manual_index < 4 and f'已接收 {manual_index}/5'.encode() in output:
+                    os.write(fd, fields[manual_index] + b'\n')
+                    manual_index += 1
+                    last_manual = time.monotonic()
+                elif manual_index == 4 and '已接收 4/5'.encode() in output:
+                    os.write(fd, b'129\x7f' if name == 'manual_edit' else b'12')
+                    manual_index += 1
+                    last_manual = time.monotonic()
+                elif manual_index == 5 and time.monotonic() - last_manual > 0.8:
+                    assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
+                    os.write(fd, b'345678\n')
+                    manual_index += 1
+            if name == 'late_extra' and '正在验证 Bot...'.encode() in output and not tail_sent:
+                os.write(fd, b'y\n')
+                tail_sent = True
+            if (name.startswith('extra') or name == 'late_extra') and output.count(b'>>> ') == 2 and not cancel_sent:
+                assert b'PTY_SAVED' not in output, output
+                if name != 'late_extra':
+                    assert b'offline_bot' not in output, output
+                os.write(fd, b'q\n')
+                cancel_sent = True
+            if '确认写入？'.encode() in output and not confirm_sent:
+                assert b'PTY_SAVED' not in output, output
+                if name != 'minimal':
+                    assert b'12345678' in output, (entry, name, output)
+                os.write(fd, b'Q\n' if name == 'confirm_q' else b'y\n')
+                confirm_sent = True
             if select.select([fd], [], [], 0.05)[0]:
                 try:
                     chunk = os.read(fd, 65536)
@@ -190,18 +235,57 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                     break
                 output += chunk
         assert sent_at is not None and f'PTY_DONE={result}'.encode() in output, (entry, name, output)
+        assert b'PTY_TTY_OK' in output, (entry, name, output)
         assert b'pty_fake_secret' not in output, output
-        prompts = 0 if entry == 'init' and name in ('q', 'Q', 'bracketed_q') else 1
+        prompts = 2 if name.startswith('extra') or name == 'late_extra' else 0 if entry == 'init' and name in ('q', 'Q', 'bracketed_q') else 1
         assert output.count(b'>>> ') == prompts, (entry, name, output)
         assert '格式不正确'.encode() not in output, (entry, name, output)
         assert (b'PTY_SAVED' in output) == (result == 0), output
+        if result == 0 and name != 'minimal':
+            assert '已接收 5/5 项'.encode() in output, (entry, name, output)
+        if name.startswith('extra'):
+            assert '配置超过 5 项或含多余输入'.encode() in output, output
+            assert '已接收 6/5'.encode() not in output, output
+        if name == 'late_extra':
+            assert '验证期间收到多余输入'.encode() in output, output
     finally:
         ended, _ = os.waitpid(pid, os.WNOHANG)
         if ended == 0:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
         os.close(fd)
-print('PASS: real TTY init/config paste, LF/CRLF framing, final Enter, hidden input and cancel')
+print('PASS: real TTY auto-submit, progress, extra-input guard, split paste, manual input and terminal restore')
+
+for interrupt in (b'\x03', b'\x04'):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], 'config'])
+    output = b''
+    interrupted = False
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            if b'>>> ' in output and not interrupted and not termios.tcgetattr(fd)[3] & termios.ECHO:
+                os.write(fd, interrupt)
+                interrupted = True
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    output += os.read(fd, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+        assert interrupted and b'PTY_SAVED' not in output, output
+        flags = termios.tcgetattr(fd)[3]
+        assert flags & termios.ECHO and flags & termios.ICANON, output
+        assert b'\x1b[?2004l' in output, output
+    finally:
+        ended, _ = os.waitpid(pid, os.WNOHANG)
+        if ended == 0:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(fd)
+print('PASS: Ctrl-C / EOF restore terminal echo and canonical input')
 PY
 
 # 3: failed enforcement restores intent; manual actions and timers propagate failure.
