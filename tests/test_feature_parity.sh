@@ -146,6 +146,7 @@ for hook in "$test_dir/etc/network/if-up.d/vps-mgr-fq" "$test_dir/etc/networkd-d
     sh -n "$hook"
 done
 install_autoupdate
+assert test ! -e "$SELF_AUTOUPDATE_FLAG"
 assert grep -q '05:00:00 Asia/Shanghai' "$test_dir/etc/systemd/system/vps-mgr-autoupdate.timer"
 declare -f get_latest_github_release | grep -q '/releases/latest'
 declare -f sbx_install_core | grep -q 'LimitNOFILE=1000000'
@@ -155,6 +156,8 @@ declare -f sbx_install_core | grep -q 'LimitNOFILE=1000000'
     }
     if output=$(install_autoupdate 2>&1); then echo 'Failed timer enable hidden'; exit 1; fi
     [[ $output == *'simulated service enable error'* ]] || { echo 'Service error output hidden'; exit 1; }
+    if _enable_self_autoupdate; then echo 'Failed timer enabled script updates'; exit 1; fi
+    assert test ! -e "$SELF_AUTOUPDATE_FLAG"
 )
 
 # Exim changes are reversible, idempotent, preserve custom macros and roll back.
@@ -403,15 +406,15 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
         echo 'Repeated initialization output'; exit 1
     fi
     if [[ $environment == partial ]]; then
-        assert grep -q '未完成 / 已跳过：.*网络调优.*TG 推送.*Fail2Ban.*TCPing.*每日更新' "$test_dir/init-$environment.log"
+        assert grep -q '未完成 / 已跳过：.*网络调优.*TG 推送.*Fail2Ban.*TCPing.*每日检查' "$test_dir/init-$environment.log"
         assert grep -q 'simulated updater error' "$test_dir/init-$environment.log"
         assert grep -q 'fq 调优或持久化未完成' "$test_dir/init-$environment.log"
-        if grep -q 'fq 已保存\|每日更新已启用' "$test_dir/init-$environment.log"; then
+        if grep -q 'fq 已保存\|每日检查已启用' "$test_dir/init-$environment.log"; then
             echo 'Failed initialization reported success'; exit 1
         fi
     else
         assert grep -q 'enable --now vps-mgr-autoupdate.timer --quiet' "$test_dir/calls"
-        assert test "$(grep -c '每日更新已启用' "$test_dir/init-$environment.log")" = 1
+        assert test "$(grep -c '每日检查已启用' "$test_dir/init-$environment.log")" = 1
     fi
     if [[ $environment == container ]]; then
         if grep -qxE 'sysctl|fq' "$test_dir/calls"; then echo 'Container changed host tuning'; exit 1; fi

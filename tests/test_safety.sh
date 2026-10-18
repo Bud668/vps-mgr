@@ -92,6 +92,7 @@ curl() { echo '{"message":"rate limited"}'; }
 assert test "$(get_latest_github_release example/example v2.7.0)" = v2.7.0
 # A beta stays off the old stable release, but can later accept its matching stable.
 (
+    : > "$SELF_AUTOUPDATE_FLAG"
     get_latest_github_release() { printf 'v1.4.1\n'; }
     output=$(self_update auto)
     [[ $output == *跳过降级* ]] || { echo 'Old stable was not skipped' >&2; exit 1; }

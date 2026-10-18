@@ -16,10 +16,11 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.14"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
+readonly SELF_AUTOUPDATE_FLAG="$WORK_DIR/self-autoupdate.enabled"
 readonly CACHE_FILE="$WORK_DIR/server_info.cache"
 readonly CACHE_TTL=86400
 readonly LOCK_FILE="/run/server-manager.lock"
@@ -3355,11 +3356,11 @@ EOF
         _install_fail2ban && _ok_f2b=1 || true
     fi
 
-    echo -e "\n${L_BLUE}── [8/8] TCPing / 每日更新 / 安全补丁 ───────────────────${NC}"
+    echo -e "\n${L_BLUE}── [8/8] TCPing / 每日检查 / 安全补丁 ───────────────────${NC}"
     _tcping_setup_silent && _ok_tcping=1 || msg_warn "TCPing 安装未完成，可从菜单 6 → 7 重试"
-    install_autoupdate && _ok_update=1 || msg_warn "每日更新未启用，可从菜单 16 重试"
+    install_autoupdate && _ok_update=1 || msg_warn "每日检查未启用，可从菜单 16 → 6 重试"
     if (( _ok_update )); then
-        echo -e "  ${GREEN}✓ 每日更新已启用（脚本跟随正式版；Realm/sing-box 仅检查并提醒）${NC}"
+        echo -e "  ${GREEN}✓ 每日检查已启用（Realm/sing-box 仅提醒；脚本自动更新默认关闭，菜单 16 → 7 手动开启）${NC}"
     fi
     _install_security_updates && _ok_security=1 || msg_warn "系统安全补丁自动更新未完成，可从菜单 6 → 8 修复"
 
@@ -3377,7 +3378,7 @@ EOF
         systemctl is-enabled --quiet "$SSH_TG_SERVICE" || _pending+=("TG 推送")
     (( _ok_f2b )) && systemctl is-active --quiet fail2ban 2>/dev/null || _pending+=("Fail2Ban")
     (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null || _pending+=("TCPing")
-    (( _ok_update )) || _pending+=("每日更新")
+    (( _ok_update )) || _pending+=("每日检查")
     (( _ok_security )) || _pending+=("系统安全补丁")
     if (( ${#_pending[@]} )); then
         msg_warn "未完成 / 已跳过：${_pending[*]}（见上方提示，可从对应菜单单独处理）"
@@ -5558,9 +5559,13 @@ edit_config() {
 }
 
 # $1=auto 时为非交互模式（systemd 定时器调用）：不提问、不 exec、日志走 stdout(journal)。
-# 更新源固定 /releases/latest —— GitHub 只返回正式版，自动排除预发布，实现"预发布不自动更新"。
+# 只跟随 /releases/latest 的同大版本正式版；手动和自动入口共用保护。
 self_update() {
-    local _mode="${1:-}" latest tmp_file self_path
+    local _mode="${1:-}" latest tmp_file self_path downloaded_version
+    if [[ $_mode == auto && ! -f $SELF_AUTOUPDATE_FLAG ]]; then
+        echo "[auto-update] 脚本自动更新已关闭（菜单 16 → 7 可手动开启）"
+        return 0
+    fi
     self_path=$(realpath "${BASH_SOURCE[0]}")
 
     [[ "$_mode" == auto ]] || msg_step "检查脚本更新..."
@@ -5569,6 +5574,10 @@ self_update() {
     # Debian version ordering: beta < matching stable; never downgrade to v1.
     if dpkg --compare-versions "${latest/-/'~'}" lt "${SCRIPT_VERSION/-/'~'}"; then
         msg_info "远端版本低于当前版本，跳过降级"; return 0
+    fi
+    if [[ ${latest%%.*} != "${SCRIPT_VERSION%%.*}" ]]; then
+        msg_warn "已阻止跨大版本升级：v${SCRIPT_VERSION} → v${latest}；请阅读发布说明后手动迁移安装"
+        return 0
     fi
 
     if [[ "$latest" == "$SCRIPT_VERSION" ]]; then
@@ -5602,6 +5611,11 @@ self_update() {
                                || msg_error "新版本语法校验失败，已放弃更新"
         return 1
     fi
+    downloaded_version=$(sed -nE 's/^readonly SCRIPT_VERSION="([^"]+)"$/\1/p' "$tmp_file") || return 1
+    if [[ $downloaded_version != "$latest" ]]; then
+        msg_error "下载脚本版本与发布标签不一致，已放弃更新，原脚本保持不变"
+        return 1
+    fi
 
     cp -p "$self_path" "${self_path}.bak" 2>/dev/null || true
     chmod +x "$tmp_file"
@@ -5618,7 +5632,7 @@ self_update() {
     exec "$self_path"
 }
 
-# 同一每日任务：管理脚本跟随正式版；Realm/sing-box 只检查并发 TG 提醒。
+# 每日提醒默认开启；脚本自动更新另需显式开启，只跟随同大版本正式版。
 install_autoupdate() {
     local _self; _self=$(realpath "${BASH_SOURCE[0]}")
     [[ $_self != *$'\n'* && $_self != *'"'* && $_self != *'%'* ]] || return 1
@@ -5654,6 +5668,11 @@ uninstall_autoupdate() {
     systemctl disable --now vps-mgr-autoupdate.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/vps-mgr-autoupdate.service /etc/systemd/system/vps-mgr-autoupdate.timer
     systemctl daemon-reload 2>/dev/null || true
+}
+
+_enable_self_autoupdate() {
+    install_autoupdate || return 1
+    mkdir -p "$WORK_DIR" && install -m 600 /dev/null "$SELF_AUTOUPDATE_FLAG"
 }
 
 _do_update_menu() {
@@ -5693,12 +5712,18 @@ _do_update_menu() {
     fi
 
     printf "\n ${C_GREEN}4.${C_RESET} 一键更新全部有更新的服务\n"
-    printf " ${C_GREEN}5.${C_RESET} 本脚本      ${C_GREEN}v%s${C_RESET}  (检查并更新)\n" "$SCRIPT_VERSION"
+    printf " ${C_GREEN}5.${C_RESET} 本脚本      ${C_GREEN}v%s${C_RESET}  (仅同大版本更新)\n" "$SCRIPT_VERSION"
     local _au_st
     systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null \
         && _au_st="${C_GREEN}已开启${C_RESET}" || _au_st="${C_DIM}已关闭${C_RESET}"
-    printf " ${C_GREEN}6.${C_RESET} 每日任务    %b  (脚本自动更新；Realm/sing-box 仅提醒)\n" "$_au_st"
+    printf " ${C_GREEN}6.${C_RESET} 每日任务    %b  (Realm/sing-box 仅提醒；脚本自动更新另由选项 7 开启)\n" "$_au_st"
     printf "    ${C_DIM}上海时间 05:00–06:00；新版本发到程序更新话题（菜单 3 → 1，第 6 项）${C_RESET}\n"
+    local _self_au_st="${C_DIM}已关闭${C_RESET}"
+    if [[ -f $SELF_AUTOUPDATE_FLAG ]]; then
+        _self_au_st="${C_GREEN}已开启${C_RESET}"
+        systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null || _self_au_st="${C_YELLOW}已允许，但每日任务未运行${C_RESET}"
+    fi
+    printf " ${C_GREEN}7.${C_RESET} 脚本自动更新 %b  (默认关闭；仅同大版本正式版)\n" "$_self_au_st"
     printf " ${C_GREEN}0.${C_RESET} 返回\n"
     printf "\n${C_PURPLE}请选择: ${C_RESET}"
     read -r _upd_ch
@@ -5720,8 +5745,15 @@ _do_update_menu() {
         6) if systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null; then
                uninstall_autoupdate; msg_info "每日任务已关闭（脚本自动更新和代理版本提醒均停止）"
            else
-               if install_autoupdate; then msg_success "每日任务已开启（脚本跟随正式版；Realm/sing-box 仅检查并提醒）"
+               if install_autoupdate; then msg_success "每日任务已开启（Realm/sing-box 仅提醒；脚本自动更新按选项 7 的设置执行）"
                else msg_error "每日任务启用失败，请检查 systemd 日志"; fi
+           fi ;;
+        7) if [[ -f $SELF_AUTOUPDATE_FLAG ]]; then
+               if rm -f "$SELF_AUTOUPDATE_FLAG"; then msg_success "脚本自动更新已关闭；每日版本提醒保持原设置"
+               else msg_error "关闭失败，请检查设置文件权限"; fi
+           else
+               if _enable_self_autoupdate; then msg_success "脚本自动更新已开启，每日任务已启用（仅同大版本正式版）"
+               else msg_error "开启失败，请检查设置文件权限和 systemd 日志"; fi
            fi ;;
         0) return ;;
         *) msg_warn "无效选项" ;;
