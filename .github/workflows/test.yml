@@ -19,13 +19,13 @@ jobs:
       - name: Test dependencies (disposable container only)
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash shellcheck jq python3 openssl curl ca-certificates nftables iproute2 util-linux procps systemd unattended-upgrades
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash shellcheck jq python3 openssl curl ca-certificates nftables iproute2 util-linux procps systemd unattended-upgrades isc-dhcp-client mtr-tiny
       - name: Syntax and isolated regressions
         shell: bash
         run: |
           bash -n vps-mgr.sh
           shellcheck -S error vps-mgr.sh tests/*.sh
-          for test in get_node_id safety feature_parity ipv6 network_init audit_fixes security_updates runtime_fixes; do
+          for test in get_node_id safety feature_parity ipv6 network_init audit_fixes security_updates runtime_fixes dns_dhcp; do
             bash "tests/test_${test}.sh"
           done
 

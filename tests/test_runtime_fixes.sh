@@ -35,7 +35,7 @@ for caller in _do_full_init do_system_update; do
 done
 
 # 2/7: direct-paste seed, comments, optional topics, trailing blanks, immediate q, EOF.
-for scenario in full seeded minimal comments q mid_q eof short_eof save_fail monitor_fail notify_fail; do
+for scenario in full seeded minimal comments bracketed seeded_bracketed q mid_q bracketed_q invalid_token invalid_hub invalid_topic eof short_eof save_fail monitor_fail notify_fail; do
 (
     : > "$test_dir/calls"
     _tg_api() { record api; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
@@ -49,8 +49,14 @@ for scenario in full seeded minimal comments q mid_q eof short_eof save_fail mon
         seeded) seed=123:fake_secret; payload=$'-100123\n4\n5\n6\n\ny' ;;
         minimal) payload=$'123:fake_secret\n-100123\n\n\ny' ;;
         comments) payload=$'# comment\n123:fake_secret\n\n-100123\n4\n5\n6\ny' ;;
+        bracketed) payload=$'\e[200~123:fake_secret\r\n-100123\r\n4\r\n5\r\n6\e[201~\r\n\e[200~y\e[201~' ;;
+        seeded_bracketed) seed=$'\e[200~123:fake_secret'; payload=$'-100123\n4\n5\n6\n\e[201~y' ;;
         q) payload=q ;;
         mid_q) payload=$'123:fake_secret\nq' ;;
+        bracketed_q) payload=$'\e[200~Q\e[201~' ;;
+        invalid_token) payload=$'123:fake_secret!\n-100123\n4\n5\n6\nq' ;;
+        invalid_hub) payload=$'123:fake_secret\n-100oops\n4\n5\n6\nq' ;;
+        invalid_topic) payload=$'123:fake_secret\n-100123\n4\n5\n6x\nq' ;;
         eof) payload='' ;;
         short_eof) payload=123:fake_secret ;;
     esac
@@ -60,7 +66,7 @@ for scenario in full seeded minimal comments q mid_q eof short_eof save_fail mon
     else output=$(_tg_input_tokens test-server "$seed" <<< "$payload" 2>&1) || rc=$?; fi
     reject grep -Fq fake_secret <<< "$output"
     case $scenario in
-        full|seeded|minimal|comments)
+        full|seeded|minimal|comments|bracketed|seeded_bracketed)
             assert test "$rc" = 0
             assert test "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)" = 123:fake_secret
             assert _tg_config_valid
@@ -68,9 +74,17 @@ for scenario in full seeded minimal comments q mid_q eof short_eof save_fail mon
         *) assert test "$rc" != 0 ;;
     esac
     case $scenario in
-        q|mid_q|eof|short_eof) assert test ! -s "$test_dir/calls" ;;
+        q|mid_q|bracketed_q|invalid_*|eof|short_eof) assert test ! -s "$test_dir/calls" ;;
         save_fail) reject grep -qx monitor "$test_dir/calls"; reject grep -q '✓ 已保存' <<< "$output" ;;
         monitor_fail) assert grep -q 'SSH 监控未就绪' <<< "$output" ;;
+    esac
+    case $scenario in
+        seeded|seeded_bracketed)
+            assert grep -q '已收到 Token（隐藏）' <<< "$output"
+            reject grep -q '粘贴配置，支持' <<< "$output" ;;
+        invalid_token) assert grep -q '第 1 行 Token 格式不正确' <<< "$output" ;;
+        invalid_hub) assert grep -q '第 2 行 Chat ID 格式不正确' <<< "$output" ;;
+        invalid_topic) assert grep -q '第 3–5 行话题 ID 格式不正确' <<< "$output" ;;
     esac
 )
 done
@@ -104,7 +118,7 @@ done
     reject _tg_notify_configured test-server
 )
 
-# Real controlling TTY: pasted token must not echo, extra blank lines must not reset input.
+# Real TTY: both init's first prompt and the config reader must accept terminal paste framing.
 python3 - "$repo_dir/vps-mgr.sh" <<'PY'
 import errno
 import os
@@ -124,21 +138,47 @@ _setup_ssh_tg_monitor() { :; }
 _tg_notify_configured() { :; }
 install_quota_services() { :; }
 rc=0
-_tg_input_tokens pty-node || rc=$?
+if [[ $2 == init ]]; then
+    _tg_config_valid() { return 1; }
+    init_tg_test() {
+        local _init_srv_name=pty-node _ok_tg=0
+        # Run the real initialization input block without any host setup operations.
+        eval "$(declare -f _do_full_init | sed -n '/if _tg_config_valid; then/,/Fail2Ban/ { /Fail2Ban/d; p; }')"
+        rc=$((1 - _ok_tg))
+    }
+    init_tg_test
+else
+    _tg_input_tokens pty-node || rc=$?
+fi
 printf '\nPTY_DONE=%s\n' "$rc"
 '''
-for payload, result in [(b'123:pty_fake_secret\n-100123\n4\n5\n6\n\n\ny\n', 0), (b'q\n', 1)]:
+fields = [b'1234567890:pty_fake_secret_With-Dashes_1234567890', b'-1001234567890', b'4', b'5', b'6']
+plain = b'\n'.join(fields)
+cases = [('plain', plain + b'\n\n\ny\n', 0), ('no_final_newline', plain, 0),
+         ('q', b'q\n', 1), ('Q', b'Q\n', 1), ('bracketed_q', b'\x1b[200~Q\x1b[201~\n', 1),
+         ('confirm_q', plain + b'\nQ\n', 1)]
+for separator in (b'\n', b'\r', b'\r\n'):
+    block = separator.join(fields)
+    cases += [('bracketed', b'\x1b[200~' + block + b'\x1b[201~\ny\n', 0),
+              ('marker_on_next_line', b'\x1b[200~' + block + separator + b'\x1b[201~y\n', 0)]
+for entry, name, payload, result in [(entry, *case) for entry in ('config', 'init') for case in cases]:
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1]])
+        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], entry])
     output = b''
-    sent = False
+    sent_at = None
+    final_enter = False
+    prompt = '是否现在配置'.encode() if entry == 'init' else b'>>> '
     deadline = time.monotonic() + 8
     try:
         while time.monotonic() < deadline:
-            if not sent and b'>>> ' in output and not termios.tcgetattr(fd)[3] & termios.ECHO:
+            if sent_at is None and prompt in output and not termios.tcgetattr(fd)[3] & termios.ECHO:
                 os.write(fd, payload)
-                sent = True
+                sent_at = time.monotonic()
+            if name == 'no_final_newline' and sent_at is not None and not final_enter and time.monotonic() - sent_at > 0.2:
+                assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
+                os.write(fd, b'\ny\n')
+                final_enter = True
             if select.select([fd], [], [], 0.05)[0]:
                 try:
                     chunk = os.read(fd, 65536)
@@ -149,9 +189,11 @@ for payload, result in [(b'123:pty_fake_secret\n-100123\n4\n5\n6\n\n\ny\n', 0), 
                 if not chunk:
                     break
                 output += chunk
-        assert sent and f'PTY_DONE={result}'.encode() in output, output
+        assert sent_at is not None and f'PTY_DONE={result}'.encode() in output, (entry, name, output)
         assert b'pty_fake_secret' not in output, output
-        assert output.count(b'>>> ') == 1, output
+        prompts = 0 if entry == 'init' and name in ('q', 'Q', 'bracketed_q') else 1
+        assert output.count(b'>>> ') == prompts, (entry, name, output)
+        assert '格式不正确'.encode() not in output, (entry, name, output)
         assert (b'PTY_SAVED' in output) == (result == 0), output
     finally:
         ended, _ = os.waitpid(pid, os.WNOHANG)
@@ -159,7 +201,7 @@ for payload, result in [(b'123:pty_fake_secret\n-100123\n4\n5\n6\n\n\ny\n', 0), 
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
         os.close(fd)
-print('PASS: real TTY hidden paste and immediate cancel')
+print('PASS: real TTY init/config paste, LF/CRLF framing, final Enter, hidden input and cancel')
 PY
 
 # 3: failed enforcement restores intent; manual actions and timers propagate failure.

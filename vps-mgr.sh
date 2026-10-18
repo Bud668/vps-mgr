@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.10"
+readonly SCRIPT_VERSION="2.0.0-beta.11"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -439,25 +439,39 @@ _write_tg_conf() {
     chmod 600 "$tmp" && mv "$tmp" "$TG_CONF" || { rm -f "$tmp"; return 1; }
     _tg_permissions
 }
+
+_tg_clean_input_line() {
+    local -n _tg_line=$1
+    # 普通 read 不解析终端的 bracketed-paste 包装，只去掉这两个控制标记。
+    _tg_line=${_tg_line//$'\e[200~'/}
+    _tg_line=${_tg_line//$'\e[201~'/}
+    _tg_line="${_tg_line#"${_tg_line%%[![:space:]]*}"}"
+    _tg_line="${_tg_line%"${_tg_line##*[![:space:]]}"}"
+}
+
 _tg_input_tokens() {
     local _srv="${1:-}" _first="${2:-}" _failed=0
     local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd
-    local _resp _bot _gf _cf
+    local _resp _bot _gf _cf _bad_field
     while :; do
-        printf "  粘贴配置，支持 # 注释行和空行分隔，自动跳过:\n"
-        printf "  顺序: Bot Token → 话题群 Chat ID\n"
-        printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID\n"
-        printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
-        printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
-        printf "  ${C_YELLOW}输入不回显；满 5 行自动确认，仅填 2–4 行时连按两次回车；q 随时放弃${C_RESET}\n>>> "
+        if [[ -n $_first ]]; then
+            printf "  已收到 Token（隐藏），继续读取 Chat ID → SSH / 配额 / DDNS 话题 ID。\n"
+            printf "  已整段粘贴请直接按回车，不要重复粘贴。\n"
+        else
+            printf "  粘贴配置，支持 # 注释行和空行分隔，自动跳过:\n"
+            printf "  顺序: Bot Token → 话题群 Chat ID\n"
+            printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID\n"
+            printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
+            printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
+        fi
+        printf "  ${C_YELLOW}输入隐藏；末行也需回车，收齐 5 行后核对；2–4 行连按两次回车；单独输入 q 放弃${C_RESET}\n>>> "
         _vals=(); _blank=0
         while [[ ${#_vals[@]} -lt 5 ]]; do
             if [[ -n $_first ]]; then _vline=$_first; _first=""
             elif ! read -rs _vline < /dev/tty; then
                 printf '\n'; msg_warn "输入已结束，未保存 TG 配置"; return 1
             fi
-            _vline="${_vline#"${_vline%%[![:space:]]*}"}"
-            _vline="${_vline%"${_vline##*[![:space:]]}"}"
+            _tg_clean_input_line _vline
             [[ ${_vline,,} != q ]] || { printf '\n'; msg_info "已放弃 TG 配置"; return 1; }
             if [[ -z "$_vline" ]]; then
                 # 已够主频道(≥2行) 时，连续两个空行结束；否则空行仅作分隔忽略
@@ -474,9 +488,14 @@ _tg_input_tokens() {
         _new_tok="${_vals[0]:-}" _hub="${_vals[1]:-}"
         _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
         printf '\n'
-        if [[ ! $_new_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ || ! $_hub =~ ^-?[0-9]+$ ||
-              ! $_th_ssh =~ ^[0-9]*$ || ! $_th_qt =~ ^[0-9]*$ || ! $_th_dd =~ ^[0-9]*$ ]]; then
-            printf "  ${C_RED}✗ Token、Chat ID 或话题 ID 格式不正确，请重新粘贴（q 放弃）${C_RESET}\n"; continue
+        _bad_field=""
+        if [[ ! $_new_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then _bad_field="第 1 行 Token"
+        elif [[ ! $_hub =~ ^-?[0-9]+$ ]]; then _bad_field="第 2 行 Chat ID"
+        elif [[ ! $_th_ssh =~ ^[0-9]*$ || ! $_th_qt =~ ^[0-9]*$ || ! $_th_dd =~ ^[0-9]*$ ]]; then
+            _bad_field="第 3–5 行话题 ID"
+        fi
+        if [[ -n $_bad_field ]]; then
+            printf "  ${C_RED}✗ %s 格式不正确，请从 Token 开始重新粘贴（q 放弃）${C_RESET}\n" "$_bad_field"; continue
         fi
         printf "  正在验证 Bot..."
         _resp=$(_tg_api "$_new_tok" getMe -s --max-time 8 2>/dev/null || true)
@@ -498,6 +517,7 @@ _tg_input_tokens() {
         printf "  ${C_YELLOW}确认写入？[y=写入 / r=重新粘贴 / q=放弃]: ${C_RESET}"
         while :; do
             read -r _cf < /dev/tty || _cf=q
+            _tg_clean_input_line _cf
             case "${_cf,,}" in
                 y|r) break ;;
                 q) printf "  ${C_YELLOW}⚠ 已放弃，未写入${C_RESET}\n"; return 1 ;;
@@ -2807,6 +2827,23 @@ _security_updates_menu() {
     esac
 }
 
+_install_dhcp_dns_hook() {
+    local dir=/etc/dhcp/dhclient-enter-hooks.d tmp
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "$dir/.vps-mgr-dns.XXXXXX") || return 1
+    if ! cat > "$tmp" <<'EOF'
+#!/bin/sh
+# 只跳过本脚本已锁定 DNS 的写入，不改 DHCP 地址、路由或续租流程。
+if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] &&
+    grep -qxF '# Managed by vps-mgr DNS' /etc/resolv.conf &&
+    lsattr -d /etc/resolv.conf 2>/dev/null | grep -qE '^[^[:space:]]*i'; then
+    make_resolv_conf() { :; }
+fi
+EOF
+    then rm -f "$tmp"; return 1; fi
+    chmod 644 "$tmp" && mv -T "$tmp" "$dir/zz-vps-mgr-dns" || { rm -f "$tmp"; return 1; }
+}
+
 _do_full_init() {
     check_system || return 1
     local _container=0 _ok_ipv6=0 _ok_tcping=0 _ok_update=0 _ok_swap=1 _ok_security=0
@@ -2839,7 +2876,7 @@ _do_full_init() {
         unzip zip tar gzip xz-utils jq gnupg gnupg2 lsb-release
         bc net-tools iproute2 iputils-ping "$_dns_pkg" vim nano htop tree lsof
         screen psmisc bsdmainutils nftables python3 util-linux logrotate
-        mtr iperf3 isc-dhcp-client conntrack procps systemd-timesyncd
+        mtr-tiny iperf3 isc-dhcp-client conntrack procps systemd-timesyncd
         socat netcat-openbsd fail2ban python3-systemd
     )
 
@@ -3102,6 +3139,7 @@ EOF
         ''|1) ;;
         *) msg_warn "无效选择，使用默认 Cloudflare DNS" ;;
     esac
+    _install_dhcp_dns_hook || { msg_error "DHCP DNS 保护安装失败，未修改 DNS"; return 1; }
     # 若 /etc/resolv.conf 是符号链接（systemd-resolved 系统），先删除再创建真实文件
     # 否则 chattr +i 对 tmpfs 目标静默失败，重启后 DNS 被 systemd-resolved 覆盖
     if [ -L /etc/resolv.conf ]; then
@@ -3109,7 +3147,7 @@ EOF
     fi
     if [ -f /etc/resolv.conf ] || [ ! -e /etc/resolv.conf ]; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
-        if ! printf 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' \
+        if ! printf '# Managed by vps-mgr DNS\nnameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' \
             "$_dns_primary" "$_dns_secondary" > /etc/resolv.conf; then
             msg_error "DNS 写入失败，请检查 /etc/resolv.conf 权限"; return 1
         fi
@@ -3197,8 +3235,7 @@ EOF
             echo -ne "  是否现在配置 TG 推送？[Y/n，可直接粘贴配置，输入隐藏]: "
             if ! read -rs _tg_ans < /dev/tty; then printf '\n'; msg_warn "未读取到输入，跳过 TG 配置"; break; fi
             printf '\n'
-            _tg_ans="${_tg_ans#"${_tg_ans%%[![:space:]]*}"}"
-            _tg_ans="${_tg_ans%"${_tg_ans##*[![:space:]]}"}"
+            _tg_clean_input_line _tg_ans
             case "$_tg_ans" in
                 ""|[Yy]|[Yy][Ee][Ss]) _tg_input_tokens "$_init_srv_name" && _ok_tg=1 || true; break ;;
                 [Nn]|[Nn][Oo]|[Qq]) echo -e "  ${YELLOW}⚠ 跳过（可后续从选项 3 配置）${NC}"; break ;;

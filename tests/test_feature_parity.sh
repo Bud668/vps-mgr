@@ -195,7 +195,7 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
 assert test "$(declare -f _do_full_init | grep -c '_confirm_reboot')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps cf google blank invalid timeout unlocked dns_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail tg_direct tg_skip tg_eof tg_existing tg_existing_fail; do
+for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hook_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail tg_direct tg_skip tg_eof tg_existing tg_existing_fail; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
@@ -208,7 +208,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
     show_spinner() { :; }
     apt-get() { record "apt-get $*"; [[ $environment != kernel_fail || $* != *linux-xanmod* ]]; }
     apt-cache() { :; }
-    dpkg-query() { printf 'install ok installed'; }
+    dpkg-query() { record "package ${*: -1}"; printf 'install ok installed'; }
     _write_disable_ipv6_conf() { record ipv6; [[ $environment != container ]]; }
     _exim_ipv6_compat() { :; }
     get_public_ip() { echo 192.0.2.1; }
@@ -280,7 +280,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
     fi
     if [[ $environment == dns_fail ]]; then
         printf() {
-            [[ $1 != 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' ]] || return 1
+            [[ $1 != '# Managed by vps-mgr DNS\nnameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' ]] || return 1
             builtin printf "$@"
         }
         if do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1; then
@@ -290,7 +290,22 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
         if grep -qx firewall "$test_dir/calls"; then echo 'Initialization continued after DNS failure'; exit 1; fi
         exit 0
     fi
+    if [[ $environment == dns_hook_fail ]]; then
+        mv "$test_dir/etc/resolv.conf" "$test_dir/resolver-target"
+        ln -s "$test_dir/resolver-target" "$test_dir/etc/resolv.conf"
+        _install_dhcp_dns_hook() { return 1; }
+        if do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1; then
+            echo 'Failed DHCP hook installation reported success'; exit 1
+        fi
+        assert test -L "$test_dir/etc/resolv.conf"
+        assert test "$(cat "$test_dir/resolver-target")" = 'nameserver 192.0.2.53'
+        assert grep -q 'DHCP DNS 保护安装失败，未修改 DNS' "$test_dir/init-$environment.log"
+        rm "$test_dir/etc/resolv.conf"
+        exit 0
+    fi
     do_quick_init </dev/null > "$test_dir/init-$environment.log" 2>&1
+    assert grep -qx 'package mtr-tiny' "$test_dir/calls"
+    if grep -qx 'package mtr' "$test_dir/calls"; then echo 'GUI mtr dependency requested'; exit 1; fi
     if [[ $environment == container ]]; then
         assert test "$(cat "$test_dir/etc/resolv.conf")" = 'nameserver 192.0.2.53'
         if grep -qx dns "$test_dir/calls"; then echo 'Managed container DNS prompted'; exit 1; fi
@@ -299,12 +314,13 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail contain
         assert grep -Fq '[1] Cloudflare  1.1.1.1 / 1.0.0.1（默认）' "$test_dir/init-$environment.log"
         assert grep -Fq '[2] Google      8.8.8.8 / 8.8.4.4' "$test_dir/init-$environment.log"
         dns_provider=Cloudflare
-        dns_expected=$'nameserver 1.1.1.1\nnameserver 1.0.0.1\noptions timeout:2 attempts:2'
+        dns_expected=$'# Managed by vps-mgr DNS\nnameserver 1.1.1.1\nnameserver 1.0.0.1\noptions timeout:2 attempts:2'
         if [[ $environment == google ]]; then
             dns_provider=Google
-            dns_expected=$'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions timeout:2 attempts:2'
+            dns_expected=$'# Managed by vps-mgr DNS\nnameserver 8.8.8.8\nnameserver 8.8.4.4\noptions timeout:2 attempts:2'
         fi
         assert test "$(cat "$test_dir/etc/resolv.conf")" = "$dns_expected"
+        assert test -f "$test_dir/etc/dhcp/dhclient-enter-hooks.d/zz-vps-mgr-dns"
         if [[ $environment == invalid ]]; then
             assert grep -q '无效选择，使用默认 Cloudflare DNS' "$test_dir/init-$environment.log"
         fi
