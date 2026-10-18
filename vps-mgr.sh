@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.13"
+readonly SCRIPT_VERSION="2.0.0-beta.14"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -84,7 +84,8 @@ readonly C_RESET='\033[0m'
 readonly C_RED='\033[1;31m'
 readonly C_GREEN='\033[1;32m'
 readonly C_YELLOW='\033[1;33m'
-readonly C_BLUE='\033[1;34m'
+# 保留旧颜色变量名，原蓝色标题/提示统一用黑底更清楚的亮青色。
+readonly C_BLUE='\033[1;96m'
 readonly C_PURPLE='\033[1;35m'
 readonly C_CYAN='\033[1;36m'
 readonly C_WHITE='\033[1;37m'
@@ -1253,7 +1254,7 @@ _fw_rollback_locked() {
 }
 
 _fw_show_status() {
-    local fw_json policy rules ssh paused color port ssh_color ssh_mark ssh_current cn
+    local fw_json policy rules ssh paused color port ssh_color ssh_mark ssh_current ssh_sep="" cn
     if ! command -v nft >/dev/null; then
         printf '   nftables 未安装（菜单 1 初始化）\n'
     elif ! command -v jq >/dev/null; then
@@ -1269,36 +1270,37 @@ _fw_show_status() {
              ports("ssh_ports"), ports("paused_ports")] | @tsv
         ' <<< "$fw_json")
         color=$C_GREEN; [[ $policy == DROP ]] || color=$C_RED
-        printf '   %b防火墙%b  nftables %b运行中%b   策略 %b%s%b   规则 %s条\n' \
-            "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET" "$color" "$policy" "$C_RESET" "$rules"
+        printf '   %b防火墙%b    nftables %b运行中%b · 策略 %b%s%b · %s 条规则\n' \
+            "$C_WHITE" "$C_RESET" "$C_GREEN" "$C_RESET" "$color" "$policy" "$C_RESET" "$rules"
         if [[ -e "$FW_PENDING" ]]; then
-            printf '   %b初始化未完成，回滚保护中（菜单 5 → 1 重试）%b\n' "$C_YELLOW" "$C_RESET"
+            printf '   %b持久化%b    %b初始化未完成，回滚保护中（菜单 5 → 1 重试）%b\n' "$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
         elif [[ -s "$FW_CONF" ]] && systemctl is-enabled --quiet "$FW_SERVICE.service"; then
-            printf '   %b持久化%b  %b已保存 · 开机恢复已启用%b\n' "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET"
+            printf '   %b持久化%b    %b已保存 · 开机恢复已启用%b\n' "$C_WHITE" "$C_RESET" "$C_GREEN" "$C_RESET"
         else
-            printf '   %b仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）%b\n' "$C_YELLOW" "$C_RESET"
+            printf '   %b持久化%b    %b仅运行时生效，开机恢复未就绪（菜单 5 → 1 修复）%b\n' "$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
         fi
+        cn=$(jq -r '[.nftables[].set? | select(.name=="cn_ports") | .elem[]? | tostring] | join(",")' <<< "$fw_json")
+        if [[ -n $cn ]]; then
+            printf '   %b防护%b      CN 屏蔽 %b已开启 [%s]%b' "$C_WHITE" "$C_RESET" "$C_GREEN" "$cn" "$C_RESET"
+        else
+            printf '   %b防护%b      CN 屏蔽 %b已关闭%b' "$C_WHITE" "$C_RESET" "$C_DIM" "$C_RESET"
+        fi
+        printf ' · 域名 ACL %b\n' "$(_sbx_acl_status)"
         ssh_current=$(get_current_ssh_port) || ssh_current=""
         [[ -n $ssh_current ]] || ssh_current=$ssh
-        printf '   %b端  口%b' "$C_BLUE" "$C_RESET"
+        printf '   %bSSH%b       ' "$C_WHITE" "$C_RESET"
         for port in ${ssh_current//,/ }; do
             ssh_color=$C_RED; ssh_mark=○
             if [[ $port != - && ( $policy == ACCEPT || ,$ssh, == *,"$port",* ) ]]; then
                 ssh_color=$C_GREEN; ssh_mark=●
             fi
-            printf '   %b%s SSH:%s%b' "$ssh_color" "$ssh_mark" "$port" "$C_RESET"
+            printf '%s%b%s %s%b' "$ssh_sep" "$ssh_color" "$ssh_mark" "$port" "$C_RESET"
+            ssh_sep="  "
         done
         printf '\n'
         _fw_port_summary "$fw_json" "$ssh_current"
-        [[ $policy != ACCEPT ]] || printf '          %b默认放行（ACCEPT；封禁/ACL 仍有效）%b\n' "$C_YELLOW" "$C_RESET"
-        [[ $paused == - ]] || printf '   %b已暂停%b  %s\n' "$C_YELLOW" "$C_RESET" "$paused"
-        cn=$(jq -r '[.nftables[].set? | select(.name=="cn_ports") | .elem[]? | tostring] | join(",")' <<< "$fw_json")
-        if [[ -n $cn ]]; then
-            printf '   %b防护%b     CN 屏蔽 %b已开启 [%s]%b' "$C_BLUE" "$C_RESET" "$C_GREEN" "$cn" "$C_RESET"
-        else
-            printf '   %b防护%b     CN 屏蔽 %b已关闭%b' "$C_BLUE" "$C_RESET" "$C_DIM" "$C_RESET"
-        fi
-        printf '   域名 ACL %b\n' "$(_sbx_acl_status)"
+        [[ $policy != ACCEPT ]] || printf '             %b默认放行（ACCEPT；封禁/ACL 仍有效）%b\n' "$C_YELLOW" "$C_RESET"
+        [[ $paused == - ]] || printf '   %b已暂停%b    %s\n' "$C_YELLOW" "$C_RESET" "$paused"
     elif [[ -s "$FW_CONF" ]]; then
         printf '   已有保存配置，但规则未加载（菜单 5 → 1 恢复，不必重跑整套初始化）\n'
     else
@@ -1308,22 +1310,26 @@ _fw_show_status() {
 }
 
 _fw_port_summary() {
-    local port proto note token proto_color width=${COLUMNS:-80} used=10 col=0
+    local port proto note token token_width proto_color width=${COLUMNS:-80} used=13 col=0
     [[ $width =~ ^[0-9]+$ ]] || width=80
     (( width >= 48 )) || width=48
     (( width <= 120 )) || width=120
+    printf '   %b开放端口%b  ' "$C_WHITE" "$C_RESET"
     while IFS=$'\t' read -r port proto note; do
         token="${port}(${proto})${note:+[$note]}"
-        if (( col == 0 )); then printf '          '
-        elif (( col == 4 || used + ${#token} + 2 > width )); then printf '\n          '; used=10; col=0
-        else printf '  '; used=$((used + 2)); fi
+        token_width=${#token}
+        [[ $note != *测试* ]] || token_width=$((token_width + 2))
+        if (( col > 0 )); then
+            if (( col == 4 || used + token_width + 2 > width )); then printf '\n             '; used=13; col=0
+            else printf '  '; used=$((used + 2)); fi
+        fi
         case $proto in
             t) proto_color="${C_CYAN}t" ;;
             u) proto_color="${C_PURPLE}u" ;;
             t/u) proto_color="${C_CYAN}t${C_WHITE}/${C_PURPLE}u" ;;
         esac
         printf '%b%s%b(%b%b)%b%s%b' "$C_GREEN" "$port" "$C_WHITE" "$proto_color" "$C_WHITE" "$C_DIM" "${note:+[$note]}" "$C_RESET"
-        used=$((used + ${#token}))
+        used=$((used + token_width))
         col=$((col + 1))
     done < <(jq -r --arg ssh "${2:-}" '
         [.nftables[].set? | select(.name == "ssh_ports" or .name == "tcp_ports" or .name == "udp_ports" or
@@ -1334,7 +1340,8 @@ _fw_port_summary() {
         sort_by(.port) | group_by(.port)[] | .[0].port as $port |
         select(($ssh | split(",") | index($port | tostring)) == null) |
         [$port, ([.[].proto]|unique|join("/")), ([.[].note|select(.!="")]|unique|join("+"))] | @tsv' <<< "$1")
-    (( col == 0 )) || printf '\n'
+    (( col > 0 )) || printf '%b无额外放行%b' "$C_DIM" "$C_RESET"
+    printf '\n'
     return 0
 }
 
@@ -8146,9 +8153,8 @@ show_menu() {
         printf "   Realm Forwarding : [-]\n"
     fi
 
-    # ---------- 防火墙状态 ----------
-    printf "${C_BLUE}:: 防火墙 & 内核 ::${C_RESET}\n"
-    _fw_show_status
+    # ---------- 内核、网络与防火墙状态 ----------
+    printf "${C_BLUE}:: 内核 & 防火墙 ::${C_RESET}\n"
     local bbr_label bbr_color
     bbr_label=$(_get_bbr_version)
     case "$bbr_label" in
@@ -8156,15 +8162,16 @@ show_menu() {
         v1) bbr_label='BBR v1'; bbr_color=$C_YELLOW ;;
         *) bbr_label='BBR 不可用'; bbr_color=$C_DIM ;;
     esac
-    printf '   %b内  核%b  %b%s%b   %b%s%b\n' \
-        "$C_BLUE" "$C_RESET" "$C_CYAN" "$(uname -r)" "$C_RESET" "$bbr_color" "$bbr_label" "$C_RESET"
+    printf '   %b内核%b      %b%s%b   %b%s%b\n' \
+        "$C_WHITE" "$C_RESET" "$C_CYAN" "$(uname -r)" "$C_RESET" "$bbr_color" "$bbr_label" "$C_RESET"
     local ipv6_state
     ipv6_state=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) || ipv6_state=unknown
     case "$ipv6_state" in
-        1) printf '   %bIPv6%b    %b已禁用%b\n' "$C_BLUE" "$C_RESET" "$C_GREEN" "$C_RESET" ;;
-        0) printf '   %bIPv6%b    %b已开启%b（菜单 6 → 3 切换）\n' "$C_BLUE" "$C_RESET" "$C_YELLOW" "$C_RESET" ;;
-        *) printf '   %bIPv6%b    无法读取 / 内核不支持\n' "$C_BLUE" "$C_RESET" ;;
+        1) printf '   %bIPv6%b      %b已禁用%b\n' "$C_WHITE" "$C_RESET" "$C_GREEN" "$C_RESET" ;;
+        0) printf '   %bIPv6%b      %b已开启%b（菜单 6 → 3 切换）\n' "$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET" ;;
+        *) printf '   %bIPv6%b      无法读取 / 内核不支持\n' "$C_WHITE" "$C_RESET" ;;
     esac
+    _fw_show_status
 
     local connection_stats
     connection_stats=$(get_connection_stats)
@@ -8172,12 +8179,12 @@ show_menu() {
     local conn_details=${connection_stats#*:}
     
     if [[ $total_conns -gt 0 ]]; then
-        printf "   ${C_BLUE}代理连接${C_RESET}  ${C_GREEN}%d${C_RESET} (TCP)\n" "$total_conns"
+        printf "   ${C_WHITE}代理连接${C_RESET}  ${C_GREEN}%d${C_RESET} (TCP)\n" "$total_conns"
         if [[ -n "$conn_details" ]]; then
-            printf "   ${C_YELLOW}详情: %s${C_RESET}\n" "$conn_details"
+            printf "   ${C_WHITE}连接详情${C_RESET}  ${C_YELLOW}%s${C_RESET}\n" "$conn_details"
         fi
     else
-        printf "   ${C_BLUE}代理连接${C_RESET}  ${C_DIM}0 (TCP)${C_RESET}\n"
+        printf "   ${C_WHITE}代理连接${C_RESET}  ${C_DIM}0 (TCP)${C_RESET}\n"
     fi
     if find "$SNELL_CONFIG_DIR" -name "snell-[0-9]*.conf" -type f -print -quit 2>/dev/null | grep -q .; then
         local short_suffix

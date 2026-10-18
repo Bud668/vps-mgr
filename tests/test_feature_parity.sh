@@ -31,6 +31,38 @@ _realm_safe_restart() { :; }
 _quota_tg_notify() { :; }
 chown() { :; }
 
+# Main-menu layout stays readable on black terminals without touching live services.
+(
+    clear() { :; }
+    systemctl() { return 1; }
+    check_service_status() { printf '[-]\n'; }
+    get_installed_version() { printf '%s\n' '-'; }
+    get_cached_latest_version() { :; }
+    _get_bbr_version() { printf 'v1\n'; }
+    uname() { printf '6.12.107+deb13-cloud-amd64\n'; }
+    sysctl() { printf '1\n'; }
+    _fw_show_status() { printf 'FIREWALL_STATUS\n'; }
+    _fw_test_deadline() { return 1; }
+    get_connection_stats() { printf '0:\n'; }
+    output=$(show_menu)
+    [[ $output == *$'\033[1;96m:: 内核 & 防火墙 ::'* && $output != *$'\033[1;34m'* ]] || {
+        echo 'FAIL: dark-blue title remains'; exit 1;
+    }
+    [[ $output == *$'\033[1;37m内核'* && $output == *$'\033[1;37m代理连接'* ]] || {
+        echo 'FAIL: dashboard labels are not bright white'; exit 1;
+    }
+    plain=$(sed -E 's/\x1B\[[0-9;]*m//g' <<< "$output")
+    [[ $plain == *'内核      6.12.107+deb13-cloud-amd64   BBR v1'*'IPv6      已禁用'*'FIREWALL_STATUS'*'代理连接  0 (TCP)'* ]] || {
+        echo 'FAIL: kernel/firewall/connection display order'; exit 1;
+    }
+    sysctl() { printf '0\n'; }
+    get_connection_stats() { printf '3:443=3\n'; }
+    plain=$(show_menu | sed -E 's/\x1B\[[0-9;]*m//g')
+    [[ $plain == *'IPv6      已开启'*'代理连接  3 (TCP)'*'连接详情  443=3'* ]] || {
+        echo 'FAIL: enabled IPv6 or connection details missing'; exit 1;
+    }
+)
+
 # Client names keep country flags and distinct protocol/port suffixes.
 printf 'S_METHOD=2022-blake3-aes-256-gcm\n' > "$SBX_ST/ss-24073.env"
 printf 'SERVER_NAME=Chi_ATT\n' > "$TG_CONF"

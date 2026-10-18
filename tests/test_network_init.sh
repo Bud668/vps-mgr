@@ -103,25 +103,29 @@ done
         {"set":{"name":"test_tcp","elem":[{"elem":{"val":5201,"expires":3600}}]}},
         {"set":{"name":"test_udp","elem":[{"elem":{"val":5201,"expires":3600}}]}}]}'
     output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-    [[ $output == *'端  口   ● SSH:26680'* ]] || { echo 'FAIL: SSH port row missing'; exit 1; }
+    [[ $output == *'防火墙'*'持久化'*'防护'*'SSH       ● 26680'*'开放端口'* ]] || { echo 'FAIL: firewall rows out of order'; exit 1; }
     for token in '2222(t)' '9999(t)[TCPing]' '5201(t/u)[测试]' '24073(t/u)' '24074(u)'; do
         [[ $output == *"$token"* ]] || { echo "FAIL: dashboard port $token"; exit 1; }
     done
     assert_eq 1 "$(grep -oF '9999(t)' <<< "$output" | wc -l)" 'monitor port deduplicated'
-    assert_eq 3 "$(grep -c '^          [0-9]' <<< "$output")" 'at most four ports per line'
+    assert_eq 3 "$(grep -Ec '^   开放端口  |^             [0-9]' <<< "$output")" 'at most four ports per line'
     COLUMNS=48
     output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-    [[ $(grep -c '^          [0-9]' <<< "$output") -gt 3 ]] || { echo 'FAIL: narrow dashboard does not wrap'; exit 1; }
+    [[ $(grep -Ec '^   开放端口  |^             [0-9]' <<< "$output") -gt 3 ]] || { echo 'FAIL: narrow dashboard does not wrap'; exit 1; }
+    python3 -c 'import sys, unicodedata
+for line in sys.stdin:
+    if line.startswith(("   开放端口  ", "             ")):
+        assert sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line.rstrip("\n")) <= 48, line' <<< "$output"
     get_current_ssh_port() { echo 26680,26682; }
     output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-    [[ $output == *'● SSH:26680'*'○ SSH:26682'* ]] || { echo 'FAIL: blocked SSH falsely shown open'; exit 1; }
+    [[ $output == *'● 26680'*'○ 26682'* ]] || { echo 'FAIL: blocked SSH falsely shown open'; exit 1; }
     dashboard_rules=$(jq '.nftables[0].chain.policy="accept"' <<< "$dashboard_rules")
     output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-    [[ $output == *'● SSH:26682'*'默认放行（ACCEPT；封禁/ACL 仍有效）'* ]] || exit 1
+    [[ $output == *'● 26682'*'默认放行（ACCEPT；封禁/ACL 仍有效）'* ]] || exit 1
     dashboard_rules='{"nftables":[{"chain":{"name":"input","policy":"drop"}},{"set":{"name":"ssh_ports","elem":[26680]}}]}'
     get_current_ssh_port() { echo 26680; }
     output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-    [[ $output == *'端  口   ● SSH:26680'* ]] || { echo 'FAIL: no proxy hides port row'; exit 1; }
+    [[ $output == *'SSH       ● 26680'*'开放端口  无额外放行'* ]] || { echo 'FAIL: empty port row missing'; exit 1; }
 )
 # One entry, no mode question: containers also reach the shared full workflow.
 (

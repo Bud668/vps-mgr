@@ -58,7 +58,7 @@ assert test ! -e "$test_dir/timer"
 assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 [[ $(_fw_show_status) == *开机恢复已启用* ]] || exit 1
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
-[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'端  口   ● SSH:22'* ]] || exit 1
+[[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH       ● 22'*'开放端口  无额外放行'* ]] || exit 1
 [[ $status != *TCP* && $status != *UDP* && $status != *已暂停* && $status != *ssh_ports* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
 # Repair a beta.1 interruption/disabled boot unit without replacing live rules.

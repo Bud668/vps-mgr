@@ -9,9 +9,17 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.13-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.14-orange)
 
 </div>
+
+---
+
+## beta.14：黑底终端配色与状态栏整理
+
+原蓝色标题和提示统一换成亮青色，状态标签使用亮白色。首页按「内核 / BBR → IPv6 → 防火墙 → 持久化 → 防护 → SSH → 开放端口 → 代理连接」排序并统一对齐，SSH 和其他端口独立成行。端口保持 TCP/UDP 合并、去重和自动换行，窄屏换行计入中文标记宽度；没有额外端口时明确显示「无额外放行」。
+
+仅调整界面显示，不改内核安装、BBR 识别、防火墙规则或代理配置，保留 beta.13 的全部功能。已有 beta 测试机在原路径替换脚本并重新打开菜单即可，无需重跑初始化或为界面更新重启。
 
 ---
 
@@ -87,21 +95,21 @@ beta.10 在 beta.9 基础上包含以下 10 项修复与优化，均保留在当
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.13 预发布测试版**，新增 Realm / sing-box 每日版本提醒和独立更新话题，TG 配置扩展为 6 项，保留 beta.12 的粘贴自动验证、接收进度及全部修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.14 预发布测试版**，优化黑底终端配色和首页状态栏排序、对齐及端口显示，保留 beta.13 的 Realm / sing-box 每日版本提醒、独立更新话题、TG 6 项粘贴配置及全部修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.13/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.14/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.13。发布页：[v2.0.0-beta.13](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.13)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.14。发布页：[v2.0.0-beta.14](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.14)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
 请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
 
-已完成 beta.5–beta.12 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本即生效 TG 输入修复，已有 TG 配置保持不变；如需代理版本 TG 提醒，请在菜单 3 → 1 重新粘贴原配置并追加第 6 项更新话题 ID，并确认菜单 16 → 6 的每日任务已开启。但替换脚本不会自动更换 `mtr` 或安装 DHCP DNS 保护，这两项用于新系统初始化，也不会自动调整已有 Swap、内核或安全补丁策略。新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 beta.9 起的 Token 传递修复。
+已完成 beta.5–beta.13 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。重新打开脚本即可看到新版界面并应用 TG 输入修复，已有 TG 配置保持不变；如需代理版本 TG 提醒，请在菜单 3 → 1 重新粘贴原配置并追加第 6 项更新话题 ID，并确认菜单 16 → 6 的每日任务已开启。但替换脚本不会自动更换 `mtr` 或安装 DHCP DNS 保护，这两项用于新系统初始化，也不会自动调整已有 Swap、内核或安全补丁策略。新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 beta.9 起的 Token 传递修复。
 
 已完成 beta.4 初始化的测试机不必重装或重跑菜单 1：备份并在原路径替换脚本、验证语法后，执行 `systemctl restart vps-mgr-fq.service` 即可应用 beta.5 起包含的 fq 修复，沿用原先配置的速率，无需重启服务器。首次打开菜单缺少 jq/nftables 时只提示安装依赖，不再提前调用未安装的命令；完整依赖仍由菜单 1 安装。
 
@@ -222,7 +230,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 菜单 5 → 9 重建本脚本基础链为 DROP，保留业务端口集合、ACL、配额计数和暂停状态；不会清空整个 ruleset
 - 按链和 nftables `handle` 删除规则，或按端口清理专用集合、ACL 和配额；当前 SSH 规则/监听端口受保护。批量清理只处理精确单端口匹配，范围/多端口规则需用 handle 审阅处理
 - 菜单 5 → 10 管理防火墙 SSH 放行端口，不修改 sshd 本身；菜单 5 → 7 提供静态拦截、实时拦截、实时完整内核日志
-- 详细规则带包/字节计数；首页沿用老版 `● SSH:端口`、`端口(t/u)` 样式，TCP/UDP 合并、每行最多 4 项并按终端宽度换行；未安装代理也保留 SSH 端口行，TCPing/测试端口、暂停、CN 和域名 ACL 标记保留
+- 详细规则带包/字节计数；首页 SSH 与开放端口分行显示，保留 `●/○` SSH 放行状态及 `端口(t/u)` 样式，TCP/UDP 合并、每行最多 4 项并按终端宽度换行；未安装代理也保留 SSH 端口行，没有额外端口时显示「无额外放行」，TCPing/测试端口、暂停、CN 和域名 ACL 标记保留
 
 **首次初始化遇到其他防火墙规则或管理服务时，拒绝操作并原样保留，不清空、不停用。**读取状态失败也中止。已保存的本脚本配置可独立恢复，其他表仍保留；开放模式不等于清空整机规则。不支持接管 Docker、Kubernetes 或已有路由/NAT 主机；Realm 是用户态代理，不能把它等同于内核 FORWARD。
 
