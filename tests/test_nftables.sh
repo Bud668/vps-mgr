@@ -161,11 +161,18 @@ read -r socks6 _ < <(quota_get_port_bytes 24074)
 assert test "$socks6" -gt "$socks4"
 _fw_element add tcping_ports 24076
 nsenter -t "$peer_pid" -n python3 -c 'import socket
-for port in (22,24076):
-    s=socket.socket(); s.settimeout(0.3)
-    try: s.connect(("192.0.2.1",port))
-    except OSError: pass
-    s.close()'
+s=socket.socket(); s.settimeout(0.3)
+try: s.connect(("192.0.2.1",22))
+except OSError: pass
+s.close()
+for family, address in ((socket.AF_INET,"192.0.2.1"),(socket.AF_INET6,"2001:db8::1")):
+    connections=[]
+    for index in range(4):
+        s=socket.socket(family); s.settimeout(0.3); connections.append(s)
+        try: s.connect((address,24076))
+        except TimeoutError: assert index == 3, "TCPing blocked an allowed connection"
+        else: assert index < 3, "TCPing connection limit bypassed"
+    for s in connections: s.close()'
 # Sourced above; the later definition only injects a persistence failure.
 # shellcheck disable=SC2218
 _fw_persist
@@ -204,6 +211,10 @@ assert test "$(nft -j list chain inet "$FW_TABLE" input | jq -r '.nftables[].cha
 _fw_set_policy drop
 _fw_element add cn_ports 24073
 _fw_rebuild </dev/null
+_fw_rebuild </dev/null
+for limiter in ssh_rate4 ssh_rate6 tcping4 tcping6; do
+    assert nft list set inet "$FW_TABLE" "$limiter" >/dev/null
+done
 assert test "$(quota_get_port_bytes 24073)" = "$before"
 assert _fw_has_element cn_ports 24073
 assert _fw_has_element tcping_ports 24076

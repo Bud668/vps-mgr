@@ -937,6 +937,10 @@ table inet $FW_TABLE {
     set paused_ports { type inet_service; }
     set cn_ports { type inet_service; }
     set tcping_ports { type inet_service; }
+    set ssh_rate4 { type ipv4_addr; size 65535; flags dynamic,timeout; }
+    set ssh_rate6 { type ipv6_addr; size 65535; flags dynamic,timeout; }
+    set tcping4 { type ipv4_addr; size 65535; flags dynamic; }
+    set tcping6 { type ipv6_addr; size 65535; flags dynamic; }
     set ssh_allow4 { type ipv4_addr; flags interval; auto-merge; }
     set ssh_allow6 { type ipv6_addr; flags interval; auto-merge; }
     set allow4 { type ipv4_addr; flags interval; auto-merge; }
@@ -967,11 +971,11 @@ table inet $FW_TABLE {
         tcp dport 5201 tcp dport != @test_tcp tcp dport != @tcp_ports counter drop
         udp dport 5201 udp dport != @test_udp udp dport != @udp_ports counter drop
         ct state established,related counter accept
-        tcp dport @ssh_ports ct state new meter ssh_rate4 { ip saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
-        tcp dport @ssh_ports ct state new meter ssh_rate6 { ip6 saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
+        tcp dport @ssh_ports ct state new update @ssh_rate4 { ip saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
+        tcp dport @ssh_ports ct state new update @ssh_rate6 { ip6 saddr timeout 1m limit rate over 15/minute burst 15 packets } counter jump ssh_brute
         tcp dport @ssh_ports counter accept
-        tcp dport @tcping_ports ct state new meter tcping4 { ip saddr ct count over 3 } counter drop
-        tcp dport @tcping_ports ct state new meter tcping6 { ip6 saddr ct count over 3 } counter drop
+        tcp dport @tcping_ports ct state new add @tcping4 { ip saddr ct count over 3 } counter drop
+        tcp dport @tcping_ports ct state new add @tcping6 { ip6 saddr ct count over 3 } counter drop
         tcp dport @tcping_ports counter accept
         tcp dport @tcp_ports counter accept
         udp dport @udp_ports counter accept
@@ -1191,6 +1195,7 @@ _fw_rebuild_locked() {
                 printf 'flush chain inet %s %s\n' "$FW_TABLE" "$chain"
             fi
         done
+        # Named dynamic sets can be reused; inline meters collide on nft 1.0.x.
         _fw_base_rules "$ports"
     } | _fw_apply || return 1
     msg_success "基础策略已重建为安全模式；业务端口、黑白名单、ACL、配额与其他表均保留"
