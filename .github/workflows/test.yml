@@ -25,7 +25,7 @@ jobs:
         run: |
           bash -n vps-mgr.sh
           shellcheck -S error vps-mgr.sh tests/*.sh
-          for test in get_node_id safety feature_parity ipv6 network_init audit_fixes security_updates runtime_fixes dns_dhcp; do
+          for test in get_node_id safety feature_parity ipv6 network_init audit_fixes security_updates proxy_updates runtime_fixes dns_dhcp; do
             bash "tests/test_${test}.sh"
           done
 

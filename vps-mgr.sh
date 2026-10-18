@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0-beta.12"
+readonly SCRIPT_VERSION="2.0.0-beta.13"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -223,7 +223,8 @@ get_node_id() {
 get_latest_github_release() {
     local latest fallback=${2:-}
     latest=$(curl -fsSL --connect-timeout 5 --max-time 15 --retry 1 \
-        "https://api.github.com/repos/$1/releases/latest" | jq -er '.tag_name' 2>/dev/null) || latest=""
+        "https://api.github.com/repos/$1/releases/latest" |
+        jq -er 'select(.draft == false and .prerelease == false) | .tag_name' 2>/dev/null) || latest=""
     if [[ $latest =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ ]]; then
         printf '%s\n' "$latest"; return
     fi
@@ -392,8 +393,7 @@ _cf_curl() {
 }
 
 # 解析通知通道，设置 TG_BOT_TOKEN / TG_CHAT_ID / TG_THREAD_ID
-# $1 = monitor | quota | ddns —— 三者共用话题群(TG_CHAT_HUB)，各占一个话题
-# 三个通道共用话题群(TG_CHAT_HUB)，各占一个话题
+# $1 = ssh | quota | ddns | update —— 共用话题群(TG_CHAT_HUB)，各占一个话题。
 _tg_resolve_channel() {
     local _key
     TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_THREAD_ID=""
@@ -401,6 +401,7 @@ _tg_resolve_channel() {
         ssh)     _key=TG_THREAD_SSH     ;;
         quota)   _key=TG_THREAD_QUOTA   ;;
         ddns)    _key=TG_THREAD_DDNS    ;;
+        update)  _key=TG_THREAD_UPDATE  ;;
         *)       return 0 ;;
     esac
     TG_BOT_TOKEN=$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)
@@ -415,26 +416,26 @@ _tg_config_valid() {
     hub=$(_tg_cfg_get "$TG_CONF" TG_CHAT_HUB)
     [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ && $hub =~ ^-?[0-9]+$ &&
        $(_tg_cfg_get "$TG_CONF" TG_CHAT_ID) == "$hub" ]] || return 1
-    for key in TG_THREAD_SSH TG_THREAD_QUOTA TG_THREAD_DDNS; do
+    for key in TG_THREAD_SSH TG_THREAD_QUOTA TG_THREAD_DDNS TG_THREAD_UPDATE; do
         thread=$(_tg_cfg_get "$TG_CONF" "$key")
         [[ $thread =~ ^[0-9]*$ ]] || return 1
     done
 }
 
-# 写入统一 TG 配置：话题群 + SSH/配额/DDNS 三个话题ID
+# 写入统一 TG 配置：话题群 + SSH/配额/DDNS/程序更新四个话题ID
 # 全部通知统一发到话题群，各占一个话题。TG_CHAT_ID 保留并等于话题群 ID：
 # SSH 监控脚本沿用它作 chat_id，配合 TG_THREAD_SSH 投递到 SSH 话题。
 _write_tg_conf() {
     local _tok="$1" _hub="$2" _srv="$3"
-    local _th_ssh="${4:-}" _th_qt="${5:-}" _th_dd="${6:-}"
+    local _th_ssh="${4:-}" _th_qt="${5:-}" _th_dd="${6:-}" _th_up="${7:-}"
     [[ $_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ && $_hub =~ ^-?[0-9]+$ &&
-       $_th_ssh =~ ^[0-9]*$ && $_th_qt =~ ^[0-9]*$ && $_th_dd =~ ^[0-9]*$ &&
+       $_th_ssh =~ ^[0-9]*$ && $_th_qt =~ ^[0-9]*$ && $_th_dd =~ ^[0-9]*$ && $_th_up =~ ^[0-9]*$ &&
        $_srv != *$'\n'* && $_srv != *$'\r'* ]] || { msg_error "TG 配置格式无效"; return 1; }
     local tmp; tmp=$(mktemp "$(dirname "$TG_CONF")/.tg-conf.XXXXXX") || return 1
     {
         printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='%s'\nTG_CHAT_HUB='%s'\n" "$_tok" "$_hub" "$_hub" &&
         printf 'SERVER_NAME="%s"\n' "$_srv" &&
-        printf "TG_THREAD_SSH='%s'\nTG_THREAD_QUOTA='%s'\nTG_THREAD_DDNS='%s'\n" "$_th_ssh" "$_th_qt" "$_th_dd"
+        printf "TG_THREAD_SSH='%s'\nTG_THREAD_QUOTA='%s'\nTG_THREAD_DDNS='%s'\nTG_THREAD_UPDATE='%s'\n" "$_th_ssh" "$_th_qt" "$_th_dd" "$_th_up"
     } > "$tmp" || { rm -f "$tmp"; return 1; }
     chmod 600 "$tmp" && mv "$tmp" "$TG_CONF" || { rm -f "$tmp"; return 1; }
     _tg_permissions
@@ -496,10 +497,10 @@ _tg_pending_input_empty() {
 
 _tg_input_tokens() (
     local _srv="${1:-}" _first="${2:-}" _failed=0
-    local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd
+    local _vals _vline _blank _new_tok _hub _th_ssh _th_qt _th_dd _th_up
     local _resp _bot _gf _cf _bad_field
     local _tty_fd _tty_state="" _pasting=0 _paste_end=0 _auto=0 _burst=0 _cancel=0
-    local -a _fields=(Token 'Chat ID' 'SSH 话题' '配额话题' 'DDNS 话题')
+    local -a _fields=(Token 'Chat ID' 'SSH 话题' '配额话题' 'DDNS 话题' '更新话题')
     local _expected=${#_fields[@]}
     exec {_tty_fd}< /dev/tty || { msg_warn "未读取到终端，未保存 TG 配置"; return 1; }
     if [[ -t $_tty_fd ]]; then
@@ -514,16 +515,16 @@ _tg_input_tokens() (
             printf '\033[?2004h'
         fi
         if [[ -n $_first ]]; then
-            printf "  已收到 Token（隐藏），继续读取 Chat ID → SSH / 配额 / DDNS 话题 ID。\n"
+            printf "  已收到 Token（隐藏），继续读取 Chat ID → SSH / 配额 / DDNS / 更新话题 ID。\n"
             printf "  已整段粘贴请等待自动验证，不要重复粘贴。\n"
         else
             printf "  粘贴配置，支持 # 注释行和空行分隔，自动跳过:\n"
             printf "  顺序: Bot Token → 话题群 Chat ID\n"
-            printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID\n"
+            printf "        → SSH 话题ID → 配额 话题ID → DDNS 话题ID → 更新话题ID\n"
             printf "  ${C_CYAN}提示: 话题ID = 在 TG 里右键话题「复制链接」，末尾那个数字${C_RESET}\n"
             printf "  ${C_CYAN}      所有机器填同一组 ID 即可共用话题群${C_RESET}\n"
         fi
-        printf "  ${C_YELLOW}输入隐藏；整段粘贴 %s 项自动验证，无需补回车；逐行输入按回车，2–4 项连按两次回车；q 放弃${C_RESET}\n>>> " "$_expected"
+        printf "  ${C_YELLOW}输入隐藏；整段粘贴 %s 项自动验证，无需补回车；逐行输入按回车，2–%s 项连按两次回车；q 放弃${C_RESET}\n>>> " "$_expected" "$((_expected - 1))"
         _vals=(); _blank=0; _burst=0; _cancel=0
         while :; do
             _paste_end=0; _auto=0
@@ -563,12 +564,12 @@ _tg_input_tokens() (
             continue
         fi
         _new_tok="${_vals[0]:-}" _hub="${_vals[1]:-}"
-        _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}"
+        _th_ssh="${_vals[2]:-}" _th_qt="${_vals[3]:-}" _th_dd="${_vals[4]:-}" _th_up="${_vals[5]:-}"
         _bad_field=""
         if [[ ! $_new_tok =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then _bad_field="第 1 行 Token"
         elif [[ ! $_hub =~ ^-?[0-9]+$ ]]; then _bad_field="第 2 行 Chat ID"
-        elif [[ ! $_th_ssh =~ ^[0-9]*$ || ! $_th_qt =~ ^[0-9]*$ || ! $_th_dd =~ ^[0-9]*$ ]]; then
-            _bad_field="第 3–5 行话题 ID"
+        elif [[ ! $_th_ssh =~ ^[0-9]*$ || ! $_th_qt =~ ^[0-9]*$ || ! $_th_dd =~ ^[0-9]*$ || ! $_th_up =~ ^[0-9]*$ ]]; then
+            _bad_field="第 3–6 行话题 ID"
         fi
         if [[ -n $_bad_field ]]; then
             printf "  ${C_RED}✗ %s 格式不正确，请从 Token 开始重新粘贴（q 放弃）${C_RESET}\n" "$_bad_field"; continue
@@ -592,7 +593,8 @@ _tg_input_tokens() (
         printf "  话题群  : %s\n" "$_hub"
         printf "    ├ SSH 登录 : 话题 %s\n" "${_th_ssh:-未设置}"
         printf "    ├ 流量配额 : 话题 %s\n" "${_th_qt:-未设置}"
-        printf "    └ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
+        printf "    ├ DDNS     : 话题 %s\n" "${_th_dd:-未设置}"
+        printf "    └ 程序更新 : 话题 %s\n" "${_th_up:-未设置（仅记录日志）}"
         if [[ -n $_tty_state ]]; then
             stty "$_tty_state" <&"$_tty_fd" || return 1
             printf '\033[?2004l'
@@ -611,7 +613,7 @@ _tg_input_tokens() (
         [[ ${_cf,,} == y ]] && break
         printf "  ${C_CYAN}↻ 重新粘贴${C_RESET}\n"
     done
-    _write_tg_conf "$_new_tok" "$_hub" "$_srv" "$_th_ssh" "$_th_qt" "$_th_dd" || {
+    _write_tg_conf "$_new_tok" "$_hub" "$_srv" "$_th_ssh" "$_th_qt" "$_th_dd" "$_th_up" || {
         msg_error "TG 配置保存失败，未启动监控；请检查磁盘空间和文件权限"; return 1;
     }
     printf "  ${C_GREEN}✓ 已保存${C_RESET}\n"
@@ -630,7 +632,7 @@ _tg_input_tokens() (
 _tg_notify_configured() {
     local _srv="$1" _entry _ch _label _msg _ts _failed=0
     _ts=$(TZ="$TZ_DEFAULT" date '+%Y-%m-%d %H:%M:%S')
-    for _entry in "ssh:SSH 登录" "quota:流量配额" "ddns:DDNS"; do
+    for _entry in "ssh:SSH 登录" "quota:流量配额" "ddns:DDNS" "update:程序更新"; do
         _ch="${_entry%%:*}"; _label="${_entry#*:}"
         _tg_resolve_channel "$_ch"
         [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" || -z "$TG_THREAD_ID" ]] && continue
@@ -675,28 +677,32 @@ _do_tg_config() {
         clear
         printf "${C_CYAN}:: TG 推送配置 ::${C_RESET}\n\n"
 
-        local _tok="" _srv="" _hub="" _th_ssh="" _th_qt="" _th_dd=""
+        local _tok="" _srv="" _hub="" _th_ssh="" _th_qt="" _th_dd="" _th_up=""
         _tok=$(_tg_cfg_get    "$TG_CONF" TG_BOT_TOKEN)
         _srv=$(_tg_cfg_get    "$TG_CONF" SERVER_NAME)
         _hub=$(_tg_cfg_get    "$TG_CONF" TG_CHAT_HUB)
         _th_ssh=$(_tg_cfg_get "$TG_CONF" TG_THREAD_SSH)
         _th_qt=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_QUOTA)
         _th_dd=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_DDNS)
+        _th_up=$(_tg_cfg_get  "$TG_CONF" TG_THREAD_UPDATE)
 
-        local _ssh_tg_st _quota_st _ddns_st
+        local _ssh_tg_st _quota_st _ddns_st _update_st
         systemctl is-active --quiet "$SSH_TG_SERVICE" 2>/dev/null \
             && _ssh_tg_st="${C_GREEN}运行中${C_RESET}" || _ssh_tg_st="[-]"
         systemctl is-active --quiet quota-check.timer 2>/dev/null \
             && _quota_st="${C_GREEN}运行中${C_RESET}" || _quota_st="[-]"
         systemctl is-active --quiet "${DDNS_SERVICE_NAME}.timer" 2>/dev/null \
             && _ddns_st="${C_GREEN}运行中${C_RESET}" || _ddns_st="[-]"
+        systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null \
+            && _update_st="${C_GREEN}每日检查${C_RESET}" || _update_st="[-]"
 
         local _d
         _d="${_tok:+已配置（隐藏）}"; printf "  Token : %s\n\n" "${_d:-未设置}"
         printf "  ${C_BLUE}[ 话题群 ]${C_RESET}  %b\n" "${_hub:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ SSH 登录 %b  话题 %b\n" "$_ssh_tg_st"  "${_th_ssh:-${C_YELLOW}未设置${C_RESET}}"
         printf "    ├ 流量配额 %b  话题 %b\n" "$_quota_st" "${_th_qt:-${C_YELLOW}未设置${C_RESET}}"
-        printf "    └ DDNS     %b  话题 %b\n" "$_ddns_st" "${_th_dd:-${C_YELLOW}未设置${C_RESET}}"
+        printf "    ├ DDNS     %b  话题 %b\n" "$_ddns_st" "${_th_dd:-${C_YELLOW}未设置${C_RESET}}"
+        printf "    └ 程序更新 %b  话题 %b\n" "$_update_st" "${_th_up:-${C_YELLOW}未设置（仅记录日志）${C_RESET}}"
 
         printf "\n  ${C_GREEN}1.${C_RESET} 设置 Token & Chat ID\n"
         printf "  ${C_GREEN}2.${C_RESET} SSH 监控\n"
@@ -766,11 +772,12 @@ _do_tg_config() {
                         *) msg_warn "无效选项"; printf "\n${C_GREEN}按任意键返回...${C_RESET}"; read -rsn1 ;;
                     esac
                 done ;;
-            4)  # 测试推送（话题群三个话题）
+            4)  # 测试已配置的推送通道
                 local _ts; _ts=$(TZ="$TZ_DEFAULT" date '+%H:%M:%S')
                 _tg_test_one "SSH"  "$_tok" "$_hub" "$_th_ssh" "$_ts"
                 _tg_test_one "配额" "$_tok" "$_hub" "$_th_qt"  "$_ts"
                 _tg_test_one "DDNS" "$_tok" "$_hub" "$_th_dd"  "$_ts"
+                [[ -z $_th_up ]] || _tg_test_one "更新" "$_tok" "$_hub" "$_th_up" "$_ts"
                 pause ;;
             0|"") return ;;
             *) continue ;;
@@ -3345,7 +3352,7 @@ EOF
     _tcping_setup_silent && _ok_tcping=1 || msg_warn "TCPing 安装未完成，可从菜单 6 → 7 重试"
     install_autoupdate && _ok_update=1 || msg_warn "每日更新未启用，可从菜单 16 重试"
     if (( _ok_update )); then
-        echo -e "  ${GREEN}✓ 每日更新已启用（仅正式版，不自动安装 beta）${NC}"
+        echo -e "  ${GREEN}✓ 每日更新已启用（脚本跟随正式版；Realm/sing-box 仅检查并提醒）${NC}"
     fi
     _install_security_updates && _ok_security=1 || msg_warn "系统安全补丁自动更新未完成，可从菜单 6 → 8 修复"
 
@@ -4107,12 +4114,16 @@ get_installed_version() {
                 [[ "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || ver="${SNELL_VERSION_OVERRIDE}"
             fi
             ;;
-        realm)
-            if [[ -f "$REALM_BIN" ]]; then
-                # realm 输出形如: realm x.x.x 或带 v 前缀，同时兼容 stderr
+        realm|sing-box)
+            if [[ -x "$bin_path" ]]; then
                 local raw
-                raw=$("$REALM_BIN" --version 2>&1 || "$REALM_BIN" -V 2>&1 || true)
-                ver=$(echo "$raw" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+                if [[ $service_name == realm ]]; then
+                    raw=$(timeout 5 "$bin_path" --version 2>&1 || timeout 5 "$bin_path" -V 2>&1) || raw=""
+                else
+                    raw=$(timeout 5 "$bin_path" version 2>&1) || raw=""
+                fi
+                # 保留预发布后缀，避免把本地 beta 误当成同版本正式版。
+                ver=$(printf '%s\n' "$raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?' | head -1 || true)
                 [[ -n "$ver" && "$ver" != v* ]] && ver="v${ver}"
             fi
             ;;
@@ -4231,6 +4242,63 @@ get_cached_latest_version() {
     grep -m1 "^${service_name}:" "$UPDATE_CHECK_CACHE" 2>/dev/null | cut -d: -f2 || true
 }
 
+# 复用每日任务，只通知已安装的代理；不调用安装、配置或服务重启入口。
+_proxy_updates_notify() (
+    local service bin repo label menu installed current tag latest marker key notice="" result=0 index tmp
+    local -a pending_services=() pending_versions=()
+    umask 077
+    mkdir -p "$WORK_DIR" || return 1
+    exec 9>"$WORK_DIR/proxy-updates.lock" || return 1
+    flock -n 9 || return 0
+    _tg_resolve_channel update
+    for service in realm sing-box; do
+        case $service in
+            realm) bin=$REALM_BIN; repo=zhboner/realm; label=Realm; menu=3 ;;
+            sing-box) bin=$SBX_BIN; repo=SagerNet/sing-box; label=sing-box; menu=2 ;;
+        esac
+        [[ -x $bin ]] || continue
+        installed=$(get_installed_version "$service" "$bin")
+        current=${installed#v}
+        if [[ ! $current =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            msg_warn "$label 本地版本无法识别，跳过本次更新检查"
+            result=1; continue
+        fi
+        if ! tag=$(get_latest_github_release "$repo") || [[ ! $tag =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            msg_warn "$label 正式版查询失败或版本格式异常，下次每日任务重试"
+            result=1; continue
+        fi
+        latest=${tag#v}
+        current=${current%%+*}
+        dpkg --compare-versions "${current/-/'~'}" lt "$latest" || continue
+        marker="$WORK_DIR/proxy-update-$service.notice"
+        key="$TG_CHAT_ID:$TG_THREAD_ID:$latest"
+        [[ ! -f $marker || $(cat "$marker") != "$key" ]] || continue
+        notice+="${notice:+$'\n\n'}$label: $installed → v$latest"
+        notice+=$'\n'"更新入口：菜单 16 → $menu"
+        notice+=$'\n'"https://github.com/$repo/releases/tag/$tag"
+        pending_services+=("$service"); pending_versions+=("$key")
+    done
+    [[ -n $notice ]] || return "$result"
+    notice="📦 #代理程序更新 $(get_node_id)"$'\n\n'"$notice"$'\n\n仅提醒，未下载、安装或重启代理；请先在测试机验证，再手动升级。'
+    log_message INFO "$notice"
+    if ! _tg_config_valid || [[ ! $TG_THREAD_ID =~ ^[1-9][0-9]*$ ]]; then
+        msg_info "TG 或程序更新话题未配置，代理更新信息仅记录在本地日志（菜单 3 → 1，第 6 项）"
+        return "$result"
+    fi
+    send_telegram "$notice" "" plain || return 1
+    # 只在送达后记版本；失败/未配置 TG 时保留重试机会。
+    for index in "${!pending_services[@]}"; do
+        tmp=$(mktemp "$WORK_DIR/.proxy-update.XXXXXX") || return 1
+        if ! { printf '%s\n' "${pending_versions[$index]}" > "$tmp" &&
+            mv -fT "$tmp" "$WORK_DIR/proxy-update-${pending_services[$index]}.notice"; }; then
+            rm -f "$tmp"
+            msg_warn "代理更新提醒已发送，但去重记录保存失败，下次可能重复提醒"
+            return 1
+        fi
+    done
+    return "$result"
+)
+
 # 更新单个服务
 update_service() {
     local service_name=$1
@@ -4283,7 +4351,7 @@ update_service() {
             ;;
         sing-box)
             if [[ ! -x "$SBX_BIN" ]]; then msg_error "sing-box 未安装。"; return; fi
-            local cur; cur=$("$SBX_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9.]+' | head -1 || true)
+            local cur; cur=$(get_installed_version sing-box "$SBX_BIN")
             msg_step "正在更新 sing-box (当前 ${cur:-?}，重新下载最新版)..."
             if sbx_install_core force; then
                 msg_success "sing-box 已更新。"
@@ -5543,13 +5611,13 @@ self_update() {
     exec "$self_path"
 }
 
-# 安装/开启每日自动更新定时器（仅正式版）。记录当前脚本路径，定时器认这个路径原地替换。
+# 同一每日任务：管理脚本跟随正式版；Realm/sing-box 只检查并发 TG 提醒。
 install_autoupdate() {
     local _self; _self=$(realpath "${BASH_SOURCE[0]}")
     [[ $_self != *$'\n'* && $_self != *'"'* && $_self != *'%'* ]] || return 1
     cat > /etc/systemd/system/vps-mgr-autoupdate.service <<EOF
 [Unit]
-Description=vps-mgr auto-update (stable releases only)
+Description=vps-mgr stable self-update and proxy update notifications
 After=network-online.target
 Wants=network-online.target
 
@@ -5561,7 +5629,7 @@ EOF
     # 每天上海 05:00 起、1 小时内随机触发(05:00~06:00)。你在上海 05:00 前把新正式版测好即可。
     cat > /etc/systemd/system/vps-mgr-autoupdate.timer <<'EOF'
 [Unit]
-Description=Daily vps-mgr auto-update check (Shanghai 05:00-06:00)
+Description=Daily vps-mgr update and proxy notifications (Shanghai 05:00-06:00)
 
 [Timer]
 OnCalendar=*-*-* 05:00:00 Asia/Shanghai
@@ -5587,7 +5655,7 @@ _do_update_menu() {
     local _sv _sn _ssv _ssn _rv _rn
     _sv=$(get_installed_version snell "$SNELL_BIN")
     _sn=$(get_cached_latest_version snell)
-    _ssv=$([[ -x "$SBX_BIN" ]] && "$SBX_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9.]+' | head -1 || true)
+    _ssv=$(get_installed_version sing-box "$SBX_BIN")
     _ssn=""
     _rv=$(get_installed_version realm "$REALM_BIN")
     _rn=$(get_cached_latest_version realm)
@@ -5622,7 +5690,8 @@ _do_update_menu() {
     local _au_st
     systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null \
         && _au_st="${C_GREEN}已开启${C_RESET}" || _au_st="${C_DIM}已关闭${C_RESET}"
-    printf " ${C_GREEN}6.${C_RESET} 自动更新    %b  (每天检查，仅正式版)\n" "$_au_st"
+    printf " ${C_GREEN}6.${C_RESET} 每日任务    %b  (脚本自动更新；Realm/sing-box 仅提醒)\n" "$_au_st"
+    printf "    ${C_DIM}上海时间 05:00–06:00；新版本发到程序更新话题（菜单 3 → 1，第 6 项）${C_RESET}\n"
     printf " ${C_GREEN}0.${C_RESET} 返回\n"
     printf "\n${C_PURPLE}请选择: ${C_RESET}"
     read -r _upd_ch
@@ -5642,10 +5711,10 @@ _do_update_menu() {
             ;;
         5) self_update ;;
         6) if systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null; then
-               uninstall_autoupdate; msg_info "自动更新已关闭"
+               uninstall_autoupdate; msg_info "每日任务已关闭（脚本自动更新和代理版本提醒均停止）"
            else
-               if install_autoupdate; then msg_success "自动更新已开启（每天检查正式版，预发布不更新）"
-               else msg_error "自动更新启用失败，请检查 systemd 日志"; fi
+               if install_autoupdate; then msg_success "每日任务已开启（脚本跟随正式版；Realm/sing-box 仅检查并提醒）"
+               else msg_error "每日任务启用失败，请检查 systemd 日志"; fi
            fi ;;
         0) return ;;
         *) msg_warn "无效选项" ;;
@@ -8347,7 +8416,7 @@ main() {
     # daemon/daily/quota-* 子命令通常由 systemd 以 root 自动触发；手动以非 root 运行会在
     # iptables / 写系统文件处报错，这里提前给出友好提示而非让其半路失败。
     case "${1:-}" in
-        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq|security-update-notify)
+        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq|security-update-notify|auto-update)
             if [[ $EUID -ne 0 ]]; then
                 echo "错误: '$1' 子命令需要 root 权限（一般由 systemd 自动调用）。请用 sudo 运行。" >&2
                 exit 1
@@ -8361,9 +8430,12 @@ main() {
         firewall-rollback) _fw_rollback; return ;;
         cn-update) _sbx_cn_update; return ;;
         auto-update)
-            command -v curl >/dev/null 2>&1 \
-                || { echo "auto-update 缺少 curl" >&2; exit 1; }
-            self_update auto; return ;;
+            command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+                || { echo "auto-update 缺少依赖 (curl/jq)" >&2; exit 1; }
+            local update_result=0
+            _proxy_updates_notify || update_result=1
+            self_update auto
+            return "$update_result" ;;
         quota-check)
             _fw_ensure || return 1
             quota_check_all; return ;;

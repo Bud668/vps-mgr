@@ -9,9 +9,15 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0--beta.12-orange)
+![Version](https://img.shields.io/badge/version-v2.0.0--beta.13-orange)
 
 </div>
+
+---
+
+## beta.13：代理版本检查与独立更新话题
+
+Realm / sing-box 每日只检查并提醒，不自动升级。TG 批量配置新增第 **6 项「程序更新话题 ID」**，顺序为 `Token → Chat ID → SSH → 配额 → DDNS → 程序更新`。整段粘贴 6 项自动验证；仅填 2–5 项时连按两次回车结束，旧话题顺序不变。更新话题只需在群里创建一次，所有机器共用；不把用户的群/话题 ID 写死在脚本中。详见下方「Realm / sing-box 版本提醒」。
 
 ---
 
@@ -81,21 +87,21 @@ beta.10 在 beta.9 基础上包含以下 10 项修复与优化，均保留在当
 
 ## ⚡ 测试版安装
 
-当前为 **v2.0.0-beta.12 预发布测试版**，包含 TG 粘贴自动验证、接收进度及 beta.11 的全部修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
+当前为 **v2.0.0-beta.13 预发布测试版**，新增 Realm / sing-box 每日版本提醒和独立更新话题，TG 配置扩展为 6 项，保留 beta.12 的粘贴自动验证、接收进度及全部修复。默认纯 Cloudflare DNS（3 秒未确认自动选择，可选纯 Google）、默认关闭 IPv6、TCPing 9999 和手动确认带宽保持不变；新建 Swap 上限 1GB，初始化默认启用官方安全补丁自动安装，不自动重启。首次安装仅供重装后的干净系统测试。下面固定下载测试标签，不跟随 main；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.12/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0-beta.13/vps-mgr.sh -o vps-mgr-beta.sh && bash -n vps-mgr-beta.sh && chmod 700 vps-mgr-beta.sh && ./vps-mgr-beta.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.12。发布页：[v2.0.0-beta.12](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.12)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0-beta.13。发布页：[v2.0.0-beta.13](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0-beta.13)。
 
 测试代码位于 `test/nftables-v2`，不合并到 `main`；GitHub Release 标记为 Pre-release，且不设为 Latest。旧版脚本的 `/releases/latest` 正式更新入口仍为 v1.4.1，不会自动安装本测试版。后续 beta 需手动安装，本测试版也不会自动降级到 v1。
 
 请保留下载脚本的路径，防火墙等 systemd 单元会引用它；不要测试安装后删除或移动。实际启动、SSH 连通性和重启恢复仍需在测试机验收。
 
-已完成 beta.5–beta.11 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本即生效 TG 输入修复，已有 TG 配置保持不变；但不会自动更换 `mtr` 或安装 DHCP DNS 保护，这两项用于新系统初始化，也不会自动调整已有 Swap、内核或安全补丁策略。新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 beta.9 起的 Token 传递修复。
+已完成 beta.5–beta.12 初始化的测试机先备份，再将下载并校验后的脚本替换到原路径，不必重装、重跑菜单 1 或重启服务器。替换脚本即生效 TG 输入修复，已有 TG 配置保持不变；如需代理版本 TG 提醒，请在菜单 3 → 1 重新粘贴原配置并追加第 6 项更新话题 ID，并确认菜单 16 → 6 的每日任务已开启。但替换脚本不会自动更换 `mtr` 或安装 DHCP DNS 保护，这两项用于新系统初始化，也不会自动调整已有 Swap、内核或安全补丁策略。新增安全补丁自动安装可从菜单 6 → 8 启用。已启用 SSH 通知的机器需从菜单 3 → 2 → 1「配置并启动服务」更新生成的监控脚本，才能应用 beta.9 起的 Token 传递修复。
 
 已完成 beta.4 初始化的测试机不必重装或重跑菜单 1：备份并在原路径替换脚本、验证语法后，执行 `systemctl restart vps-mgr-fq.service` 即可应用 beta.5 起包含的 fq 修复，沿用原先配置的速率，无需重启服务器。首次打开菜单缺少 jq/nftables 时只提示安装依赖，不再提前调用未安装的命令；完整依赖仍由菜单 1 安装。
 
@@ -237,6 +243,14 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 **菜单 6 → 8** 可查看策略/定时器状态、启用/修复或停止后续自动安装；停用不强杀正在运行的 APT/dpkg，不停软件源刷新。其他 APT 配置若覆盖了安全仓库或自动重启策略，会报错而非显示启用成功。
 
+**Realm / sing-box 版本提醒**
+
+初始化默认复用 `vps-mgr-autoupdate.timer`，每天上海时间 **05:00–06:00** 随机执行：管理脚本仍自动跟随正式版；已安装的 Realm、sing-box **只检查新正式版并发 TG 提醒，不下载、不安装、不修改配置、不重启代理**。只接受官方 GitHub 非草稿、非预发布的三段版本号，比较版本大小，不提示降级；未安装的程序跳过。
+
+提醒使用独立的 **程序更新话题**（`TG_THREAD_UPDATE`，菜单 3 → 1 的第 6 项），包含服务器名、当前/最新版本、发布说明链接和手动更新入口（菜单 16 → 3 Realm、16 → 2 sing-box）。同一程序的同一目标版本在同一群/话题成功发送后不再重复提醒；更换群或话题后可重新提醒。未配置有效 TG 或更新话题时只记本地日志，不回退到 SSH 话题；发送失败留待下次重试。查询失败不会阻止另一程序检查或管理脚本更新。菜单 16 → 6 开关控制这项每日任务，关闭时脚本自动更新和代理版本提醒一起停止，系统安全补丁及其 SSH 话题告警不受影响。
+
+建议先在测试机验证再升级生产机。手动升级仍会重启相关服务并中断现有连接；版本提醒本身不会触碰代理进程。仅替换新版脚本即可让已有 `auto-update` 日任务执行新检查，无需重跑初始化。
+
 **测试模式**
 
 - 通过内核 timeout 临时开放 Ping 和 iperf3，**2 小时自动到期**，不依赖 atd，也不随重启重新开放
@@ -247,15 +261,16 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 ### 📡 Telegram 告警
 
-三类通知共用一个**话题群**，各占一个话题：
+四类通知共用一个**话题群**，各占一个话题：
 
 | 通道 | 内容 |
 |------|------|
 | 🔐 SSH 登录（话题） | 登录成功/失败，IP + 时间 + 方式；Fail2Ban 封禁通知 |
 | 📊 流量配额（话题） | 用量预警、超额暂停通知 |
 | ☁️ DDNS（话题） | IP 变更、健康巡检 |
+| 📦 程序更新（话题） | Realm / sing-box 新正式版提醒，不自动升级 |
 
-所有 Token 与 Chat ID **均为运行时输入**，不写进脚本。未启用 SSH 通知时为 root-only；启用后共享配置/国旗缓存为 `root:ssh-tg-monitor`、640，父目录仅给该组遍历权限，其他代理密钥仍不可读。监控以独立用户读取 systemd journal，不再 source 用户配置；卸载 SSH 监控保留配额/DDNS 共用的 TG 配置。
+所有 Token 与 Chat ID **均为运行时输入**，不写进脚本。未启用 SSH 通知时为 root-only；启用后共享配置/国旗缓存为 `root:ssh-tg-monitor`、640，父目录仅给该组遍历权限，其他代理密钥仍不可读。监控以独立用户读取 systemd journal，不再 source 用户配置；卸载 SSH 监控保留其他通道共用的 TG 配置。
 
 Token 不放入 curl 命令行，防止被本机其他用户通过进程列表读取。长报告按字符分页，配额报告使用纯文本保留别名中的特殊字符；其他长 HTML 消息会转为纯文本分页，保留内容及翻页按钮。
 

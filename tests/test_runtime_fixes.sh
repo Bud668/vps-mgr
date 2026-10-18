@@ -35,7 +35,7 @@ for caller in _do_full_init do_system_update; do
 done
 
 # 2/7: direct-paste seed, comments, optional topics, trailing blanks, immediate q, EOF.
-for scenario in full seeded minimal comments bracketed seeded_bracketed q mid_q bracketed_q invalid_token invalid_hub invalid_topic eof short_eof save_fail monitor_fail notify_fail; do
+for scenario in full seeded minimal legacy comments bracketed seeded_bracketed q mid_q bracketed_q invalid_token invalid_hub invalid_topic invalid_update eof short_eof save_fail monitor_fail notify_fail; do
 (
     : > "$test_dir/calls"
     _tg_api() { record api; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
@@ -43,20 +43,22 @@ for scenario in full seeded minimal comments bracketed seeded_bracketed q mid_q 
     _tg_notify_configured() { record notify; [[ $scenario != notify_fail ]]; }
     install_quota_services() { record quota; }
     if [[ $scenario == save_fail ]]; then _write_tg_conf() { record save-failed; return 1; }; fi
-    payload=$'123:fake_secret\n-100123\n4\n5\n6\n\ny'
+    payload=$'123:fake_secret\n-100123\n4\n5\n6\n7\n\ny'
     seed=''
     case $scenario in
-        seeded) seed=123:fake_secret; payload=$'-100123\n4\n5\n6\n\ny' ;;
+        seeded) seed=123:fake_secret; payload=$'-100123\n4\n5\n6\n7\n\ny' ;;
         minimal) payload=$'123:fake_secret\n-100123\n\n\ny' ;;
-        comments) payload=$'# comment\n123:fake_secret\n\n-100123\n4\n5\n6\ny' ;;
-        bracketed) payload=$'\e[200~123:fake_secret\r\n-100123\r\n4\r\n5\r\n6\e[201~\r\n\e[200~y\e[201~' ;;
-        seeded_bracketed) seed=$'\e[200~123:fake_secret'; payload=$'-100123\n4\n5\n6\n\e[201~y' ;;
+        legacy) payload=$'123:fake_secret\n-100123\n4\n5\n6\n\n\ny' ;;
+        comments) payload=$'# comment\n123:fake_secret\n\n-100123\n4\n5\n6\n7\ny' ;;
+        bracketed) payload=$'\e[200~123:fake_secret\r\n-100123\r\n4\r\n5\r\n6\r\n7\e[201~\r\n\e[200~y\e[201~' ;;
+        seeded_bracketed) seed=$'\e[200~123:fake_secret'; payload=$'-100123\n4\n5\n6\n7\n\e[201~y' ;;
         q) payload=q ;;
         mid_q) payload=$'123:fake_secret\nq' ;;
         bracketed_q) payload=$'\e[200~Q\e[201~' ;;
-        invalid_token) payload=$'123:fake_secret!\n-100123\n4\n5\n6\nq' ;;
-        invalid_hub) payload=$'123:fake_secret\n-100oops\n4\n5\n6\nq' ;;
-        invalid_topic) payload=$'123:fake_secret\n-100123\n4\n5\n6x\nq' ;;
+        invalid_token) payload=$'123:fake_secret!\n-100123\n4\n5\n6\n7\nq' ;;
+        invalid_hub) payload=$'123:fake_secret\n-100oops\n4\n5\n6\n7\nq' ;;
+        invalid_topic) payload=$'123:fake_secret\n-100123\n4\n5\n6x\n7\nq' ;;
+        invalid_update) payload=$'123:fake_secret\n-100123\n4\n5\n6\n7x\nq' ;;
         eof) payload='' ;;
         short_eof) payload=123:fake_secret ;;
     esac
@@ -66,10 +68,15 @@ for scenario in full seeded minimal comments bracketed seeded_bracketed q mid_q 
     else output=$(_tg_input_tokens test-server "$seed" <<< "$payload" 2>&1) || rc=$?; fi
     reject grep -Fq fake_secret <<< "$output"
     case $scenario in
-        full|seeded|minimal|comments|bracketed|seeded_bracketed)
+        full|seeded|minimal|legacy|comments|bracketed|seeded_bracketed)
             assert test "$rc" = 0
             assert test "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)" = 123:fake_secret
             assert _tg_config_valid
+            if [[ $scenario == minimal || $scenario == legacy ]]; then
+                assert test -z "$(_tg_cfg_get "$TG_CONF" TG_THREAD_UPDATE)"
+            else
+                assert test "$(_tg_cfg_get "$TG_CONF" TG_THREAD_UPDATE)" = 7
+            fi
             assert grep -qx monitor "$test_dir/calls" ;;
         *) assert test "$rc" != 0 ;;
     esac
@@ -84,10 +91,31 @@ for scenario in full seeded minimal comments bracketed seeded_bracketed q mid_q 
             reject grep -q '粘贴配置，支持' <<< "$output" ;;
         invalid_token) assert grep -q '第 1 行 Token 格式不正确' <<< "$output" ;;
         invalid_hub) assert grep -q '第 2 行 Chat ID 格式不正确' <<< "$output" ;;
-        invalid_topic) assert grep -q '第 3–5 行话题 ID 格式不正确' <<< "$output" ;;
+        invalid_topic|invalid_update) assert grep -q '第 3–6 行话题 ID 格式不正确' <<< "$output" ;;
     esac
 )
 done
+(
+    _write_tg_conf 123:offline -100123 Test_server 4 5 6 7
+    before=$(sha256sum "$TG_CONF")
+    reject _write_tg_conf 123:offline -100123 Test_server 4 5 6 invalid
+    assert test "$before" = "$(sha256sum "$TG_CONF")"
+    for channel in ssh:4 quota:5 ddns:6 update:7; do
+        _tg_resolve_channel "${channel%:*}"
+        assert test "$TG_THREAD_ID" = "${channel#*:}"
+        assert test "$TG_CHAT_ID" = -100123
+    done
+    : > "$test_dir/calls"
+    send_telegram() { record "confirmed-topic $TG_THREAD_ID"; }
+    _tg_notify_configured Test_server
+    for topic in 4 5 6 7; do assert grep -qx "confirmed-topic $topic" "$test_dir/calls"; done
+    clear() { :; }
+    pause() { :; }
+    _tg_test_one() { record "tested-topic $4"; }
+    _do_tg_config <<< $'4\n0' > "$test_dir/tg-menu"
+    assert grep -q '程序更新.*话题.*7' "$test_dir/tg-menu"
+    assert grep -qx 'tested-topic 7' "$test_dir/calls"
+)
 for scenario in token name threads; do
 (
     _write_tg_conf 123:previous -100123 Old_name 4 5 6
@@ -134,7 +162,7 @@ source <(sed '/^main "\$@"$/d' "$1")
 log_message() { :; }
 test_scenario=${3:-}
 _tg_api() { [[ $test_scenario != late_extra ]] || sleep 0.3; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
-_write_tg_conf() { printf '\nPTY_SAVED\n'; }
+_write_tg_conf() { printf '\nPTY_SAVED\nPTY_UPDATE=%s\n' "${7:-none}"; }
 _setup_ssh_tg_monitor() { :; }
 _tg_notify_configured() { :; }
 install_quota_services() { :; }
@@ -156,7 +184,8 @@ fi
 printf '\nPTY_TTY_OK\n'
 printf '\nPTY_DONE=%s\n' "$rc"
 '''
-fields = [b'1234567890:pty_fake_secret_With-Dashes_1234567890', b'-1001234567890', b'4', b'5', b'12345678']
+fields = [b'1234567890:pty_fake_secret_With-Dashes_1234567890', b'-1001234567890', b'4', b'5', b'6', b'12345678']
+field_count = len(fields)
 plain = b'\n'.join(fields)
 cases = [('plain', plain + b'\n\n\n', 0), ('no_final_newline', plain, 0),
          ('q', b'q\n', 1), ('Q', b'Q\n', 1), ('bracketed_q', b'\x1b[200~Q\x1b[201~\n', 1),
@@ -164,10 +193,12 @@ cases = [('plain', plain + b'\n\n\n', 0), ('no_final_newline', plain, 0),
          ('extra', plain + b'\n7\ny\n', 1),
          ('extra_framed', b'\x1b[200~' + plain + b'\ny\n7\x1b[201~', 1),
          ('late_extra', plain + b'\n', 1),
-         ('split_plain', b'\n'.join(fields[:4]) + b'\n12', 0),
-         ('split_framed', b'\x1b[200~' + b'\n'.join(fields[:4]) + b'\n12', 0),
+         ('split_plain', b'\n'.join(fields[:-1]) + b'\n12', 0),
+         ('split_framed', b'\x1b[200~' + b'\n'.join(fields[:-1]) + b'\n12', 0),
          ('comments', b'# comment\n' + plain + b'\n# trailing comment\n', 0),
          ('minimal', b'\n'.join(fields[:2]) + b'\n\n\n', 0),
+         ('legacy', b'\n'.join(fields[:-1]) + b'\n\n\n', 0),
+         ('legacy_framed', b'\x1b[200~' + b'\n'.join(fields[:-1]) + b'\x1b[201~', 0),
          ('manual', fields[0] + b'\n', 0), ('manual_edit', fields[0] + b'\n', 0)]
 for separator in (b'\n', b'\r', b'\r\n'):
     block = separator.join(fields)
@@ -197,15 +228,15 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                 os.write(fd, b'345678' + (b'\x1b[201~' if name == 'split_framed' else b''))
                 tail_sent = True
             if name.startswith('manual') and sent_at is not None and time.monotonic() - last_manual > 0.2:
-                if manual_index < 4 and f'已接收 {manual_index}/5'.encode() in output:
+                if manual_index < field_count - 1 and f'已接收 {manual_index}/{field_count}'.encode() in output:
                     os.write(fd, fields[manual_index] + b'\n')
                     manual_index += 1
                     last_manual = time.monotonic()
-                elif manual_index == 4 and '已接收 4/5'.encode() in output:
+                elif manual_index == field_count - 1 and f'已接收 {field_count - 1}/{field_count}'.encode() in output:
                     os.write(fd, b'129\x7f' if name == 'manual_edit' else b'12')
                     manual_index += 1
                     last_manual = time.monotonic()
-                elif manual_index == 5 and time.monotonic() - last_manual > 0.8:
+                elif manual_index == field_count and time.monotonic() - last_manual > 0.8:
                     assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
                     os.write(fd, b'345678\n')
                     manual_index += 1
@@ -220,7 +251,7 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                 cancel_sent = True
             if '确认写入？'.encode() in output and not confirm_sent:
                 assert b'PTY_SAVED' not in output, output
-                if name != 'minimal':
+                if name not in ('minimal', 'legacy', 'legacy_framed'):
                     assert b'12345678' in output, (entry, name, output)
                 os.write(fd, b'Q\n' if name == 'confirm_q' else b'y\n')
                 confirm_sent = True
@@ -241,11 +272,15 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
         assert output.count(b'>>> ') == prompts, (entry, name, output)
         assert '格式不正确'.encode() not in output, (entry, name, output)
         assert (b'PTY_SAVED' in output) == (result == 0), output
-        if result == 0 and name != 'minimal':
-            assert '已接收 5/5 项'.encode() in output, (entry, name, output)
+        if result == 0:
+            if name in ('minimal', 'legacy', 'legacy_framed'):
+                assert b'PTY_UPDATE=none' in output, (entry, name, output)
+            else:
+                assert f'已接收 {field_count}/{field_count} 项'.encode() in output, (entry, name, output)
+                assert b'PTY_UPDATE=12345678' in output, (entry, name, output)
         if name.startswith('extra'):
-            assert '配置超过 5 项或含多余输入'.encode() in output, output
-            assert '已接收 6/5'.encode() not in output, output
+            assert f'配置超过 {field_count} 项或含多余输入'.encode() in output, output
+            assert f'已接收 {field_count + 1}/{field_count}'.encode() not in output, output
         if name == 'late_extra':
             assert '验证期间收到多余输入'.encode() in output, output
     finally:
@@ -447,11 +482,12 @@ done
     _save_server_name Name_without_TG
     assert test "$(_tg_cfg_get "$TG_CONF" SERVER_NAME)" = Name_without_TG
     reject _tg_config_valid
-    _write_tg_conf 123:offline -100123 Old_name 4 5 6
+    _write_tg_conf 123:offline -100123 Old_name 4 5 6 7
     _set_server_name <<< New_name
     assert test "$(_tg_cfg_get "$TG_CONF" SERVER_NAME)" = New_name
     assert test "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)" = 123:offline
     assert test "$(_tg_cfg_get "$TG_CONF" TG_THREAD_DDNS)" = 6
+    assert test "$(_tg_cfg_get "$TG_CONF" TG_THREAD_UPDATE)" = 7
     before=$(sha256sum "$TG_CONF")
     mv() { return 1; }
     reject _save_server_name Failed_name
