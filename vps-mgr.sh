@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.0.2"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1286,7 +1286,7 @@ _fw_show_status() {
         if [[ -n $cn ]]; then
             printf '   %b防护%b      CN 屏蔽 %b已开启 [%s]%b' "$C_WHITE" "$C_RESET" "$C_GREEN" "$cn" "$C_RESET"
         else
-            printf '   %b防护%b      CN 屏蔽 %b已关闭%b' "$C_WHITE" "$C_RESET" "$C_DIM" "$C_RESET"
+            printf '   %b防护%b      CN 屏蔽 %b已关闭%b' "$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
         fi
         printf ' · 域名 ACL %b\n' "$(_sbx_acl_status)"
         ssh_current=$(get_current_ssh_port) || ssh_current=""
@@ -5594,7 +5594,7 @@ edit_config() {
 }
 
 # $1=auto 时为非交互模式（systemd 定时器调用）：不提问、不 exec、日志走 stdout(journal)。
-# 只跟随 /releases/latest 的同大版本正式版；手动和自动入口共用保护。
+# 只跟随 /releases/latest 正式版；自动仅同大版本，手动跨大版本需二次确认。
 self_update() {
     local _mode="${1:-}" latest tmp_file self_path downloaded_version
     if [[ $_mode == auto && ! -f $SELF_AUTOUPDATE_FLAG ]]; then
@@ -5610,8 +5610,8 @@ self_update() {
     if dpkg --compare-versions "${latest/-/'~'}" lt "${SCRIPT_VERSION/-/'~'}"; then
         msg_info "远端版本低于当前版本，跳过降级"; return 0
     fi
-    if [[ ${latest%%.*} != "${SCRIPT_VERSION%%.*}" ]]; then
-        msg_warn "已阻止跨大版本升级：v${SCRIPT_VERSION} → v${latest}；请阅读发布说明后手动迁移安装"
+    if [[ $_mode == auto && ${latest%%.*} != "${SCRIPT_VERSION%%.*}" ]]; then
+        msg_warn "已阻止跨大版本升级：v${SCRIPT_VERSION} → v${latest}；请先阅读发布说明，确认支持原地升级后从菜单 16 → 5 手动操作"
         return 0
     fi
 
@@ -5625,9 +5625,22 @@ self_update() {
         echo "[auto-update] 发现新版本 v${SCRIPT_VERSION} → v${latest}，开始更新"
     else
         printf "${C_YELLOW}发现新版本: v%s → v%s${C_RESET}\n" "$SCRIPT_VERSION" "$latest"
-        printf "${C_PURPLE}是否更新? [Y/n]: ${C_RESET}"
-        local _yn; read -r _yn
-        [[ "${_yn:-Y}" =~ ^[Nn]$ ]] && return 0
+        local _yn
+        if [[ ${latest%%.*} != "${SCRIPT_VERSION%%.*}" ]]; then
+            msg_warn "跨大版本可能不兼容现有防火墙、代理或服务；本更新器仅替换脚本，不负责迁移配置。"
+            msg_warn "请先备份配置并确认目标版本支持原地升级；若不支持，请取消并按发布说明迁移。"
+            printf '发布说明：https://github.com/%s/releases/tag/v%s\n' "$SELF_REPO" "$latest"
+            printf "${C_PURPLE}已了解风险并确认继续跨大版本更新？[y/N]: ${C_RESET}"
+            read -r _yn || return 0
+            [[ $_yn =~ ^[Yy]$ ]] || { msg_info "已取消跨大版本更新"; return 0; }
+            printf "${C_PURPLE}二次确认：请输入完整目标版本 v%s（其他输入取消）: ${C_RESET}" "$latest"
+            read -r _yn || return 0
+            [[ $_yn == "v${latest}" ]] || { msg_info "确认版本不匹配，已取消跨大版本更新"; return 0; }
+        else
+            printf "${C_PURPLE}是否更新? [Y/n]: ${C_RESET}"
+            read -r _yn || return 0
+            [[ "${_yn:-Y}" =~ ^[Nn]$ ]] && return 0
+        fi
     fi
 
     # 与脚本同目录建临时文件，确保后续 mv 是同文件系统内的原子替换
@@ -5652,7 +5665,9 @@ self_update() {
         return 1
     fi
 
-    cp -p "$self_path" "${self_path}.bak" 2>/dev/null || true
+    cp -p "$self_path" "${self_path}.bak" || {
+        msg_error "旧脚本备份失败，已放弃更新，原脚本保持不变"; return 1;
+    }
     chmod +x "$tmp_file"
     mv "$tmp_file" "$self_path"
     trap - RETURN
@@ -5747,7 +5762,7 @@ _do_update_menu() {
     fi
 
     printf "\n ${C_GREEN}4.${C_RESET} 一键更新全部有更新的服务\n"
-    printf " ${C_GREEN}5.${C_RESET} 本脚本      ${C_GREEN}v%s${C_RESET}  (仅同大版本更新)\n" "$SCRIPT_VERSION"
+    printf " ${C_GREEN}5.${C_RESET} 本脚本      ${C_GREEN}v%s${C_RESET}  (手动更新；跨大版本需二次确认)\n" "$SCRIPT_VERSION"
     local _au_st
     systemctl is-active --quiet vps-mgr-autoupdate.timer 2>/dev/null \
         && _au_st="${C_GREEN}已开启${C_RESET}" || _au_st="${C_DIM}已关闭${C_RESET}"

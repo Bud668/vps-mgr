@@ -102,7 +102,9 @@ done
         {"set":{"name":"tcping_ports","elem":[9999]}},
         {"set":{"name":"test_tcp","elem":[{"elem":{"val":5201,"expires":3600}}]}},
         {"set":{"name":"test_udp","elem":[{"elem":{"val":5201,"expires":3600}}]}}]}'
-    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    output=$(_fw_show_status)
+    [[ $output == *$'CN 屏蔽 \033[1;33m已关闭\033[0m'* ]] || { echo 'FAIL: disabled CN protection must be yellow'; exit 1; }
+    output=$(sed -E 's/\x1B\[[0-9;]*m//g' <<< "$output")
     [[ $output == *'防火墙'*'持久化'*'防护'*'SSH       ● 26680'*'开放端口'* ]] || { echo 'FAIL: firewall rows out of order'; exit 1; }
     for token in '2222(t)' '9999(t)[TCPing]' '5201(t/u)[测试]' '24073(t/u)' '24074(u)'; do
         [[ $output == *"$token"* ]] || { echo "FAIL: dashboard port $token"; exit 1; }
