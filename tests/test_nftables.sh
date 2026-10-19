@@ -16,11 +16,13 @@ trap cleanup_test EXIT
 # shellcheck source=/dev/null
 source <(sed \
     -e '/^main "\$@"$/d' \
+    -e "s|/run/|$test_dir/run/|g" \
     -e "s|^readonly WORK_DIR=.*|readonly WORK_DIR=\"$test_dir/state\"|" \
     -e "s|^readonly FW_CONF=.*|readonly FW_CONF=\"$test_dir/rules.nft\"|" \
     -e "s|^readonly FW_PENDING=.*|readonly FW_PENDING=\"$test_dir/pending\"|" \
     -e "s|^readonly FW_LOCK=.*|readonly FW_LOCK=\"$test_dir/lock\"|" \
     "$repo_dir/vps-mgr.sh")
+mkdir -p "$test_dir/run"
 log_message() { :; }
 _fw_install_unit() { :; }
 install_quota_services() { :; }
@@ -61,6 +63,21 @@ status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
 [[ $status == *'nftables 运行中'*'策略 DROP'* && $status == *'SSH       ● 22'*'开放端口  无额外放行'* ]] || exit 1
 [[ $status != *TCP* && $status != *UDP* && $status != *已暂停* && $status != *ssh_ports* ]] || exit 1
 assert test "$(stat -c %a "$FW_CONF")" = 600
+# Early /tmp mounting must not hide the temporary rules used for boot restore.
+(
+    mktemp() {
+        local temporary
+        if (( $# == 0 )); then
+            temporary=$(command mktemp) || return 1
+            rm -f "$temporary"
+            printf '%s\n' "$temporary"
+        else command mktemp "$@"; fi
+    }
+    nft delete table inet "$FW_TABLE"
+    _fw_ensure
+    assert _fw_has_element ssh_ports 22
+    assert test -z "$(find "$test_dir/run" -name 'vps-mgr-restore.*' -print)"
+)
 # Repair a beta.1 interruption/disabled boot unit without replacing live rules.
 printf 'old-confirmation-token\n%s\n' "$SSH_CONNECTION" > "$FW_PENDING"
 systemctl disable "$FW_SERVICE.service"
@@ -114,8 +131,17 @@ t.bind(("::",24074)); t.listen(32)
 m=socket.socket(socket.AF_INET6,socket.SOCK_STREAM)
 m.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)
 m.bind(("::",24076)); m.listen(32)
+c=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+c.bind(("0.0.0.0",24077)); c.listen(32)
 time.sleep(50)' &
 server_pid=$!
+(
+    systemctl() { [[ $1 != show ]] || printf '%s\n' "$server_pid"; }
+    assert _tcping_wait_listening 24077
+    if _tcping_listening 24078; then echo 'Missing TCPing listener accepted'; exit 1; fi
+    systemctl() { [[ $1 != show ]] || printf '1\n'; }
+    if _tcping_listening 24077; then echo 'Another process listener accepted as TCPing'; exit 1; fi
+)
 send_packet() {
     nsenter -t "$peer_pid" -n python3 -c 'import socket,sys
 v6=sys.argv[1]=="6"

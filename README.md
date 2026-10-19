@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.0-green)
+![Version](https://img.shields.io/badge/version-v2.0.1-green)
 
 </div>
 
@@ -19,10 +19,10 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 正式版安装
 
-当前为 **v2.0.0 正式版**，采用原生 nftables，脚本自动更新默认关闭，仅允许同大版本更新。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
+当前为 **v2.0.1 正式版**，采用原生 nftables，脚本自动更新默认关闭，仅允许同大版本更新。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.0/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.1/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
@@ -31,9 +31,9 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ### 升级与兼容性
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.0。发布页：[v2.0.0](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.0)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.1。发布页：[v2.0.1](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.1)。
 
-正式代码发布到 `main`，GitHub Latest 为 `v2.0.0`；历史 v1 和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
+正式代码发布到 `main`，GitHub Latest 为 `v2.0.1`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
 
 已完成 beta.5–beta.14 初始化的测试机可从 **菜单 16 → 5** 直接更新到正式版：下载并校验后备份旧脚本、在原路径替换，无需重装、重跑菜单 1 或为脚本更新重启。也可先备份，再手动替换原路径；不要因示例文件名变成 `vps-mgr.sh` 就移动原来的 `vps-mgr-beta.sh`，systemd 可能仍引用旧路径。节点和 TG 配置保持不变，转正后脚本自动更新默认关闭，需要时从菜单 16 → 7 开启。尚未转正的 beta 若保留旧定时任务，仍会按旧逻辑自动获取正式版；新开关在安装本版后生效。
 
@@ -149,7 +149,7 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 - 默认 DROP 策略，最小暴露面
 - 不预开 80/443（脚本不签证书、不跑 web，需要时菜单手动开）
 - 仅管理 `table inet vps_mgr`，普通修改是原子批次，不清空整个 ruleset
-- 配置存于 `/etc/nftables.d/vps-mgr.nft`，由 `vps-mgr-firewall.service` 恢复；停止该单元不会移除保护
+- 配置存于 `/etc/nftables.d/vps-mgr.nft`，由 `vps-mgr-firewall.service` 在本地文件系统就绪后、网络启动前恢复，恢复临时文件使用 `/run`；停止该单元不会移除保护
 - 沿用旧版自动流程：识别本机 SSH 端口 → 建立独立 systemd 回滚保护 → 校验/应用规则 → 保存并检查开机恢复 → 自动撤销回滚
 - **不要求新开 SSH、不输入确认码、不重复进入初始化。**应用/保存/启用失败会撤回本次加载的表；异常中断由 3 分钟定时器兜底，恢复失败保留原有配置文件
 - 核对的是本机 SSH 端口规则，不等于实测公网新连接；可自行另开 SSH 验证，但不会阻断安装流程
@@ -259,7 +259,9 @@ Token 不放入 curl 命令行，防止被本机其他用户通过进程列表�
 
 脚本自动识别共享内核容器（如 LXC/OpenVZ），与 VPS 共用完整用户态初始化：依赖/软件更新、时区、日志、文件描述符、TG、Fail2Ban、TCPing 和每日检查不再整批跳过，脚本自动更新仍默认关闭。只跳过换内核、Swap、宿主 sysctl/qdisc 和共享时钟修改；挂载或只读 DNS 文件保留宿主设置。若宿主禁止 IPv6 sysctl 写入，会报告“未禁用”并继续其他功能，不假报成功。菜单 2 → 3 可单独安装/修复 Fail2Ban。你不需要手动判断或选择环境，NAT 或公网端口数量不能作为容器判据。
 
-**TCPing 默认 9999**，仅在被占用时向后找空闲端口；已运行的服务保留原端口。菜单 6 → 7 可手动指定端口、查看哪吒目标或卸载。它是 TCP 延迟探测监听，不是哪吒 Agent；NAT 机器还需对应公网映射，脚本不能新增供应商的开放端口。参数计算尊重 cgroup 内存上限和真实页大小。
+**TCPing 在初始化时自动安装并启用开机启动，默认 9999**，新装时仅在被占用时向后找空闲端口；已有配置保留原端口，停止后修复也不换端口。安装会等待服务进程实际监听，运行中的实例会补齐开机启用而不重启；初始化末尾再核对服务、监听、开机启用及防火墙放行。菜单 6 → 7 可安装/修复、手动指定端口、查看状态/日志或卸载。它是 TCP 延迟探测监听，不是哪吒 Agent；NAT 机器还需对应公网映射，脚本不能新增供应商的开放端口。参数计算尊重 cgroup 内存上限和真实页大小。
+
+**重启后 TCPing 未运行？**先用菜单 6 → 7 → 3 查看本次启动日志；`Dependency failed` 表示依赖服务启动失败，不等于初始化漏装。更新脚本后可先用菜单 5 → 1 重建防火墙开机恢复单元（保留现有规则），再用菜单 6 → 7 → 1 修复 TCPing，无需重跑整套初始化或重启代理。
 
 关闭 IPv6 时使用 Exim4 原生配置处理 IPv6 监听冲突，保留邮件服务和自定义配置；重新开启 IPv6 时撤回脚本加入的配置。SSH 监控安装后恢复启动测试推送，地址以可复制的代码格式展示，并转义消息中的 HTML 特殊字符。客户端自定义节点名称保留国旗与防重名后缀；到期删除 Realm/配额时清理对应元数据和告警标记，避免同月复用端口漏告警。sing-box 的文件描述符上限恢复为 1000000。
 

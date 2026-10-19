@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1048,8 +1048,9 @@ _fw_restore() {
 _fw_load_config() {
     [[ -s "$FW_CONF" ]] || { msg_error "请先初始化 nftables 防火墙"; return 1; }
     local tmp ports=""
-    tmp=$(mktemp) || return 1
-    chmod 600 "$tmp"
+    # 开机恢复早于 /tmp 挂载时，默认临时文件会被新挂载遮住。
+    tmp=$(mktemp /run/vps-mgr-restore.XXXXXX) || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     if [[ -f "$QUOTA_DATA" ]]; then
         ports=$(awk -F'|' '$7==1 && $1~/^[0-9]+$/ && $1>0 && $1<=65535 {print $1+0}' "$QUOTA_DATA" | sort -nu | paste -sd, -)
     fi
@@ -1207,6 +1208,7 @@ _fw_install_unit() {
 Description=VPS Manager native nftables rules
 DefaultDependencies=no
 Wants=network-pre.target
+After=local-fs.target
 Before=network-pre.target shutdown.target
 Conflicts=shutdown.target
 
@@ -2135,6 +2137,24 @@ find_available_port() {
         END { for(p=start;p<=65535;p++) if(!used[p]) {print p; exit} exit 1 }'
 }
 
+_tcping_listening() {
+    local port=${1:-} pid
+    _valid_port "$port" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" || return 1
+    pid=$(systemctl show "$TCPING_SERVICE_NAME" -p MainPID --value) || return 1
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    ss -H -4 -ltnp "sport = :$port" | grep -q "pid=$pid,"
+}
+
+_tcping_wait_listening() {
+    local attempt
+    for attempt in {1..20}; do
+        _tcping_listening "$1" && return 0
+        sleep 0.1
+    done
+    msg_error "TCPing 未监听端口 $1；请检查 journalctl -u $TCPING_SERVICE_NAME -b --no-pager"
+    return 1
+}
+
 # 静默启用 TCPing 监控（用于一键初始化，不询问用户）
 _tcping_setup_silent() {
     _fw_ensure || return 1
@@ -2142,13 +2162,17 @@ _tcping_setup_silent() {
     old_port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
     systemctl is-active --quiet "$TCPING_SERVICE_NAME" && active=1
     systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" && enabled=1
-    if [[ -z $monitor_port ]] && _valid_port "$old_port" && (( active )); then
+    if [[ -z $monitor_port ]] && _tcping_listening "$old_port"; then
+        systemctl enable "$TCPING_SERVICE_NAME" --quiet && systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" || {
+            msg_error "TCPing 开机启动未启用，请检查 systemd 配置"; return 1;
+        }
         printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
             "$FW_TABLE" "$FW_TABLE" "$old_port" | _fw_apply || return 1
-        msg_info "TCPing 已运行，保留端口 $old_port（跳过重装）"
+        msg_info "TCPing 已运行，保留端口 $old_port（开机启动已启用）"
         _tcping_target "$old_port"
         return 0
     fi
+    if [[ -z $monitor_port ]] && _valid_port "$old_port"; then monitor_port=$old_port; fi
     [[ -n $monitor_port ]] || monitor_port=$(find_available_port 9999) || {
         msg_error "找不到空闲 TCPing 端口"; return 1;
     }
@@ -2171,6 +2195,7 @@ Description=TCPing Monitor
 After=network.target $FW_SERVICE.service
 Requires=$FW_SERVICE.service
 [Service]
+Type=exec
 User=tcping
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -2183,11 +2208,12 @@ WantedBy=multi-user.target
 EOF
     if (( rc == 0 )) && systemctl daemon-reload &&
         systemctl enable "$TCPING_SERVICE_NAME" --quiet &&
-        systemctl restart "$TCPING_SERVICE_NAME" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" &&
+        systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" &&
+        systemctl restart "$TCPING_SERVICE_NAME" && _tcping_wait_listening "$monitor_port" &&
         printf 'flush set inet %s tcping_ports\nadd element inet %s tcping_ports { %s }\n' \
             "$FW_TABLE" "$FW_TABLE" "$monitor_port" | _fw_apply; then
         rm -rf "$backup"
-        msg_success "TCPing 已启用：端口 $monitor_port"
+        msg_success "TCPing 已启用：端口 $monitor_port（监听正常、开机启动已启用）"
         _tcping_target "$monitor_port"
     else
         systemctl stop "$TCPING_SERVICE_NAME" || recovered=0
@@ -2215,10 +2241,13 @@ do_tcping_monitor() {
     local choice port
     printf '\n=== TCPing 监控（供哪吒探测，不是哪吒 Agent）===\n'
     port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
-    if systemctl is-active --quiet "$TCPING_SERVICE_NAME"; then
+    if _tcping_listening "$port"; then
         printf '状态：运行中\n'; _tcping_target "$port"
-    else printf '状态：未运行\n'; fi
-    printf '\n1. 自动安装（从 9999 选择空闲端口；运行中保留原端口）\n2. 停止并卸载\n3. 查看状态\n4. 手动指定端口\n0. 返回\n'
+    elif [[ -f $TCPING_CONFIG_FILE || -f /etc/systemd/system/$TCPING_SERVICE_NAME.service ]]; then
+        printf '状态：已安装但未运行或未监听（选择 1 修复，选择 3 查看日志）\n'
+    else printf '状态：未安装（初始化会自动安装，也可选择 1）\n'; fi
+    systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" && printf '开机启动：已启用\n' || printf '开机启动：未启用\n'
+    printf '\n1. 自动安装/修复（新装从 9999 选择空闲端口；已有配置保留原端口）\n2. 停止并卸载\n3. 查看状态\n4. 手动指定端口\n0. 返回\n'
     read -rp '选择: ' choice
     case "$choice" in
         1) _tcping_setup_silent ;;
@@ -2230,6 +2259,7 @@ do_tcping_monitor() {
            rm -f "/etc/systemd/system/$TCPING_SERVICE_NAME.service" "$TCPING_CONFIG_FILE"
            systemctl daemon-reload ;;
         3) systemctl status "$TCPING_SERVICE_NAME" --no-pager || true
+           journalctl -u "$TCPING_SERVICE_NAME" -b -n 20 --no-pager || true
            nft list set inet "$FW_TABLE" tcping_ports ;;
     esac
 }
@@ -2254,14 +2284,12 @@ _check_runtime_services() {
         if systemctl is-active --quiet fail2ban && systemctl is-enabled --quiet fail2ban &&
             fail2ban-client status sshd >/dev/null 2>&1; then
             _ck_pass "Fail2Ban 运行中、开机启用，sshd jail 可用"
-        else _ck_fail "Fail2Ban 服务或 sshd jail 未就绪（菜单 3）"; fi
-    else _ck_warn "Fail2Ban SSH 防护尚未配置（菜单 3）"; fi
+        else _ck_fail "Fail2Ban 服务或 sshd jail 未就绪（菜单 2 → 3）"; fi
+    else _ck_warn "Fail2Ban SSH 防护尚未配置（菜单 2 → 3）"; fi
 
     port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
     if [[ -f $TCPING_CONFIG_FILE ]]; then
-        if _valid_port "$port" && systemctl is-active --quiet "$TCPING_SERVICE_NAME" &&
-            systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" &&
-            ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . &&
+        if _tcping_listening "$port" && systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" &&
             _fw_has_element tcping_ports "$port"; then
             _ck_pass "TCPing $port：服务、开机启动、监听和防火墙放行正常（未验证公网映射）"
         else _ck_fail "TCPing 服务/端口/开机启动/防火墙不一致（菜单 6 → 7）"; fi
@@ -3350,8 +3378,10 @@ EOF
     # Fail2Ban 规则配置
     echo -e "\n${L_BLUE}── [7/8] Fail2Ban ──────────────────────────────────────${NC}"
     if [[ -f /etc/fail2ban/jail.d/sshd.conf ]] && fail2ban-client status sshd >/dev/null 2>&1; then
-        echo -e "  ${GREEN}✓ 已配置（跳过）${NC}"
-        _ok_f2b=1
+        if systemctl enable fail2ban --quiet && systemctl is-enabled --quiet fail2ban; then
+            echo -e "  ${GREEN}✓ 已配置，开机启动已启用（跳过重装）${NC}"
+            _ok_f2b=1
+        else msg_warn "Fail2Ban 开机启动未启用，可从菜单 2 → 3 修复"; fi
     else
         _install_fail2ban && _ok_f2b=1 || true
     fi
@@ -3367,7 +3397,8 @@ EOF
     # 成功结果已在各步骤显示，末尾只集中提醒未完成或主动跳过的项目。
     echo
     echo -e "${L_PURPLE}─────────────────── 初始化结束 ─────────────────────────${NC}"
-    local _pending=()
+    local _pending=() _tcping_port
+    _tcping_port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
     (( _ok_ipv6 )) || _pending+=("IPv6")
     (( _ok_sys )) || _pending+=("系统依赖")
     (( _ok_name )) || _pending+=("服务器名称")
@@ -3376,8 +3407,10 @@ EOF
     (( _ok_swap )) || _pending+=("Swap")
     (( _ok_tg )) && _tg_config_valid && systemctl is-active --quiet "$SSH_TG_SERVICE" &&
         systemctl is-enabled --quiet "$SSH_TG_SERVICE" || _pending+=("TG 推送")
-    (( _ok_f2b )) && systemctl is-active --quiet fail2ban 2>/dev/null || _pending+=("Fail2Ban")
-    (( _ok_tcping )) && systemctl is-active --quiet "$TCPING_SERVICE_NAME" 2>/dev/null || _pending+=("TCPing")
+    (( _ok_f2b )) && systemctl is-active --quiet fail2ban && systemctl is-enabled --quiet fail2ban &&
+        fail2ban-client status sshd >/dev/null 2>&1 || _pending+=("Fail2Ban")
+    (( _ok_tcping )) && _tcping_listening "$_tcping_port" && systemctl is-enabled --quiet "$TCPING_SERVICE_NAME" &&
+        _fw_has_element tcping_ports "$_tcping_port" || _pending+=("TCPing")
     (( _ok_update )) || _pending+=("每日检查")
     (( _ok_security )) || _pending+=("系统安全补丁")
     if (( ${#_pending[@]} )); then
@@ -3558,7 +3591,9 @@ ignoreip = $(_f2b_build_ignoreip)
 action   = ${_f2b_action}
 EOF
     _f2b_apply_all_nft
-    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl enable fail2ban --quiet && systemctl is-enabled --quiet fail2ban || {
+        msg_error "Fail2Ban 开机启动未启用，请检查 systemd 配置"; return 1;
+    }
     fail2ban-client -t || return 1
     _harden_sshd || return 1
     systemctl restart fail2ban || return 1

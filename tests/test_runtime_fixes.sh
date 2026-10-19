@@ -511,7 +511,7 @@ for scenario in fresh completed running job_failed tg_down f2b_down tcping_close
     unattended-upgrade() { echo 'FAIL: attempted upgrade during health check' >&2; exit 99; }
     fail2ban-client() { [[ $scenario != f2b_down ]]; }
     timedatectl() { echo yes; }
-    ss() { printf 'LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n'; }
+    ss() { printf 'LISTEN 0 128 0.0.0.0:9999 0.0.0.0:* users:(("socat",pid=12345,fd=5))\n'; }
     _fw_has_element() { [[ $scenario != tcping_closed ]]; }
     touch "$test_dir/etc/fail2ban/jail.d/sshd.conf" "$test_dir/etc/apt/apt.conf.d/99vps-mgr-security-updates" \
         "$test_dir/etc/systemd/system/vps-mgr-fq.service"
@@ -523,6 +523,7 @@ for scenario in fresh completed running job_failed tg_down f2b_down tcping_close
             is-enabled) [[ $scenario != timer_disabled || $3 != apt-daily-upgrade.timer ]] ;;
             show)
                 case $4 in
+                    MainPID) echo 12345 ;;
                     ActiveState) if [[ $scenario == running ]]; then echo activating; else echo inactive; fi ;;
                     Result) if [[ $scenario == job_failed && $2 == apt-daily-upgrade.service ]]; then echo exit-code; else echo success; fi ;;
                     ExecMainStartTimestamp) if [[ $2 == vps-mgr-fq.service || $scenario != fresh ]]; then echo '2026-10-18 00:00:00 UTC'; fi ;;

@@ -24,6 +24,7 @@ _state_locked() { "$@"; }
 realpath() { printf '%s/vps-mgr.sh\n' "$repo_dir"; }
 _fw_ensure() { :; }
 _fw_apply() { tee "$test_dir/batch" >/dev/null; }
+_fw_has_element() { [[ $1 == tcping_ports ]] && grep -Fq "tcping_ports { $2 }" "$test_dir/batch"; }
 quota_remove_counting_rules() { :; }
 _fw_element() { :; }
 close_firewall_port() { :; }
@@ -96,9 +97,16 @@ systemctl() {
                 *) return 0 ;;
             esac ;;
         is-failed) return 1 ;;
-        is-enabled) [[ ${*: -1} != tcping-monitor || -f "$test_dir/tcping-enabled" ]] ;;
+        show) [[ $* != *MainPID* ]] || printf '12345\n' ;;
+        is-enabled)
+            if [[ ${*: -1} == fail2ban && ${environment:-} == f2b_* ]]; then
+                [[ -f $test_dir/f2b-enabled ]]
+            else [[ ${*: -1} != tcping-monitor || -f "$test_dir/tcping-enabled" ]]; fi ;;
         enable)
+            [[ $2 != tcping-monitor || ${fail_tcping_enable:-0} == 0 ]] || return 1
+            [[ $2 != fail2ban || ${environment:-} != f2b_enable_fail ]] || return 1
             [[ " $* " == *' --quiet '* ]] || printf 'Created symlink (test service)\n' >&2
+            [[ $2 != fail2ban ]] || touch "$test_dir/f2b-enabled"
             [[ $2 != tcping-monitor ]] || touch "$test_dir/tcping-enabled" ;;
         disable) [[ $2 != tcping-monitor ]] || rm -f "$test_dir/tcping-enabled" ;;
         restart)
@@ -112,6 +120,14 @@ systemctl() {
 id() { return 0; }
 socat() { :; }
 ss() {
+    if [[ $* == *'-ltnp'* ]]; then
+        local port
+        port=$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)
+        if [[ -f $test_dir/tcping-active && $port != "${unready_port:-}" ]]; then
+            printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("socat",pid=12345,fd=5))\n' "$port"
+        fi
+        return 0
+    fi
     # -H -ltun uses the fifth field for the local endpoint.
     if [[ $* != *sport* || $* == *:9999* ]] && [[ ${busy9999:-0} == 1 ]]; then
         printf 'tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n'
@@ -119,9 +135,23 @@ ss() {
     return 0
 }
 SERVER_IP=192.0.2.1
+assert grep -q '状态：未安装' <<< "$(do_tcping_monitor <<< 0)"
 _tcping_setup_silent
 assert test "$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)" = 9999
 assert grep -q 'tcping_ports { 9999 }' "$test_dir/batch"
+output=$(do_tcping_monitor <<< 0)
+assert grep -q '状态：运行中' <<< "$output"
+assert grep -q '开机启动：已启用' <<< "$output"
+# Running but disabled services must be repaired without restarting the listener.
+rm -f "$test_dir/tcping-enabled"
+restarts=$(grep -c '^systemctl restart tcping-monitor$' "$test_dir/calls")
+_tcping_setup_silent
+assert test -f "$test_dir/tcping-enabled"
+assert test "$(grep -c '^systemctl restart tcping-monitor$' "$test_dir/calls")" = "$restarts"
+(
+    fail_tcping_enable=1
+    if _tcping_setup_silent; then echo 'TCPing boot enable failure hidden'; exit 1; fi
+)
 rm -f "$test_dir/tcping-active" "$TCPING_CONFIG_FILE"
 busy9999=1
 _tcping_setup_silent
@@ -137,8 +167,27 @@ assert test "$before" = "$(sha256sum "$test_dir/etc/systemd/system/tcping-monito
 assert test "$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)" = 10000
 assert test -f "$test_dir/tcping-active"
 fail_tcping=0
+# Restart an installed, stopped monitor on its saved custom port, not 9999.
+rm -f "$test_dir/tcping-active"
+busy9999=0
+assert grep -q '状态：已安装但未运行或未监听' <<< "$(do_tcping_monitor <<< 0)"
+_tcping_setup_silent
+assert test "$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)" = 10000
+(
+    unready_port=10001
+    sleep() { :; }
+    if _tcping_setup_silent 10001; then echo 'Active TCPing without listener accepted'; exit 1; fi
+    assert test "$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)" = 10000
+    assert test "$before" = "$(sha256sum "$test_dir/etc/systemd/system/tcping-monitor.service")"
+)
 
 # Native fq boot/network hooks and the stable-only daily updater.
+_fw_install_unit
+assert grep -qx 'After=local-fs.target' "$test_dir/etc/systemd/system/$FW_SERVICE.service"
+assert grep -qx 'Before=network-pre.target shutdown.target' "$test_dir/etc/systemd/system/$FW_SERVICE.service"
+if command -v systemd-analyze >/dev/null; then
+    systemd-analyze verify "$test_dir/etc/systemd/system/$FW_SERVICE.service"
+fi
 _persist_fq 80
 for hook in "$test_dir/etc/network/if-up.d/vps-mgr-fq" "$test_dir/etc/networkd-dispatcher/routable.d/vps-mgr-fq" "$test_dir/etc/NetworkManager/dispatcher.d/90-vps-mgr-fq"; do
     assert test -x "$hook"
@@ -230,10 +279,16 @@ assert test "$(printf 'SSH-BRUTE: IN=eth0\nVPS-DROP: IN=eth0\nnot-a-firewall-log
 # The container must reach TG/Fail2Ban/TCPing/updater even if sysctl is denied.
 assert test "$(declare -f _do_full_init | grep -c '_confirm_reboot')" = 1
 assert test "$(declare -f _do_full_init | grep -c 'echo.*重启.*BBR')" = 1
-for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hook_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail tg_direct tg_skip tg_eof tg_existing tg_existing_fail; do
+for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hook_fail container partial kernel_v2 kernel_v3 kernel_v1 kernel_fail kernel_grub_fail tg_direct tg_skip tg_eof tg_existing tg_existing_fail f2b_existing f2b_enable_fail; do
 (
     : > "$test_dir/calls"
     rm -f "$TG_CONF"
+    rm -f "$TCPING_CONFIG_FILE" "$test_dir/tcping-active" "$test_dir/tcping-enabled" \
+        "$test_dir/etc/systemd/system/tcping-monitor.service" "$test_dir/f2b-enabled"
+    busy9999=0
+    mkdir -p "$test_dir/etc/fail2ban/jail.d"
+    rm -f "$test_dir/etc/fail2ban/jail.d/sshd.conf"
+    if [[ $environment == f2b_* ]]; then printf 'existing jail\n' > "$test_dir/etc/fail2ban/jail.d/sshd.conf"; fi
     if [[ $environment == tg_existing* ]]; then _write_tg_conf 123:offline -100123 Old_name 4 5 6; fi
     printf 'nameserver 192.0.2.53\n' > "$test_dir/etc/resolv.conf"
     _is_container() { [[ $environment == container ]]; }
@@ -309,8 +364,9 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
         [[ $environment != partial ]]
     }
     _install_fail2ban() { record fail2ban; [[ $environment != partial ]]; }
-    _tcping_setup_silent() { record tcping; [[ $environment != partial ]]; }
+    fail2ban-client() { :; }
     if [[ $environment == partial ]]; then
+        _tcping_setup_silent() { record tcping; return 1; }
         install_autoupdate() { echo 'simulated updater error' >&2; return 1; }
     fi
     if [[ $environment == dns_fail ]]; then
@@ -376,9 +432,23 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
             assert grep -q 'DNS 配置未匹配 Google / Cloudflare' "$test_dir/dns-check.log"
         fi
     fi
-    for feature in ipv6 logs nofile journald firewall fail2ban tcping security-updates; do
+    for feature in ipv6 logs nofile journald firewall security-updates; do
         assert grep -qx "$feature" "$test_dir/calls"
     done
+    if [[ $environment == f2b_* ]]; then
+        assert test "$(cat "$test_dir/etc/fail2ban/jail.d/sshd.conf")" = 'existing jail'
+        assert grep -qx 'systemctl enable fail2ban --quiet' "$test_dir/calls"
+        if [[ $environment == f2b_enable_fail ]]; then
+            assert grep -q '未完成 / 已跳过：.*Fail2Ban' "$test_dir/init-$environment.log"
+        else assert test -f "$test_dir/f2b-enabled"; fi
+    else assert grep -qx fail2ban "$test_dir/calls"; fi
+    if [[ $environment != partial ]]; then
+        assert test "$(_tg_cfg_get "$TCPING_CONFIG_FILE" PORT)" = 9999
+        assert test -f "$test_dir/tcping-active"
+        assert test -f "$test_dir/tcping-enabled"
+        assert grep -q 'tcping_ports { 9999 }' "$test_dir/batch"
+        assert grep -q 'TCPing 已启用：端口 9999' "$test_dir/init-$environment.log"
+    fi
     case $environment in
         tg_skip|tg_eof|tg_existing|tg_existing_fail)
             if grep -qx telegram "$test_dir/calls"; then echo 'Unexpected TG reconfiguration'; exit 1; fi ;;
@@ -434,6 +504,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
     esac
 )
 done
+unset environment
 # Keep the SSH policy and ban count, not the verbose Fail2Ban status tree.
 (
     mkdir -p "$test_dir/etc/fail2ban/jail.d"
@@ -449,6 +520,10 @@ done
     output=$(_install_fail2ban 2>&1)
     [[ $output == *'已封禁 2 IP'* && $output == *'永久封禁  端口: 26680'* ]] || exit 1
     [[ $output != *'Status for the jail:'* && $output != *'配置 Fail2Ban...'* ]] || exit 1
+    (
+        systemctl() { [[ $1 != is-enabled ]]; }
+        if _install_fail2ban; then echo 'Fail2Ban boot enable failure hidden'; exit 1; fi
+    )
     fail2ban-client() { echo 'simulated Fail2Ban configuration error' >&2; return 1; }
     if output=$(_install_fail2ban 2>&1); then echo 'Invalid Fail2Ban config accepted'; exit 1; fi
     [[ $output == *'simulated Fail2Ban configuration error'* ]] || exit 1
