@@ -67,6 +67,7 @@ menu_output=$(ddns_show_menu)
 sent_message=""
 send_telegram() { sent_message="$1"; }
 ddns_log() { :; }
+_ddns_queue_notification() { send_telegram "$2"; }
 ddns_notify_change "FirstRun" "203.0.113.42"
 [[ "$sent_message" == *"👤 主机: 🇺🇸 #Node_LA"* ]] || {
     printf 'FAIL: DDNS notification did not render the Telegram node tag\n%s\n' "$sent_message" >&2

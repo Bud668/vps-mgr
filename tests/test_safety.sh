@@ -13,6 +13,11 @@ source <(sed -e '/^main "\$@"$/d' \
     -e 's|^readonly SBX_BIN=.*|readonly SBX_BIN="fake_sbx"|' \
     "$repo_dir/vps-mgr.sh")
 log_message() { :; }
+_sbx_ensure_user() { :; }
+chown() {
+    if [[ $1 == root:singboxproxy ]]; then shift; command chown root:root "$@"
+    else command chown "$@"; fi
+}
 sleep() { :; }
 _fw_restore() { :; }
 _fw_persist() { :; }
@@ -41,7 +46,7 @@ mkdir -p "$SBX_ETC" "$SBX_ST" "$WORK_DIR"
 umask 022
 printf 'S_PORT=24073\nS_METHOD=aes-128-gcm\nS_PW=a"quoted-password\n' > "$SBX_ST/ss-24073.env"
 sbx_render
-assert test "$(stat -c %a "$SBX_CONF")" = 600
+assert test "$(stat -c %a "$SBX_CONF")" = 640
 assert test "$(jq -r '.inbounds[0].password' "$SBX_CONF")" = 'a"quoted-password'
 printf 'S_PORT=24073\nS_METHOD=2022-blake3-aes-256-gcm\nS_PW=%s\n' "$(openssl rand -base64 32)" > "$SBX_ST/ss-24073.env"
 sbx_render

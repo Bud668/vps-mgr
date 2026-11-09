@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.3-green)
+![Version](https://img.shields.io/badge/version-v2.0.4-green)
 
 </div>
 
@@ -19,10 +19,10 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 正式版安装
 
-当前为 **v2.0.3 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
+当前为 **v2.0.4 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.3/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.4/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
@@ -31,9 +31,9 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ### 升级与兼容性
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.3。发布页：[v2.0.3](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.3)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.4。发布页：[v2.0.4](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.4)。
 
-正式代码发布到 `main`，GitHub Latest 为 `v2.0.3`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
+正式代码发布到 `main`，GitHub Latest 为 `v2.0.4`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
 
 已完成 beta.5–beta.14 初始化的测试机可从 **菜单 16 → 5** 直接更新到正式版：下载并校验后备份旧脚本、在原路径替换，无需重装、重跑菜单 1 或为脚本更新重启。也可先备份，再手动替换原路径；不要因示例文件名变成 `vps-mgr.sh` 就移动原来的 `vps-mgr-beta.sh`，systemd 可能仍引用旧路径。节点和 TG 配置保持不变，转正后脚本自动更新默认关闭，需要时从菜单 16 → 7 开启。尚未转正的 beta 若保留旧定时任务，仍会按旧逻辑自动获取正式版；新开关在安装本版后生效。
 
@@ -59,6 +59,14 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 | ☁️ **DDNS** | Cloudflare A 记录自动更新 |
 
 ---
+
+### v2.0.4 安全修复与旧机应用
+
+- 通用调优将 `net.ipv4.conf.all.route_localnet` 设为 `0`，不再全局开放回环地址路由。仅替换脚本不会改动内核实时值。旧机应先核对 Docker/自定义 DNAT 依赖，再单独修改 `/etc/sysctl.d/99-custom-tuning.conf` 中该项并应用；有业务确实需要时，仅在指定接口开启。不要为此重跑初始化或重建防火墙。
+- sing-box 安装、更新核心或菜单 **9 → 4 → 3 重启**会应用独立用户与权限。旧服务迁移前以新用户校验配置；单元重载/启动失败回退旧单元。此操作可能短暂断开该机的 sing-box 连接。仅更新脚本不会自动重启服务。手工引用的外部证书需要新用户具备只读访问；检查失败会停止迁移。
+- 节点展示和 SOCKS 白名单编辑按数据读取 env，不再执行配置中的 shell 内容。
+- DDNS 保存配置改为同目录原子替换，权限 `600`，失败保留旧内容。旧机从 **菜单 18 → 4** 保存现有配置即可收紧旧配置权限。
+- DDNS 的变更、健康、错误通知各保留一条最新待发消息，失败后至少间隔 5 分钟重试；成功才写告警冷却和当日健康标记。先完成 DNS 更新，再发送通知，菜单与定时器避免并发执行。消息以实际 Telegram 返回结果记日志，不保证接收端在响应丢失时绝对不重复。
 
 ## 亮点功能详解
 
@@ -117,7 +125,7 @@ net.ipv4.tcp_congestion_control = bbr
 
 **CN IP 封禁**：按端口开关，原生 IPv4/IPv6 interval sets 原子更新，下载/校验失败保留旧库，每周更新并持久化；不再依赖 ipset。
 
-sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效；添加/删除节点、修改 ACL 失败会恢复原状态。SOCKS5 白名单同时保护 IPv4/IPv6，默认只开放 TCP；Hy2 只开放 UDP。
+sing-box 使用独立用户 `singboxproxy`，仅保留低端口绑定权限；配置与 Hy2 证书由 root 管理、服务组只读，节点 env 保持仅 root 可读写。配置先在私有临时文件中生成并校验，再替换生效；添加/删除节点、修改 ACL 失败会恢复原状态。SOCKS5 白名单同时保护 IPv4/IPv6，默认只开放 TCP；Hy2 只开放 UDP。
 
 程序先下载、验证再替换；sing-box/Realm 验证 GitHub Release 资产的 SHA256，Snell 使用官方 HTTPS 下载、ELF/启动参数校验（上游未提供同样的摘要接口）。下载失败保留旧程序运行，替换后原本运行的服务启动失败会回退。
 

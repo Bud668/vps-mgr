@@ -22,6 +22,7 @@ clear() { :; }
 pause() { :; }
 sleep() { :; }
 chown() { :; }
+_sbx_ensure_user() { :; }
 systemctl() { record "systemctl $*"; }
 _state_locked() { "$@"; }
 _fw_ensure() { :; }

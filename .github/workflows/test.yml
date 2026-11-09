@@ -25,7 +25,7 @@ jobs:
         run: |
           bash -n vps-mgr.sh
           shellcheck -S error vps-mgr.sh tests/*.sh
-          for test in get_node_id safety self_update feature_parity ipv6 network_init audit_fixes security_updates proxy_updates runtime_fixes dns_dhcp; do
+          for test in get_node_id safety self_update feature_parity ipv6 network_init audit_fixes security_updates proxy_updates runtime_fixes dns_dhcp hardening; do
             bash "tests/test_${test}.sh"
           done
 
@@ -36,9 +36,18 @@ jobs:
         with:
           persist-credentials: false
       - name: Network test dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 iputils-ping jq python3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 iputils-ping jq python3 openssl curl
       - name: Native nftables and tc in disposable network namespaces
         run: |
           sudo unshare --net bash tests/test_ipv6.sh --netns
           sudo unshare --net bash tests/test_network_init.sh --netns
           sudo unshare --net bash tests/test_nftables.sh
+          sudo unshare --net bash tests/test_loopback_isolation.sh
+      - name: Unprivileged SS2022, SOCKS5 and Hysteria2 forwarding
+        shell: bash
+        run: |
+          curl -fL --connect-timeout 10 --max-time 120 https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz -o "$RUNNER_TEMP/sing-box.tar.gz"
+          printf '%s  %s\n' 699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968 "$RUNNER_TEMP/sing-box.tar.gz" | sha256sum -c -
+          tar -xOf "$RUNNER_TEMP/sing-box.tar.gz" sing-box-1.14.4-linux-amd64/sing-box > "$RUNNER_TEMP/sing-box"
+          chmod 755 "$RUNNER_TEMP/sing-box"
+          sudo env VPS_MGR_REAL_SBX="$RUNNER_TEMP/sing-box" unshare --net bash tests/test_singbox_unprivileged.sh

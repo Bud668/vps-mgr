@@ -198,7 +198,7 @@ install_autoupdate
 assert test ! -e "$SELF_AUTOUPDATE_FLAG"
 assert grep -q '05:00:00 Asia/Shanghai' "$test_dir/etc/systemd/system/vps-mgr-autoupdate.timer"
 declare -f get_latest_github_release | grep -q '/releases/latest'
-declare -f sbx_install_core | grep -q 'LimitNOFILE=1000000'
+declare -f _sbx_configure_service_locked | grep -q 'LimitNOFILE=1000000'
 (
     systemctl() {
         if [[ $1 == enable ]]; then echo 'simulated service enable error' >&2; return 1; fi

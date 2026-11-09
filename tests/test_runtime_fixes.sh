@@ -439,6 +439,7 @@ done
         command jq "$@"
     }
     fake_sbx() { :; }
+    _sbx_ensure_user() { :; }
     sleep() { :; }
     chown() { :; }
     printf 'S_PORT=24080\nS_METHOD=aes-128-gcm\nS_PW=%s\n' "$secret" > "$SBX_ST/ss-24080.env"
@@ -449,7 +450,7 @@ done
     assert test "$(jq -r '.inbounds[0].password' "$SBX_CONF")" = "$secret"
     assert test "$(jq -r '.inbounds[1].users[0].password' "$SBX_CONF")" = "$secret"
     assert test "$(jq -r '.inbounds[2].obfs.password' "$SBX_CONF")" = "$secret"
-    assert test "$(stat -c %a "$SBX_CONF")" = 600
+    assert test "$(stat -c %a "$SBX_CONF")" = 640
     printf '{"endpoints":[]}' > "$REALM_CONFIG_FILE"
     printf '{}' > "$REALM_META_FILE"
     _check_port_available() { :; }

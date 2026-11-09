@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.3"
+readonly SCRIPT_VERSION="2.0.4"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -66,6 +66,7 @@ readonly SBX_CONF="${SBX_ETC}/config.json"
 readonly SBX_ST="/etc/sb-server"
 readonly SBX_ACL="${SBX_ST}/acl-domains.txt"
 readonly SBX_SVC="sing-box"
+readonly SBX_USER="singboxproxy"
 
 
 TCPING_SERVICE_NAME="tcping-monitor"
@@ -1845,7 +1846,8 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.ip_forward = 1
-net.ipv4.conf.all.route_localnet = 1
+# 本地 DNAT 如确有需要，应由业务仅在指定接口开启，通用调优不全局开放 127/8。
+net.ipv4.conf.all.route_localnet = 0
 
 # --- 重传 & 乱序优化 (实测调优，适合代理中转场景) ---
 # frto=2: F-RTO 检测伪超时重传，对 HK→LA(143ms)/JP→LA(97ms) 等长RTT路径有效
@@ -6783,43 +6785,111 @@ _sbx_name_for() {
 # 选未占用端口(避开监听/Snell/Realm 已用端口)
 _sbx_pick_port() { get_port_interactive; }
 
-# ---- 安装 sing-box 核心二进制 ----
-sbx_install_core() {
-    _fw_ensure || return 1
-    [[ -x "$SBX_BIN" && ${1:-} != force ]] && return 0
-    local arch ver url
-    arch=$(_sbx_arch)
-    [[ -n $arch ]] || { msg_error "不支持的架构"; return 1; }
-    ver=$(get_latest_github_release SagerNet/sing-box) || return 1
-    url="https://github.com/SagerNet/sing-box/releases/download/$ver/sing-box-${ver#v}-linux-$arch.tar.gz"
-    install_service sing-box root "$SBX_BIN" "$SBX_ETC" "$url" tar true || return 1
-    mkdir -p "$SBX_ST" || return 1
-    chmod 700 "$SBX_ST" "$SBX_ETC"
-    cat > "/etc/systemd/system/$SBX_SVC.service" <<EOF
+# 运行账户只读自身配置和证书；节点 env 始终仅 root 可读写。
+_sbx_ensure_user() {
+    local uid
+    id "$SBX_USER" >/dev/null 2>&1 ||
+        useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$SBX_USER" || return 1
+    uid=$(id -u "$SBX_USER") || return 1
+    [[ $uid =~ ^[0-9]+$ && $uid != 0 ]]
+}
+
+_sbx_permissions() {
+    _sbx_ensure_user || return 1
+    [[ ! -L $SBX_ST && ! -L $SBX_ETC ]] || return 1
+    mkdir -p "$SBX_ST" "$SBX_ETC" || return 1
+    chown "root:$SBX_USER" "$SBX_ST" "$SBX_ETC" && chmod 750 "$SBX_ETC" && chmod 710 "$SBX_ST" || return 1
+    local f
+    for f in "$SBX_ST"/*.env "$SBX_CONF" "$SBX_ST"/hy2-*.crt "$SBX_ST"/hy2-*.key; do
+        [[ ! -L $f ]] || return 1
+        [[ -f $f ]] || continue
+        if [[ $f == *.env ]]; then
+            chown root:root "$f" && chmod 600 "$f" || return 1
+        else
+            chown "root:$SBX_USER" "$f" && chmod 640 "$f" || return 1
+        fi
+    done
+}
+
+# 安装/显式启停时迁移旧 root 单元；权限与启动失败不会留下坏单元。
+_sbx_configure_service() { _state_locked _sbx_configure_service_locked "${1:-apply}"; }
+_sbx_configure_service_locked() (
+    _sbx_permissions || return 1
+    local mode=${1:-apply} unit="/etc/systemd/system/$SBX_SVC.service" tmp active=0 failed=0
+    [[ $mode == apply || $mode == start || $mode == restart ]] || return 1
+    tmp=$(mktemp -d /etc/systemd/system/.sing-box.XXXXXX) || return 1
+    trap 'rm -rf "$tmp"' EXIT
+    cat > "$tmp/next" <<EOF || return 1
 [Unit]
 Description=sing-box server
 After=network.target nss-lookup.target $FW_SERVICE.service
 Requires=$FW_SERVICE.service
 [Service]
+User=$SBX_USER
+Group=$SBX_USER
 ExecStart=$SBX_BIN run -c $SBX_CONF
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1000000
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+    if cmp -s "$tmp/next" "$unit"; then
+        [[ $mode != apply ]] || return 0
+        systemctl "$mode" "$SBX_SVC" || return 1
+        sleep 1
+        systemctl is-active --quiet "$SBX_SVC"
+        return
+    fi
+    # 实际以新用户检查旧配置，提前发现外部证书路径等权限问题。
+    if [[ -s $SBX_CONF ]]; then
+        runuser -u "$SBX_USER" -- "$SBX_BIN" check -c "$SBX_CONF" || return 1
+    fi
+    [[ ! -e $unit ]] || cp -p "$unit" "$tmp/previous" || return 1
+    systemctl is-active --quiet "$SBX_SVC" && active=1
+    chmod 644 "$tmp/next" && mv -fT "$tmp/next" "$unit" || return 1
+    systemctl daemon-reload || failed=1
+    if (( failed == 0 )) && { (( active )) || [[ $mode != apply ]]; }; then
+        systemctl restart "$SBX_SVC" || failed=1
+        sleep 1
+        systemctl is-active --quiet "$SBX_SVC" || failed=1
+    fi
+    if (( failed )); then
+        if [[ -f $tmp/previous ]]; then mv -fT "$tmp/previous" "$unit" || return 1
+        else rm -f "$unit" || return 1; fi
+        systemctl daemon-reload || msg_error "sing-box 旧单元重载失败"
+        if (( active )); then systemctl restart "$SBX_SVC" || msg_error "sing-box 旧服务恢复失败"
+        else systemctl stop "$SBX_SVC" || true; fi
+        msg_error "sing-box 服务降权未成功，已恢复旧单元"; return 1
+    fi
+)
+
+# ---- 安装 sing-box 核心二进制 ----
+sbx_install_core() {
+    _fw_ensure || return 1
+    if [[ ! -x $SBX_BIN || ${1:-} == force ]]; then
+        local arch ver url
+        arch=$(_sbx_arch)
+        [[ -n $arch ]] || { msg_error "不支持的架构"; return 1; }
+        ver=$(get_latest_github_release SagerNet/sing-box) || return 1
+        url="https://github.com/SagerNet/sing-box/releases/download/$ver/sing-box-${ver#v}-linux-$arch.tar.gz"
+        install_service sing-box "$SBX_USER" "$SBX_BIN" "$SBX_ETC" "$url" tar true || return 1
+    fi
+    _sbx_configure_service
 }
 
 # ---- 重建 config.json 并重启 ----
 sbx_render() {
     local tmp previous f ib="" route="" kind port record
     local -a tags=()
-    mkdir -p "$SBX_ETC" || return 1
+    _sbx_permissions || return 1
     tmp=$(mktemp "$SBX_ETC/.config.XXXXXX") || return 1
     chmod 600 "$tmp"
     for f in "$SBX_ST"/ss-*.env "$SBX_ST"/socks-*.env "$SBX_ST"/hy2-*.env; do
@@ -6869,7 +6939,7 @@ sbx_render() {
     fi
     previous=$(mktemp "$SBX_ETC/.previous.XXXXXX") || { rm -f "$tmp"; return 1; }
     [[ ! -f "$SBX_CONF" ]] || cp -p "$SBX_CONF" "$previous" || { rm -f "$tmp" "$previous"; return 1; }
-    chmod 600 "$tmp" "$previous"
+    chown "root:$SBX_USER" "$tmp" && chmod 640 "$tmp" || { rm -f "$tmp" "$previous"; return 1; }
     mv -f "$tmp" "$SBX_CONF" || { rm -f "$tmp" "$previous"; return 1; }
     local failed=0
     systemctl restart "$SBX_SVC" || failed=1
@@ -6893,8 +6963,7 @@ sbx_render() {
 _sbx_mutate() { _state_locked _sbx_mutate_locked "$@"; }
 _sbx_mutate_locked() {
     _fw_restore || return 1
-    mkdir -p "$SBX_ST" "$SBX_ETC" || return 1
-    chmod 700 "$SBX_ST" "$SBX_ETC"
+    _sbx_permissions || return 1
     local tmp was_running=0 f rc=0
     tmp=$(mktemp -d) || return 1
     tar -cf "$tmp/state.tar" -C "$SBX_ST" . || { rm -rf "$tmp"; return 1; }
@@ -6922,6 +6991,7 @@ _sbx_mutate_locked() {
         if [[ -f "$tmp/config" ]]; then cp -p "$tmp/config" "$SBX_CONF"
         else rm -f "$SBX_CONF"; fi
         nft -f "$tmp/firewall" && _fw_persist || msg_error "防火墙状态恢复失败"
+        _sbx_permissions || msg_error "sing-box 旧配置权限恢复失败"
         if (( was_running )); then systemctl restart "$SBX_SVC" || msg_error "旧服务恢复失败"
         else systemctl stop "$SBX_SVC" || true; fi
         msg_error "本次节点/ACL 更改失败，已尝试恢复原配置和规则"
@@ -6937,15 +7007,18 @@ _sbx_show_one() {
     case "$(basename "$f")" in
         ss-*)
             local S_PORT="" S_PW="" S_METHOD="" u
-            # shellcheck disable=SC1090
-            . "$f"
+            S_PORT=$(_tg_cfg_get "$f" S_PORT)
+            S_PW=$(_tg_cfg_get "$f" S_PW)
+            S_METHOD=$(_tg_cfg_get "$f" S_METHOD)
             u=$(printf '%s:%s' "$S_METHOD" "$S_PW" | base64 -w0 2>/dev/null || true)
             printf "${C_GREEN}ss://%s@%s:%s#%s${C_RESET}\n" "$u" "$ip" "$S_PORT" "$nm"
             ;;
         socks-*)
             local SK_PORT="" SK_USER="" SK_PW="" SK_WL=""
-            # shellcheck disable=SC1090
-            . "$f"
+            SK_PORT=$(_tg_cfg_get "$f" SK_PORT)
+            SK_USER=$(_tg_cfg_get "$f" SK_USER)
+            SK_PW=$(_tg_cfg_get "$f" SK_PW)
+            SK_WL=$(_tg_cfg_get "$f" SK_WL)
             printf "${C_GREEN}socks5://%s:%s@%s:%s${C_RESET}" "$SK_USER" "$SK_PW" "$ip" "$SK_PORT"
             # 白名单为空 = 端口全拒绝：节点看着正常却连不上，唯一线索就在这里，必须提示。
             # 已配置则不显示 IP —— 占版面，要看去 sing-box 菜单的 SOCKS5 白名单管理。
@@ -6954,8 +7027,10 @@ _sbx_show_one() {
             ;;
         hy2-*)
             local H_PORT="" H_PW="" H_OBFS="" H_SNI=""
-            # shellcheck disable=SC1090
-            . "$f"
+            H_PORT=$(_tg_cfg_get "$f" H_PORT)
+            H_PW=$(_tg_cfg_get "$f" H_PW)
+            H_OBFS=$(_tg_cfg_get "$f" H_OBFS)
+            H_SNI=$(_tg_cfg_get "$f" H_SNI)
             printf "${C_GREEN}hysteria2://%s@%s:%s/?sni=%s&obfs=salamander&obfs-password=%s&insecure=1#%s${C_RESET}\n" \
                 "$H_PW" "$ip" "$H_PORT" "$H_SNI" "$H_OBFS" "$nm"
             ;;
@@ -7148,8 +7223,8 @@ _sbx_socks_edit_wl_impl() {
     for f in "$SBX_ST"/socks-*.env; do
         [[ -e "$f" ]] || continue
         i=$((i + 1)); p=$(basename "$f"); p=${p#socks-}; p=${p%.env}; ports+=("$p")
-        local SK_WL=""; # shellcheck disable=SC1090
-        . "$f"
+        local SK_WL=""
+        SK_WL=$(_tg_cfg_get "$f" SK_WL)
         printf "  %d) 端口 %s  白名单: %s\n" "$i" "$p" "${SK_WL:-（空,全拒绝）}"
     done
     read -rp "序号(回车取消): " n || true
@@ -7272,9 +7347,9 @@ sbx_proxy_menu() {
                 local s
                 read -rp "1)启动 2)停止 3)重启 : " s || true
                 case "$s" in
-                    1) systemctl start "$SBX_SVC" && msg_success "已启动" || msg_error "启动失败" ;;
+                    1) _sbx_configure_service start && msg_success "已启动" || msg_error "启动失败" ;;
                     2) systemctl stop "$SBX_SVC"  && msg_success "已停止" || msg_error "停止失败" ;;
-                    3) systemctl restart "$SBX_SVC" && msg_success "已重启" || msg_error "重启失败" ;;
+                    3) _sbx_configure_service restart && msg_success "已重启" || msg_error "重启失败" ;;
                 esac
                 pause ;;
             5)
@@ -7536,17 +7611,24 @@ ddns_load_config() {
     return 0
 }
 
-ddns_save_config() {
-    local _old_umask; _old_umask=$(umask); umask 177
-    cat > "$DDNS_CONFIG_FILE" <<EOF
+ddns_save_config() (
+    # 同目录原子替换同时收紧旧文件权限；任何一步失败均保留旧配置。
+    local tmp value
+    for value in "$DDNS_AUTH_TOKEN" "$DDNS_ZONE_NAME" "$DDNS_RECORD_NAME" "$DDNS_INTERVAL_SEC" "$DDNS_HEALTH_HOUR"; do
+        [[ $value != *$'\n'* && $value != *$'\r'* && $value != *'"'* ]] || return 1
+    done
+    umask 177
+    tmp=$(mktemp "$(dirname "$DDNS_CONFIG_FILE")/.cf-ddns.XXXXXX") || return 1
+    trap 'rm -f "$tmp"' EXIT
+    cat > "$tmp" <<EOF || return 1
 auth_token="$DDNS_AUTH_TOKEN"
 zone_name="$DDNS_ZONE_NAME"
 record_name="$DDNS_RECORD_NAME"
 check_interval_sec="$DDNS_INTERVAL_SEC"
 health_check_hour="$DDNS_HEALTH_HOUR"
 EOF
-    umask "$_old_umask"
-}
+    chmod 600 "$tmp" && mv -fT "$tmp" "$DDNS_CONFIG_FILE"
+)
 
 ddns_config_complete() {
     [[ -n "$DDNS_AUTH_TOKEN" && -n "$DDNS_ZONE_NAME" && -n "$DDNS_RECORD_NAME" ]]
@@ -7616,6 +7698,70 @@ ddns_get_ip() {
     return 1
 }
 
+# 每种通知只保留一条最新待发消息；失败后至少间隔 5 分钟再尝试。
+_ddns_queue_notification() {
+    local kind=$1 message=$2 file tmp next=0
+    [[ $kind == change || $kind == health || $kind == error ]] || return 1
+    if [[ -z ${TG_BOT_TOKEN:-} || -z ${TG_CHAT_ID:-} ]]; then
+        ddns_log "ℹ️ 未配置 Telegram，跳过通知。"; return 0
+    fi
+    file="$DDNS_STATE_DIR/notify-$kind.json"
+    if [[ -f $file ]]; then next=$(jq -er '.next_attempt | numbers' "$file") || return 1; fi
+    tmp=$(mktemp "$DDNS_STATE_DIR/.notify.XXXXXX") || return 1
+    if ! jq -cn --arg record "$DDNS_RECORD_NAME" --arg day "$(TZ="$TZ_DEFAULT" date +%Y%m%d)" \
+        --argjson next "$next" --rawfile message <(printf '%s' "$message") \
+        '{record:$record,day:$day,next_attempt:$next,message:$message}' > "$tmp" ||
+        ! chmod 600 "$tmp" || ! mv -fT "$tmp" "$file"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+_ddns_flush_notifications() {
+    local kind file now next day record message tmp
+    for kind in change health error; do
+        file="$DDNS_STATE_DIR/notify-$kind.json"
+        [[ -s $file ]] || continue
+        record=$(jq -er '.record | strings' "$file") || return 1
+        day=$(jq -er '.day | select(test("^[0-9]{8}$"))' "$file") || return 1
+        # 换域名后不投递旧记录通知，过期健康提醒也不补发。
+        if [[ $record != "$DDNS_RECORD_NAME" || ( $kind == health && $day != "$(TZ="$TZ_DEFAULT" date +%Y%m%d)" ) ]]; then
+            rm -f "$file" || return 1; continue
+        fi
+        [[ -n ${TG_BOT_TOKEN:-} && -n ${TG_CHAT_ID:-} ]] || continue
+        now=$(date +%s)
+        next=$(jq -er '.next_attempt | numbers' "$file") || return 1
+        (( now >= next || next > now + 300 )) || continue
+        message=$(jq -er '.message | strings' "$file") || return 1
+        # 先写下次尝试时间，发送进程中断也不会在每 10 秒巡检时刷群。
+        tmp=$(mktemp "$DDNS_STATE_DIR/.notify.XXXXXX") || return 1
+        if ! jq --argjson next "$((now + 300))" '.next_attempt=$next' "$file" > "$tmp" ||
+            ! chmod 600 "$tmp" || ! mv -fT "$tmp" "$file"; then
+            rm -f "$tmp"; return 1
+        fi
+        if send_telegram "$message"; then
+            case $kind in
+                error) printf '%s\n' "$now" > "$DDNS_STATE_DIR/last_error_time" || return 1 ;;
+                health) touch "$DDNS_STATE_DIR/health_$day.tag" || return 1 ;;
+            esac
+            rm -f "$file" || return 1
+            ddns_log "📨 Telegram 通知已发送（$kind）。"
+        else
+            ddns_log "⚠️ Telegram 通知发送失败（$kind），已保留，5 分钟后重试。"
+        fi
+    done
+}
+
+_ddns_maybe_health() {
+    local interactive=$1 ip=$2 hour day
+    [[ $interactive == false ]] || return 0
+    hour=$(TZ="$TZ_DEFAULT" date +%H); day=$(TZ="$TZ_DEFAULT" date +%Y%m%d)
+    if (( 10#$hour == 10#$DDNS_HEALTH_HOUR )) &&
+        [[ ! -f "$DDNS_STATE_DIR/health_$day.tag" && ! -f "$DDNS_STATE_DIR/notify-health.json" ]]; then
+        ddns_notify_health "$ip" || ddns_log "⚠️ 健康通知保存失败，将在下次巡检重试。"
+    fi
+    return 0
+}
+
 ddns_notify_change() {
     local _old="$1" _new="$2"
     local _title="📢 <b>DDNS IP 变更通知</b>"
@@ -7632,8 +7778,7 @@ ddns_notify_change() {
 🔴 旧 IP: <code>${_old}</code>
 🟢 新 IP: <code>${_new}</code>
 🕒 时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    send_telegram "$_msg" || true
-    ddns_log "📨 Telegram 变更通知已发送。"
+    _ddns_queue_notification change "$_msg"
 }
 
 ddns_notify_health() {
@@ -7653,8 +7798,7 @@ ddns_notify_health() {
 
 📜 <b>近期日志:</b>
 <pre>${_logs}</pre>"
-    send_telegram "$_msg" || true
-    ddns_log "📨 [健康检查] 通知已发送。"
+    _ddns_queue_notification health "$_msg"
 }
 
 # 异常告警（30 分钟冷却，避免单次抖动刷屏）
@@ -7674,36 +7818,30 @@ ddns_notify_error() {
 🌍 域名: <code>${DDNS_RECORD_NAME}</code>
 ⚠️ 错误: $(_html_escape "$_err")
 🕒 时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        send_telegram "$_msg" || true
-        echo "$_now" > "$_f"
-        ddns_log "📨 [异常告警] 通知已发送。"
+        _ddns_queue_notification error "$_msg" || return 1
     else
         ddns_log "⚠️ [异常告警] 错误已记录，跳过通知 (30分钟冷却中)。"
     fi
     return 0
 }
 
+# 菜单与 timer 共用锁，避免并发 DNS 更新、重复通知与状态文件覆盖。
+# 先完成 DNS 工作，再尝试通知；Telegram 故障不改变 DNS 更新结果。
+ddns_run_check() (
+    local rc=0
+    flock -n 8 || { ddns_log "ℹ️ 已有 DDNS 检测运行，跳过本次。"; return 0; }
+    _ddns_run_check "$@" || rc=$?
+    _ddns_flush_notifications || ddns_log "⚠️ 通知状态处理失败，保留待发记录。"
+    return "$rc"
+) 8>"$DDNS_STATE_DIR/check.lock"
+
 # 核心检测：$1 = true(交互)/false(systemd)
-ddns_run_check() {
+_ddns_run_check() {
     local _interactive="$1"
     ddns_rotate_logs
 
     local _ip=""
     _ip=$(ddns_get_ip || true)
-
-    # 每日健康推送（仅 systemd 非交互调用）
-    if [[ "$_interactive" == "false" ]]; then
-        local _hour _tag
-        _hour=$(TZ='Asia/Shanghai' date +%H)
-        _tag="$DDNS_STATE_DIR/health_$(TZ='Asia/Shanghai' date +%Y%m%d).tag"
-        # 算术比较避免 "08" != "8" 陷阱；noclobber 原子占位防并发重复推送
-        if (( 10#$_hour == 10#$DDNS_HEALTH_HOUR )) && [[ ! -f "$_tag" ]]; then
-            if ( set -o noclobber; : > "$_tag" ) 2>/dev/null; then
-                sleep $((RANDOM % 60))
-                if [[ -n "$_ip" ]]; then ddns_notify_health "$_ip"; else rm -f "$_tag"; fi
-            fi
-        fi
-    fi
 
     # 连续失败计数：单次抖动不告警，连续达阈值才推送
     local _fail_file="$DDNS_STATE_DIR/fail_count" _threshold=3
@@ -7715,7 +7853,7 @@ ddns_run_check() {
         echo "$_fc" > "$_fail_file"
         local _err="无法获取本机公网 IP，请检查网络连接。"
         ddns_log "❌ 错误：$_err (连续失败 ${_fc}/${_threshold})"
-        (( _fc >= _threshold )) && ddns_notify_error "$_err (已连续失败 ${_fc} 次)"
+        if (( _fc >= _threshold )); then ddns_notify_error "$_err (已连续失败 ${_fc} 次)" || true; fi
         [[ "$_interactive" == "true" ]] && pause
         return 1
     fi
@@ -7740,6 +7878,7 @@ ddns_run_check() {
     local _now; _now=$(date +%s)
     if [[ "$_ip" == "$_c_ip" ]] && (( _now - _last_check < _force_interval )); then
         ddns_log "🔍 [巡检] IP 无变化: $_ip"
+        _ddns_maybe_health "$_interactive" "$_ip"
         [[ "$_interactive" == "true" ]] && pause
         return 0
     fi
@@ -7752,7 +7891,7 @@ ddns_run_check() {
             | jq -r '.result[0].id // empty' 2>/dev/null || true)
         if [[ -z "$_zone_id" || "$_zone_id" == "null" ]]; then
             local _err="无法获取 Zone ID。请检查域名配置或 Token 权限。"
-            ddns_log "❌ 错误：$_err"; ddns_notify_error "$_err"
+            ddns_log "❌ 错误：$_err"; ddns_notify_error "$_err" || true
             [[ "$_interactive" == "true" ]] && pause
             return 1
         fi
@@ -7765,7 +7904,7 @@ ddns_run_check() {
             | jq -r '.result[0].id // empty' 2>/dev/null || true)
         if [[ -z "$_record_id" || "$_record_id" == "null" ]]; then
             local _err="无法获取 Record ID。请确保 Cloudflare 上已存在该 DNS 记录。"
-            ddns_log "❌ 错误：$_err"; ddns_notify_error "$_err"
+            ddns_log "❌ 错误：$_err"; ddns_notify_error "$_err" || true
             [[ "$_interactive" == "true" ]] && pause
             return 1
         fi
@@ -7780,18 +7919,18 @@ ddns_run_check() {
         ddns_log "🎉 DDNS 更新成功: $_ip"
         if [[ "$_ip" != "$_c_ip" ]]; then
             local _old_display="${_c_ip:-FirstRun}"
-            ddns_notify_change "$_old_display" "$_ip"
-            [[ "$_old_display" == "FirstRun" ]] && ddns_notify_health "$_ip"
+            ddns_notify_change "$_old_display" "$_ip" || ddns_log "⚠️ IP 变更通知保存失败。"
         fi
         {
             echo "cached_zone_id=$_zone_id"
             echo "cached_record_id=$_record_id"
             echo "cached_ip=$_ip"
             echo "last_check_time=$(date +%s)"
-        } > "$_cache"
+        } > "$_cache" || return 1
+        _ddns_maybe_health "$_interactive" "$_ip"
     else
         ddns_log "❌ 更新失败！${_resp:0:200}"
-        ddns_notify_error "更新请求失败，Cloudflare 返回: ${_resp:0:100}..."
+        ddns_notify_error "更新请求失败，Cloudflare 返回: ${_resp:0:100}..." || true
         # 保留 cached_ip（避免下次成功误报"首次配置"），仅清空可能失效的 ID 以便重取
         {
             echo "cached_zone_id="
@@ -7949,7 +8088,7 @@ ddns_paste_setup() {
     done
     DDNS_AUTH_TOKEN="$_tok"; DDNS_ZONE_NAME="$_zone"; DDNS_RECORD_NAME="$_rec"
     DDNS_INTERVAL_SEC="10"; DDNS_HEALTH_HOUR="20"
-    ddns_save_config
+    ddns_save_config || { msg_error "DDNS 配置保存失败，原配置未替换"; return 1; }
     msg_success "配置已保存: $DDNS_CONFIG_FILE"
 
     # 记录不存在则用 API 自动创建（指向本机当前公网 IP），省去去 CF 手动建
@@ -8025,7 +8164,7 @@ ddns_setup_wizard() {
     local _c
     read -rp "✅ 确认保存配置? [Y/n]: " _c || true
     if [[ "${_c,,}" != "n" ]]; then
-        ddns_save_config
+        ddns_save_config || { msg_error "DDNS 配置保存失败，原配置未替换"; return 1; }
         msg_success "配置已保存: $DDNS_CONFIG_FILE"
     else
         msg_warn "已取消，配置未保存。"
@@ -8064,7 +8203,7 @@ ddns_menu() {
     if ! ddns_config_complete; then
         printf "\n${C_YELLOW}未检测到有效 DDNS 配置，进入配置向导...${C_RESET}\n"
         sleep 1
-        ddns_setup_wizard
+        ddns_setup_wizard || { pause; return 1; }
         ddns_load_config
         if ! ddns_config_complete; then
             msg_warn "配置未完成。"; pause; return
@@ -8095,7 +8234,7 @@ ddns_menu() {
                 wait "$_tp" 2>/dev/null || true
                 ;;
             4)
-                ddns_setup_wizard
+                ddns_setup_wizard || { pause; continue; }
                 ddns_load_config
                 if systemctl is-active --quiet "${DDNS_SERVICE_NAME}.timer" 2>/dev/null; then
                     ddns_install_systemd && msg_success "服务已按新配置重启。"
