@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.2-green)
+![Version](https://img.shields.io/badge/version-v2.0.3-green)
 
 </div>
 
@@ -19,10 +19,10 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 正式版安装
 
-当前为 **v2.0.2 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
+当前为 **v2.0.3 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.2/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.3/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
@@ -31,9 +31,9 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ### 升级与兼容性
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.2。发布页：[v2.0.2](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.2)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.3。发布页：[v2.0.3](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.3)。
 
-正式代码发布到 `main`，GitHub Latest 为 `v2.0.2`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
+正式代码发布到 `main`，GitHub Latest 为 `v2.0.3`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
 
 已完成 beta.5–beta.14 初始化的测试机可从 **菜单 16 → 5** 直接更新到正式版：下载并校验后备份旧脚本、在原路径替换，无需重装、重跑菜单 1 或为脚本更新重启。也可先备份，再手动替换原路径；不要因示例文件名变成 `vps-mgr.sh` 就移动原来的 `vps-mgr-beta.sh`，systemd 可能仍引用旧路径。节点和 TG 配置保持不变，转正后脚本自动更新默认关闭，需要时从菜单 16 → 7 开启。尚未转正的 beta 若保留旧定时任务，仍会按旧逻辑自动获取正式版；新开关在安装本版后生效。
 
@@ -191,11 +191,14 @@ sing-box 配置先在 600 权限临时文件中生成并校验，再替换生效
 
 建议先在测试机验证再升级生产机。手动升级仍会重启相关服务并中断现有连接；版本提醒本身不会触碰代理进程。仅替换新版脚本即可让已有 `auto-update` 日任务执行新检查，无需重跑初始化。
 
-**测试模式**
+**临时测速模式**
 
-- 通过内核 timeout 临时开放 Ping 和 iperf3，**2 小时自动到期**，不依赖 atd，也不随重启重新开放
+- 普通 IPv4/IPv6 Ping 默认放行，不再共享每秒 1 次的限速；显式黑名单、必要的 ICMP/IPv6 控制报文规则和其他防护保留
+- 菜单 4 只通过内核 timeout 临时开放 iperf3 的 TCP/UDP 5201，**2 小时自动到期**，不依赖 atd，也不随重启重新开放；开关测速不改变普通 Ping
 - 开启时显示本机/对端 iperf3 命令，菜单显示实际自动关闭时间（上海时区）；再次选择可提前关闭
 - 两端口 NAT 容器通常没有 5201 映射，不应为测速或 TCPing 随意占用业务端口
+
+仅替换脚本不会自动改写已安装的防火墙，旧机器仍可能保留 Ping 限速。确认基础链没有需要保留的手工规则时，可用 **菜单 5 → 9 重建基础防火墙策略** 应用新默认规则；它保留业务集合、黑白名单、ACL 和配额，但会移除基础链手工编辑。含主站来源白名单或手工转发放行规则的机器，应备份并单独调整旧 Ping 规则，不要直接重建。
 
 ---
 
@@ -224,7 +227,7 @@ Token 不放入 curl 命令行，防止被本机其他用户通过进程列表�
 
 ```
  [ 系统管理 ]
- ★ 1. 一键初始化                4. 切换测试模式
+ ★ 1. 一键初始化                4. 切换测速模式
     2. Fail2Ban                 5. 防火墙规则
     3. TG 推送配置              6. 系统维护
 

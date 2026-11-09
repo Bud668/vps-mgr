@@ -36,7 +36,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Network test dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 jq python3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 iputils-ping jq python3
       - name: Native nftables and tc in disposable network namespaces
         run: |
           sudo unshare --net bash tests/test_ipv6.sh --netns

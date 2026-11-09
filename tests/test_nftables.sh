@@ -121,6 +121,34 @@ ip link set nft-test0 up
 nsenter -t "$peer_pid" -n ip addr add 192.0.2.2/24 dev nft-test1
 nsenter -t "$peer_pid" -n ip -6 addr add 2001:db8::2/64 dev nft-test1 nodad
 nsenter -t "$peer_pid" -n ip link set nft-test1 up
+ping_burst() {
+    nsenter -t "$peer_pid" -n python3 - <<'PY'
+import concurrent.futures
+import subprocess
+
+for family, address in (("4", "192.0.2.1"), ("6", "2001:db8::1")):
+    def probe(_):
+        return subprocess.run(
+            ["ping", "-" + family, "-n", "-c", "1", "-W", "1", address],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        received = sum(pool.map(probe, range(10)))
+    assert received == 10, f"IPv{family}: only {received}/10 independent Ping probes passed"
+PY
+}
+# Independent requests must not share the old 1/s bucket; one continuous Ping
+# would miss this regression because established conntrack entries bypass it.
+ping_burst
+for family in 4 6; do
+    address=192.0.2.2 target=192.0.2.1
+    [[ $family == 4 ]] || { address=2001:db8::2; target=2001:db8::1; }
+    _fw_element add "block$family" "$address"
+    if nsenter -t "$peer_pid" -n ping "-$family" -n -c 1 -W 0.2 "$target" >/dev/null; then
+        echo "IPv$family Ping bypassed blacklist" >&2; exit 1
+    fi
+    _fw_element delete "block$family" "$address"
+done
 python3 -c 'import socket,time
 s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
 s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)
@@ -272,10 +300,49 @@ _quota_commit_port 24073 "$(date +%Y-%m)"
 quota_pause_port 24073 manual
 _fw_test_mode
 assert _fw_has_element test_tcp 5201
+assert _fw_has_element test_udp 5201
 assert test -n "$(_fw_test_deadline)"
+for set in test_tcp test_udp; do
+    nft -j list set inet "$FW_TABLE" "$set" | jq -e '
+        .nftables[].set? | select(.name != null) | .timeout as $default |
+        any(.elem[]?;
+            .elem.val == 5201 and (.elem.timeout // $default) == 7200 and .elem.expires > 7100)' >/dev/null
+done
+if nft list set inet "$FW_TABLE" test_ping >/dev/null 2>&1; then
+    echo 'New installations still create a temporary ICMP bypass' >&2; exit 1
+fi
 status=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
 [[ $status == *'5201(t/u)[测试]'* && $status == *'24076(t)[TCPing]'* ]] || exit 1
 assert test "$(quota_get_port_bytes 24073)" = "$resumed_bytes 0"
+# Revoking an old broad ICMP opening must also work with the new toggle.
+nft add set inet "$FW_TABLE" test_ping '{ type nf_proto; flags timeout; timeout 2h; }'
+nft add element inet "$FW_TABLE" test_ping '{ ipv4 timeout 2h, ipv6 timeout 2h }'
+_fw_test_mode
+if _fw_has_element test_tcp 5201 || _fw_has_element test_udp 5201 ||
+    _fw_has_element test_ping ipv4 || _fw_has_element test_ping ipv6; then
+    echo 'Closing speed test left a temporary opening' >&2; exit 1
+fi
+# Remove the earlier allowlist so it cannot conceal a Ping regression.
+_fw_element delete allow4 192.0.2.2
+ping_burst
+_fw_test_mode
+if _fw_has_element test_ping ipv4 || _fw_has_element test_ping ipv6; then
+    echo 'Speed test reopened a legacy ICMP bypass' >&2; exit 1
+fi
+# Check real kernel expiry without waiting two hours; the configured 2h value
+# was verified above. Ordinary Ping must remain available after expiry.
+{
+    for set in test_tcp test_udp; do
+        printf 'flush set inet %s %s\nadd element inet %s %s { 5201 timeout 100ms }\n' \
+            "$FW_TABLE" "$set" "$FW_TABLE" "$set"
+    done
+} | _fw_apply
+sleep 0.2
+if _fw_has_element test_tcp 5201 || _fw_has_element test_udp 5201; then
+    echo 'Temporary speed-test port did not expire' >&2; exit 1
+fi
+ping_burst
+_fw_test_mode
 # Simulate lost kernel rules/reboot; persisted ACL and paused state survive,
 # temporary ports stay closed, baseline resets without losing accrued traffic.
 nft delete table inet "$FW_TABLE"
@@ -288,6 +355,7 @@ fail_enable=0
 do_init_firewall </dev/null
 assert systemctl is-enabled --quiet "$FW_SERVICE.service"
 assert test ! -e "$FW_PENDING"
+ping_burst
 quota_init
 assert _fw_has_element paused_ports 24073
 [[ $(_fw_show_status) == *已暂停*24073* ]] || exit 1
@@ -313,4 +381,4 @@ fi
     nft() { return 1; }
     [[ $(_fw_show_status) == *无法读取*CAP_NET_ADMIN* ]] || exit 1
 )
-echo 'PASS: automatic single-session setup, boot recovery/failure rollback, dual-stack policies, counters, scoped ownership'
+echo 'PASS: setup/recovery/rollback, dual-stack Ping bursts and blacklists, speed-test expiry, ACLs, counters, scoped ownership'

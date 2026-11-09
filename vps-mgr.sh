@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.2"
+readonly SCRIPT_VERSION="2.0.3"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1012,6 +1012,7 @@ _fw_require() {
 }
 
 # Persist configuration, not stale counters or temporary test openings.
+# Keep stripping test_ping elements from saved rules made by older versions.
 _fw_persist() {
     local tmp
     mkdir -p "$(dirname "$FW_CONF")" || return 1
@@ -1140,7 +1141,6 @@ table inet $FW_TABLE {
     set cn6 { type ipv6_addr; flags interval; auto-merge; }
     set test_tcp { type inet_service; flags timeout; timeout 2h; }
     set test_udp { type inet_service; flags timeout; timeout 2h; }
-    set test_ping { type nf_proto; flags timeout; timeout 2h; }
     chain socks_acl {}
     chain quota_in {}
     chain quota_out {}
@@ -1170,11 +1170,10 @@ table inet $FW_TABLE {
         udp dport @udp_ports counter accept
         tcp dport @test_tcp counter accept
         udp dport @test_udp counter accept
-        meta nfproto @test_ping meta l4proto { icmp, ipv6-icmp } counter accept
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } counter accept
-        ip protocol icmp icmp type echo-request limit rate 1/second burst 3 packets counter accept
+        ip protocol icmp icmp type echo-request counter accept
         meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } counter accept
-        meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 1/second burst 3 packets counter accept
+        meta l4proto ipv6-icmp icmpv6 type echo-request counter accept
         udp sport 67 udp dport 68 counter accept
         ip6 saddr fe80::/10 udp sport 547 udp dport 546 counter accept
         ip saddr @allow4 counter accept
@@ -1353,19 +1352,22 @@ _fw_test_mode() {
     local state
     state=$(nft -j list set inet "$FW_TABLE" test_tcp | jq '[.nftables[].set?.elem[]?] | length') || return 1
     {
-        printf 'flush set inet %s test_tcp\nflush set inet %s test_udp\nflush set inet %s test_ping\n' "$FW_TABLE" "$FW_TABLE" "$FW_TABLE"
+        printf 'flush set inet %s test_tcp\nflush set inet %s test_udp\n' "$FW_TABLE" "$FW_TABLE"
+        # Revoke a legacy broad ICMP opening when toggling the new speed test.
+        if nft list set inet "$FW_TABLE" test_ping >/dev/null 2>&1; then
+            printf 'flush set inet %s test_ping\n' "$FW_TABLE"
+        fi
         if [[ $state == 0 ]]; then
             printf 'add element inet %s test_tcp { 5201 timeout 2h }\n' "$FW_TABLE"
             printf 'add element inet %s test_udp { 5201 timeout 2h }\n' "$FW_TABLE"
-            printf 'add element inet %s test_ping { ipv4 timeout 2h, ipv6 timeout 2h }\n' "$FW_TABLE"
         fi
     } | _fw_apply || return 1
     if [[ $state == 0 ]]; then
-        msg_success "测试模式已开启，2 小时后自动关闭（$(_fw_test_deadline)）"
-        printf '  Ping：临时放行；iperf3：TCP/UDP 5201\n  本机：iperf3 -s\n  对端：iperf3 -c %s -p 5201 -P 1 -t 20 -R\n' "$SERVER_IP"
+        msg_success "测速模式已开启，2 小时后自动关闭（$(_fw_test_deadline)）"
+        printf '  iperf3：临时开放 TCP/UDP 5201\n  本机：iperf3 -s\n  对端：iperf3 -c %s -p 5201 -P 1 -t 20 -R\n' "$SERVER_IP"
         msg_info "iperf3 须手动启动；再次按 4 可提前关闭。NAT 机器还需供应商映射 5201"
     else
-        msg_success "测试模式已关闭；普通业务端口和其他规则不变"
+        msg_success "测速模式已关闭；Ping、普通业务端口和其他规则不变"
     fi
 }
 
@@ -8362,9 +8364,9 @@ show_menu() {
 
     # ── 系统管理区 ────────────────────────────────────────────────
     # 动态状态
-    local _tm_label="切换测试模式"
+    local _tm_label="切换测速模式"
     local _test_until
-    if _test_until=$(_fw_test_deadline); then _tm_label="测试中（${_test_until} 关闭，再按 4 提前关闭）"; fi
+    if _test_until=$(_fw_test_deadline); then _tm_label="测速中（${_test_until} 关闭，再按 4 提前关闭）"; fi
 
 
 
