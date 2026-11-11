@@ -16,7 +16,7 @@ readonly SNELL_VERSION_OVERRIDE="v5.0.1"
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.4"
+readonly SCRIPT_VERSION="2.0.5"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -1924,11 +1924,36 @@ except ValueError: sys.exit(1)' "$1" 2>/dev/null
 }
 
 get_current_ssh_port() {
-    # Effective configuration plus active socket (including systemd socket activation).
-    local ports
-    ports=$({ sshd -T 2>/dev/null | awk '$1=="port" {print $2}'
-        ss -H -ltnp 2>/dev/null | awk '/sshd|"ssh"/ { n=split($4,a,":"); print a[n] }'
-        [[ -n ${SSH_CONNECTION:-} ]] && awk '{print $4}' <<< "$SSH_CONNECTION"
+    local ports main_pids
+    main_pids=$(systemctl show --property=MainPID --value ssh.service sshd.service 2>/dev/null || true)
+    ports=$({
+        sshd -T 2>/dev/null | awk '$1=="port" {print $2}' || true
+        # Only the service listener counts; ssh clients and sshd sessions can forward ports.
+        ss -H -ltnp 2>/dev/null | awk -v pids="$main_pids" '
+            BEGIN { split(pids, ids, /[[:space:]]+/) }
+            {
+                for (i in ids) {
+                    if (ids[i] ~ /^[1-9][0-9]*$/ && index($0, "\"sshd\",pid=" ids[i] ",")) {
+                        n=split($4, address, ":"); print address[n]; break
+                    }
+                }
+            }' || true
+        systemctl show --property=ActiveState,Listen ssh.socket sshd.socket 2>/dev/null | awk '
+            BEGIN { RS=""; FS="\n" }
+            {
+                active=0; listen=""
+                for (i=1; i<=NF; i++) {
+                    if ($i == "ActiveState=active") active=1
+                    if ($i ~ /^Listen=/) listen=listen " " substr($i, 8)
+                }
+                if (!active) next
+                count=split(listen, endpoints, /[[:space:]]+/)
+                for (i=2; i<=count; i++) {
+                    if (endpoints[i] != "(Stream)" || endpoints[i-1] ~ /^[/@]/) continue
+                    n=split(endpoints[i-1], address, ":"); print address[n]
+                }
+            }' || true
+        if [[ -n ${SSH_CONNECTION:-} ]]; then awk '{print $4}' <<< "$SSH_CONNECTION"; fi
     } | awk '$0 ~ /^[0-9]+$/ && $0>0 && $0<=65535 {print $0+0}' | sort -nu | paste -sd, -)
     printf '%s\n' "$ports"
 }
@@ -2312,9 +2337,12 @@ _check_runtime_services() {
     fi
     if [[ -f /etc/apt/apt.conf.d/99vps-mgr-security-updates ]]; then
         if command -v unattended-upgrade >/dev/null && _security_updates_policy_ok; then
-            _ck_pass "安全补丁策略正确：仅官方安全源、不自动重启"
+            _ck_pass "安全补丁策略正确：仅官方安全源，APT 不自行重启"
         else _ck_fail "安全补丁组件缺失、已停用或策略被覆盖（菜单 6 → 8）"; fi
         timers+=(apt-daily.timer apt-daily-upgrade.timer)
+        if _security_updates_policy_ok && _security_reboot_enabled; then
+            _ck_pass "按需重启已开启：上海时间 04:00，有待重启标记且包管理空闲时执行"
+        else _ck_warn "按需重启未开启（菜单 6 → 8 → 1 启用）"; fi
         for unit in apt-daily.service apt-daily-upgrade.service; do
             state=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null) || state=unknown
             started=$(systemctl show "$unit" -p ExecMainStartTimestamp --value 2>/dev/null) || started=""
@@ -2342,7 +2370,10 @@ _check_runtime_services() {
             _ck_pass "fq 开机恢复已成功执行（一次性任务结束后 inactive 正常）"
         else _ck_warn "fq 开机任务未执行成功或未启用；当前队列以上方实际检测为准"; fi
     fi
-    [[ ! -f /var/run/reboot-required ]] || _ck_warn "系统有待重启更新，请自行安排维护时间"
+    if [[ -f /var/run/reboot-required ]]; then
+        if _security_updates_policy_ok && _security_reboot_enabled; then _ck_warn "系统有待重启更新，上海时间 04:00 检查并按需重启"
+        else _ck_warn "系统有待重启更新，请自行安排维护时间"; fi
+    fi
 }
 
 do_check_all() {
@@ -2844,6 +2875,61 @@ _security_updates_policy_ok() {
         grep -Fqx 'APT::Periodic::Enable "1";' <<< "$policy"
 }
 
+_security_reboot_enabled() {
+    systemctl is-enabled --quiet vps-mgr-security-reboot.timer &&
+        systemctl is-active --quiet vps-mgr-security-reboot.timer
+}
+
+_security_updates_reboot() {
+    [[ -f /var/run/reboot-required ]] || return 0
+    _security_updates_policy_ok && _security_reboot_enabled || return 0
+    [[ $(TZ="$TZ_DEFAULT" date +%H:%M) == 04:00 ]] || return 0
+    local unit state
+    for unit in apt-daily.service apt-daily-upgrade.service; do
+        state=$(systemctl show "$unit" --property=ActiveState --value) || return 1
+        if [[ $state != inactive ]]; then
+            msg_warn "$unit 状态为 $state，跳过本次重启，下一次上海时间 04:00 再检查"
+            return 0
+        fi
+    done
+    # APT/dpkg use POSIX locks, while apt.systemd.daily uses flock; hold both through reboot submission.
+    python3 - <<'SECURITY_REBOOT_PY'
+import contextlib
+import fcntl
+import os
+import subprocess
+import sys
+
+locks = [
+    ("/var/lib/apt/daily_lock", fcntl.flock),
+    ("/var/lib/dpkg/lock-frontend", fcntl.lockf),
+    ("/var/lib/dpkg/lock", fcntl.lockf),
+    ("/var/lib/apt/lists/lock", fcntl.lockf),
+    ("/var/cache/apt/archives/lock", fcntl.lockf),
+    ("/var/run/unattended-upgrades.lock", fcntl.lockf),
+]
+with contextlib.ExitStack() as stack:
+    for path, lock in locks:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+            stack.callback(os.close, fd)
+            lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("包管理正在运行，跳过重启；下一次上海时间 04:00 再检查")
+            sys.exit(0)
+        except OSError as error:
+            print(f"无法确认包管理锁，取消重启：{error}", file=sys.stderr)
+            sys.exit(1)
+    audit = subprocess.run(["dpkg", "--audit"], capture_output=True, text=True, timeout=30)
+    if audit.returncode or audit.stdout.strip() or audit.stderr.strip():
+        print("软件包安装状态不完整或无法确认，跳过重启；请检查 dpkg --audit")
+        sys.exit(0)
+    if os.path.isfile("/var/run/reboot-required"):
+        print("系统更新待重启，提交上海时间 04:00 的按需重启", flush=True)
+        subprocess.run(["systemctl", "reboot"], check=True)
+SECURITY_REBOOT_PY
+}
+
 _install_security_updates() {
     local distro script config=/etc/apt/apt.conf.d/99vps-mgr-security-updates tmp
     distro=$(_tg_cfg_get /etc/os-release ID)
@@ -2854,7 +2940,7 @@ _install_security_updates() {
     tmp=$(mktemp -d /etc/apt/apt.conf.d/.vps-security.XXXXXX) || return 1
     [[ ! -f $config ]] || cp -p "$config" "$tmp/previous" || { rm -rf "$tmp"; return 1; }
     if ! cat > "$tmp/config" <<'SECURITY_APT'
-// Managed by vps-mgr: official security pockets only; never reboot automatically.
+// Managed by vps-mgr: official security pockets only; reboot is handled by a separate Shanghai timer.
 #clear Unattended-Upgrade::Allowed-Origins;
 #clear Unattended-Upgrade::Origins-Pattern;
 Unattended-Upgrade::Origins-Pattern {
@@ -2898,14 +2984,38 @@ OnFailure=vps-mgr-security-update-alert.service
 ExecStartPre=-/usr/bin/touch /run/vps-mgr-security-update.started
 ExecStartPost=-/bin/bash "$script" security-update-notify completed
 EOF
+    cat > /etc/systemd/system/vps-mgr-security-reboot.service <<EOF || return 1
+[Unit]
+Description=Reboot for pending system updates at 04:00 Asia/Shanghai
+ConditionPathExists=/var/run/reboot-required
+[Service]
+Type=oneshot
+ExecStart=/bin/bash "$script" security-update-reboot
+EOF
+    cat > /etc/systemd/system/vps-mgr-security-reboot.timer <<EOF || return 1
+[Unit]
+Description=Check pending system reboot daily at 04:00 Asia/Shanghai
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=vps-mgr-security-reboot.service
+[Install]
+WantedBy=timers.target
+EOF
     systemctl daemon-reload && systemctl enable --now apt-daily.timer apt-daily-upgrade.timer --quiet &&
         systemctl is-active --quiet apt-daily.timer && systemctl is-active --quiet apt-daily-upgrade.timer &&
         systemctl is-enabled --quiet apt-daily.timer && systemctl is-enabled --quiet apt-daily-upgrade.timer || return 1
-    msg_success "系统安全更新已启用（官方安全补丁，不自动重启；软件包更新可能重启服务）"
+    if ! systemctl enable --now vps-mgr-security-reboot.timer --quiet || ! _security_reboot_enabled; then
+        systemctl disable --now vps-mgr-security-reboot.timer >/dev/null 2>&1 || true
+        return 1
+    fi
+    msg_success "系统安全更新已启用（官方安全补丁；待重启时上海时间 04:00 自动重启，包管理忙则顺延；更新可能重启服务）"
 }
 
 _security_updates_notify() {
-    local mode=${1:-completed} failed=0 reboot_needed=0 started since key notice node
+    local mode=${1:-completed} failed=0 reboot_needed=0 scheduled=0 started since key notice node
     [[ $mode == completed || $mode == download || $mode == failed ]] || return 1
     [[ $mode != failed ]] || failed=1
     # 原生 APT 日任务会吞掉部分失败退出码；只看当前 systemd invocation 的摘要。
@@ -2922,15 +3032,20 @@ _security_updates_notify() {
     fi
     [[ ! -f /var/run/reboot-required ]] || reboot_needed=1
     (( failed || reboot_needed )) || return 0
-    key="$(TZ="$TZ_DEFAULT" date +%F):$failed:$reboot_needed"
+    _tg_resolve_channel update
+    if _security_updates_policy_ok && _security_reboot_enabled; then scheduled=1; fi
+    key="$(TZ="$TZ_DEFAULT" date +%F):${TG_CHAT_ID}:${TG_THREAD_ID}:$scheduled:$failed:$reboot_needed"
     [[ ! -f $WORK_DIR/security-update.notice || $(cat "$WORK_DIR/security-update.notice") != "$key" ]] || return 0
     node=$(get_node_id)
     notice="🔧 #系统安全更新 ${node}"
     (( failed == 0 )) || notice+=$'\n⚠️ APT/安全补丁安装失败，请检查 apt-daily、apt-daily-upgrade 日志及 /var/log/unattended-upgrades/'
-    (( reboot_needed == 0 )) || notice+=$'\n⟳ 系统更新待重启生效，请自行安排维护时间；脚本不会自动重启。'
+    if (( reboot_needed )); then
+        if (( scheduled )); then
+            notice+=$'\n⟳ 系统更新待重启生效，已安排上海时间 04:00 检查并自动重启；包管理忙或异常则顺延，关机期间错过不补执行。'
+        else notice+=$'\n⟳ 系统更新待重启生效；定时重启未启用，请自行安排维护，或在菜单 6 → 8 → 1 启用。'; fi
+    fi
     log_message WARN "$notice"
-    _tg_resolve_channel ssh
-    [[ -n $TG_BOT_TOKEN && -n $TG_CHAT_ID ]] || return 0
+    [[ -n $TG_BOT_TOKEN && -n $TG_CHAT_ID && $TG_THREAD_ID =~ ^[1-9][0-9]*$ ]] || return 0
     send_telegram "$notice" "" plain || return 1
     mkdir -p "$WORK_DIR" && (umask 077; printf '%s\n' "$key" > "$WORK_DIR/security-update.notice")
 }
@@ -2941,10 +3056,13 @@ _security_updates_menu() {
     if _security_updates_policy_ok && systemctl is-active --quiet apt-daily.timer &&
         systemctl is-active --quiet apt-daily-upgrade.timer && systemctl is-enabled --quiet apt-daily.timer &&
         systemctl is-enabled --quiet apt-daily-upgrade.timer; then
-        printf '状态：官方安全更新已启用，不自动重启\n'
+        printf '状态：官方安全更新已启用\n'
     else printf '状态：未启用或策略/定时器不完整\n'; fi
-    [[ ! -f /var/run/reboot-required ]] || msg_warn "系统存在待重启更新，请安排维护"
-    printf '1. 启用 / 修复\n2. 停止后续自动安装（保留软件源更新）\n0. 返回\n'
+    if _security_updates_policy_ok && _security_reboot_enabled; then
+        printf '按需重启：上海时间 04:00，仅有待重启标记且包管理空闲时执行\n'
+    else printf '按需重启：未启用\n'; fi
+    [[ ! -f /var/run/reboot-required ]] || msg_warn "系统存在待重启更新"
+    printf '1. 启用 / 修复（含上海时间 04:00 按需重启）\n2. 停止后续自动安装和定时重启（保留软件源更新）\n0. 返回\n'
     read -rp '选择: ' choice || return 0
     case $choice in
         1) _install_security_updates ;;
@@ -2953,7 +3071,10 @@ _security_updates_menu() {
            apt-config dump | grep -Fx 'APT::Periodic::Unattended-Upgrade "0";' >/dev/null || {
                msg_error "停用策略被其他 APT 配置覆盖，请检查 apt-config dump"; return 1;
            }
-           msg_info "已停止后续自动安装；正在进行的 APT 任务不会被中断" ;;
+           systemctl disable --now vps-mgr-security-reboot.timer >/dev/null 2>&1 || {
+               if systemctl cat vps-mgr-security-reboot.timer >/dev/null 2>&1; then return 1; fi
+           }
+           msg_info "已停止后续自动安装和定时重启；正在进行的 APT 任务不会被中断" ;;
     esac
 }
 
@@ -8646,7 +8767,7 @@ main() {
     # daemon/daily/quota-* 子命令通常由 systemd 以 root 自动触发；手动以非 root 运行会在
     # iptables / 写系统文件处报错，这里提前给出友好提示而非让其半路失败。
     case "${1:-}" in
-        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq|security-update-notify|auto-update)
+        daemon|daily|quota-check|quota-daily|ddns-run|firewall-restore|firewall-rollback|cn-update|apply-fq|security-update-notify|security-update-reboot|auto-update)
             if [[ $EUID -ne 0 ]]; then
                 echo "错误: '$1' 子命令需要 root 权限（一般由 systemd 自动调用）。请用 sudo 运行。" >&2
                 exit 1
@@ -8655,6 +8776,7 @@ main() {
 
     case "${1:-}" in
         security-update-notify) _security_updates_notify "${2:-completed}"; return ;;
+        security-update-reboot) _security_updates_reboot; return ;;
         apply-fq) _apply_fq "$(ip route show default | awk '{print $5; exit}')" "${2:-}"; return ;;
         firewall-restore) _fw_ensure; return ;;
         firewall-rollback) _fw_rollback; return ;;

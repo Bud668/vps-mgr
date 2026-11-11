@@ -500,7 +500,7 @@ done
 )
 
 # 10: read-only health distinguishes enabled, running, never executed, and failed jobs.
-for scenario in fresh completed running job_failed tg_down f2b_down tcping_closed timer_disabled policy_bad; do
+for scenario in fresh completed running job_failed tg_down f2b_down tcping_closed timer_disabled reboot_timer_disabled policy_bad; do
 (
     : > "$test_dir/calls"
     _ck_pass() { printf 'PASS %s\n' "$1"; }
@@ -521,7 +521,8 @@ for scenario in fresh completed running job_failed tg_down f2b_down tcping_close
         record "systemctl $*"
         case $1 in
             is-active) [[ $scenario != tg_down || $3 != "$SSH_TG_SERVICE" ]] ;;
-            is-enabled) [[ $scenario != timer_disabled || $3 != apt-daily-upgrade.timer ]] ;;
+            is-enabled) [[ $scenario != timer_disabled || $3 != apt-daily-upgrade.timer ]] &&
+                [[ $scenario != reboot_timer_disabled || $3 != vps-mgr-security-reboot.timer ]] ;;
             show)
                 case $4 in
                     MainPID) echo 12345 ;;
@@ -544,6 +545,8 @@ for scenario in fresh completed running job_failed tg_down f2b_down tcping_close
         f2b_down) assert grep -q 'FAIL Fail2Ban' <<< "$output" ;;
         tcping_closed) assert grep -q 'FAIL TCPing' <<< "$output" ;;
         timer_disabled) assert grep -q 'FAIL apt-daily-upgrade.timer' <<< "$output" ;;
+        reboot_timer_disabled) assert grep -q 'WARN 按需重启未开启' <<< "$output";
+            reject grep -q 'PASS 按需重启已开启' <<< "$output" ;;
         policy_bad) assert grep -q 'FAIL 安全补丁组件' <<< "$output" ;;
     esac
 )

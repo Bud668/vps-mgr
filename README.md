@@ -9,7 +9,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.4-green)
+![Version](https://img.shields.io/badge/version-v2.0.5-green)
 
 </div>
 
@@ -19,10 +19,10 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ## ⚡ 正式版安装
 
-当前为 **v2.0.4 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
+当前为 **v2.0.5 正式版**，采用原生 nftables，脚本自动更新默认关闭且仅允许同大版本更新；手动跨大版本需风险提示和二次确认。首次安装仅用于干净的 Debian / Ubuntu 系统。下面固定下载正式标签，不直接执行 main 分支代码；没有 curl 时先安装：
 
 ```bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.4/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.5/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ```
 
 > v2 面向重装后的干净 Debian / Ubuntu，推荐 Debian 12/13 或 Ubuntu 22.04/24.04。需要 root、systemd 作为 PID 1、apt，以及内核 nftables 支持。容器还需要 CAP_NET_ADMIN；普通 Docker 容器不适用。
@@ -31,9 +31,9 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 
 ### 升级与兼容性
 
-**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.4。发布页：[v2.0.4](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.4)。
+**不提供 v1/iptables 升级迁移或双后端兼容。**旧 v1 机器先重装系统，再使用 v2 配置；请确认脚本显示 v2.0.5。发布页：[v2.0.5](https://github.com/Bud668/vps-mgr/releases/tag/v2.0.5)。
 
-正式代码发布到 `main`，GitHub Latest 为 `v2.0.4`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
+正式代码发布到 `main`，GitHub Latest 为 `v2.0.5`；历史正式版和 beta 标签保留不变。**仓库 Latest 不再指向 v1.4.1**：尚未安装新保护逻辑的旧脚本若仍启用了自动更新，仍可能下载 v2。发布新保护不能替代逐台关闭旧机器的更新任务。
 
 已完成 beta.5–beta.14 初始化的测试机可从 **菜单 16 → 5** 直接更新到正式版：下载并校验后备份旧脚本、在原路径替换，无需重装、重跑菜单 1 或为脚本更新重启。也可先备份，再手动替换原路径；不要因示例文件名变成 `vps-mgr.sh` 就移动原来的 `vps-mgr-beta.sh`，systemd 可能仍引用旧路径。节点和 TG 配置保持不变，转正后脚本自动更新默认关闭，需要时从菜单 16 → 7 开启。尚未转正的 beta 若保留旧定时任务，仍会按旧逻辑自动获取正式版；新开关在安装本版后生效。
 
@@ -55,7 +55,7 @@ XanMod 内核 · BBR v3 · TCP 动态调优 · 代理部署 · 端口转发 · �
 | 📊 **流量配额** | 按端口计量、超额自动暂停、到期管理 |
 | 📡 **监控告警** | Telegram 话题群推送、SSH 登录通知、流量配额告警 |
 | 🔄 **自更新** | 自动默认关闭且仅同大版本；手动跨大版本需二次确认，保留语法/版本校验、备份及防降级 |
-| 🛡️ **系统安全补丁** | 原生 APT 定时安全更新、不自动重启、失败/待重启 TG 提醒 |
+| 🛡️ **系统安全补丁** | 原生 APT 定时安全更新、上海 04:00 按需重启、更新话题 TG 提醒 |
 | ☁️ **DDNS** | Cloudflare A 记录自动更新 |
 
 ---
@@ -183,15 +183,17 @@ sing-box 使用独立用户 `singboxproxy`，仅保留低端口绑定权限；�
 
 初始化默认安装/配置 `unattended-upgrades`，复用系统 `apt-daily.timer` / `apt-daily-upgrade.timer`，不另造补丁定时器。只允许 Debian/Ubuntu 官方 `-security` 仓库；不自动更新 XanMod、Snell、Realm、sing-box 或其他第三方源，也不做发行版升级。脚本自身的每日正式版检查是独立功能。
 
-禁止自动重启；软件包维护脚本仍可能重启 SSH 或其他服务，不能承诺业务零中断。更新失败或系统标记需要重启时，通过已配置的 **SSH 话题**提醒，状态不变时每天最多一次；没配置 TG 时只记本地日志。检查原生任务失败状态、本次 APT 日志摘要和 unattended-upgrades 错误日志，不发送正常成功刷屏消息。
+启用安全更新后，默认在 **上海时间凌晨 04:00** 检查 `/var/run/reboot-required`，存在该标记且软件包安装状态完整、包管理空闲时自动重启；不受服务器本地时区影响。忙碌、安装异常时跳过，下一天 04:00 再检查；关机期间错过不补执行。APT 自带自动重启保持关闭，由本脚本的 `vps-mgr-security-reboot.timer` 统一调度。重启会短暂中断连接，软件包维护脚本也可能在安装过程中重启 SSH 或其他服务。
 
-**菜单 6 → 8** 可查看策略/定时器状态、启用/修复或停止后续自动安装；停用不强杀正在运行的 APT/dpkg，不停软件源刷新。其他 APT 配置若覆盖了安全仓库或自动重启策略，会报错而非显示启用成功。
+更新失败或系统标记需要重启时，通过已配置的 **程序更新话题**（`TG_THREAD_UPDATE`）提醒，目标和状态不变时每天最多一次；未配置更新话题时只记本地日志，不回退到 SSH 话题。检查原生任务失败状态、本次 APT 日志摘要和 unattended-upgrades 错误日志，不发送正常成功刷屏消息。
+
+**菜单 6 → 8** 可查看策略/定时器状态、启用/修复或停止后续自动安装；停用也关闭按需重启，不强杀正在运行的 APT/dpkg，不停软件源刷新。其他 APT 配置若覆盖了安全仓库或 APT 自带自动重启策略，会报错而非显示启用成功。**旧机器更新脚本后，执行一次菜单 6 → 8 → 1** 安装新的重启定时器；只替换脚本会修正通知话题，不会自动生成定时器。
 
 **Realm / sing-box 版本提醒**
 
 初始化默认复用 `vps-mgr-autoupdate.timer`，每天上海时间 **05:00–06:00** 随机执行：已安装的 Realm、sing-box **只检查新正式版并发 TG 提醒，不下载、不安装、不修改配置、不重启代理**。只接受官方 GitHub 非草稿、非预发布的三段版本号，比较版本大小，不提示降级；未安装的程序跳过。管理脚本自动更新默认关闭，只有手动开启后才在同一每日任务内检查并安装同大版本正式版。
 
-提醒使用独立的 **程序更新话题**（`TG_THREAD_UPDATE`，菜单 3 → 1 的第 6 项），包含服务器名、当前/最新版本、发布说明链接和手动更新入口（菜单 16 → 3 Realm、16 → 2 sing-box）。同一程序的同一目标版本在同一群/话题成功发送后不再重复提醒；更换群或话题后可重新提醒。未配置有效 TG 或更新话题时只记本地日志，不回退到 SSH 话题；发送失败留待下次重试。查询失败不会阻止另一程序检查或管理脚本更新。菜单 16 → 6 开关控制整项每日任务，关闭时自动检查/更新不再定时触发，系统安全补丁及其 SSH 话题告警不受影响。
+提醒使用独立的 **程序更新话题**（`TG_THREAD_UPDATE`，菜单 3 → 1 的第 6 项），包含服务器名、当前/最新版本、发布说明链接和手动更新入口（菜单 16 → 3 Realm、16 → 2 sing-box）。同一程序的同一目标版本在同一群/话题成功发送后不再重复提醒；更换群或话题后可重新提醒。未配置有效 TG 或更新话题时只记本地日志，不回退到 SSH 话题；发送失败留待下次重试。查询失败不会阻止另一程序检查或管理脚本更新。菜单 16 → 6 开关控制整项每日任务，关闭时自动检查/更新不再定时触发，系统安全补丁、按需重启及其更新话题告警不受影响。
 
 **菜单 16 → 7** 单独开关管理脚本的自动更新：默认关闭，手动开启时启用每日任务，并在 `/opt/proxy-manager/self-autoupdate.enabled` 保存明确选择；关闭只移除此选择，不关闭 Realm / sing-box 提醒。每日任务停止后，开启脚本自动更新会重新启用它。关闭不会强行中断已开始的更新。脚本仍只查询仓库 Latest：自动更新遇到更高大版本时提示并跳过，不自动寻找旧大版本维护分支。
 

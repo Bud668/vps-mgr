@@ -11,6 +11,67 @@ assert_state() {
     _firewall_init_state || status=$?
     assert_eq "$1" "$status" "$2"
 }
+# SSH forwards must not become login ports in the dashboard or firewall setup.
+(
+    sshd() { printf '%s\n' "$ssh_config"; return "${config_status:-0}"; }
+    ss() { printf '%s\n' "$listeners"; return "${ss_status:-0}"; }
+    systemctl() {
+        case "$*" in
+            'show --property=MainPID --value ssh.service sshd.service') printf '%s\n' "$service_pids" ;;
+            'show --property=ActiveState,Listen ssh.socket sshd.socket') printf '%s\n' "$sockets" ;;
+            *) return 0 ;;
+        esac
+        return "${systemctl_status:-0}"
+    }
+    ssh_config='port 26680'
+    service_pids=$'573\n\n573'
+    sockets=$'ActiveState=inactive\nListen=[::]:22 (Stream)'
+    SSH_CONNECTION='192.0.2.10 54321 192.0.2.20 26680'
+    listeners='LISTEN 0 128 127.0.0.1:1080 0.0.0.0:* users:(("ssh",pid=1882439,fd=4))
+LISTEN 0 128 127.0.0.1:1081 0.0.0.0:* users:(("ssh",pid=1682945,fd=4))
+LISTEN 0 128 127.0.0.1:1085 0.0.0.0:* users:(("ssh",pid=1684818,fd=4))
+LISTEN 0 128 0.0.0.0:26680 0.0.0.0:* users:(("sshd",pid=573,fd=6))
+LISTEN 0 128 [::]:26680 [::]:* users:(("sshd",pid=573,fd=7))
+LISTEN 0 128 127.0.0.1:1086 0.0.0.0:* users:(("sshd",pid=5730,fd=8))'
+    assert_eq 26680 "$(get_current_ssh_port)" 'exclude ssh clients, session forwards and inactive sockets'
+    nft() {
+        [[ $* == 'list tables' ]] || printf '%s\n' '{"nftables":[
+            {"chain":{"name":"input","policy":"drop"}},
+            {"set":{"name":"ssh_ports","elem":[26680]}},
+            {"set":{"name":"tcp_ports","elem":[1080,9999]}},
+            {"set":{"name":"tcping_ports","elem":[9999]}}]}'
+    }
+    _sbx_acl_status() { echo 关闭; }
+    output=$(_fw_show_status | sed -E 's/\x1B\[[0-9;]*m//g')
+    assert_eq '   SSH       ● 26680' "$(grep '^   SSH ' <<< "$output")" 'dashboard shows only login ports'
+    [[ $output == *'1080(t)'* ]] || { echo 'FAIL: ordinary port hidden by SSH misclassification'; exit 1; }
+    _fw_has_element() { [[ $* == 'ssh_ports 26680' ]]; }
+    _fw_persist() { :; }
+    log_message() { :; }
+    rm() { :; }
+    _fw_finish_init >/dev/null
+
+    unset SSH_CONNECTION
+    ssh_config=$'port 26681\nport 26682'
+    assert_eq 26680,26681,26682 "$(get_current_ssh_port)" 'keep live port after configuration changes'
+    listeners+=$'\nLISTEN 0 128 [::]:26683 [::]:* users:(("sshd",pid=573,fd=9))'
+    assert_eq 26680,26681,26682,26683 "$(get_current_ssh_port)" 'multiple actual service listeners'
+    service_pids=0; listeners=''; ssh_config=''
+    sockets=$'Listen=0.0.0.0:26680 (Stream)\nListen=[::]:26680 (Stream)\nListen=[::]:26681 (Stream)\nListen=26682 (Stream)\nListen=/run/ssh:1080 (Stream)\nListen=@ssh:1081 (Stream)\nListen=0.0.0.0:1085 (Datagram)\nActiveState=active\n\nActiveState=inactive\nListen=[::]:22 (Stream)'
+    assert_eq 26680,26681,26682 "$(get_current_ssh_port)" 'socket activation without a running sshd'
+    sockets=$'ActiveState=inactive\nListen=[::]:22 (Stream)\n\nActiveState=active\nListen=[::]:26684 (Stream)'
+    assert_eq 26684 "$(get_current_ssh_port)" 'sshd socket alias'
+    service_pids=''; sockets=''; systemctl_status=1; ss_status=1
+    ssh_config='port 26680'
+    assert_eq 26680 "$(get_current_ssh_port)" 'configuration works without systemd or ss'
+    ssh_config=''; config_status=1
+    SSH_CONNECTION='2001:db8::10 54321 2001:db8::20 26685'
+    assert_eq 26685 "$(get_current_ssh_port)" 'current connection survives all probe failures'
+    unset SSH_CONNECTION
+    assert_eq '' "$(get_current_ssh_port)" 'no fabricated port when detection is unavailable'
+    ssh_config=$'port 0\nport 65536\nport invalid\nport 026680\nport 26680'; config_status=0
+    assert_eq 26680 "$(get_current_ssh_port)" 'validate, normalize and deduplicate ports'
+)
 for pair in 1:1 10:10 80:80 080:80 100:100 1000:1000 1200:1200 1201:1176 6000:5880; do
     assert_eq "${pair#*:}" "$(_fq_maxrate_mbps "${pair%:*}")" "fq rate $pair"
 done
