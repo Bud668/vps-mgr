@@ -19,7 +19,7 @@ jobs:
       - name: Test dependencies (disposable container only)
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash shellcheck jq python3 openssl curl ca-certificates nftables iproute2 util-linux procps systemd unattended-upgrades isc-dhcp-client mtr-tiny
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash shellcheck jq python3 openssl curl ca-certificates nftables iproute2 util-linux procps systemd tzdata unattended-upgrades isc-dhcp-client mtr-tiny
       - name: Syntax and isolated regressions
         shell: bash
         run: |

@@ -2934,6 +2934,10 @@ _install_security_updates() {
     local distro script config=/etc/apt/apt.conf.d/99vps-mgr-security-updates tmp
     distro=$(_tg_cfg_get /etc/os-release ID)
     [[ $distro == debian || $distro == ubuntu ]] || { msg_error "自动安全更新仅支持 Debian/Ubuntu"; return 1; }
+    if [[ ! -r /usr/share/zoneinfo/Asia/Shanghai ]]; then
+        _apt_quiet "安装上海时区数据" install -y -qq tzdata || return 1
+        [[ -r /usr/share/zoneinfo/Asia/Shanghai ]] || { msg_error "缺少上海时区数据，未启用安全更新定时器"; return 1; }
+    fi
     script=$(realpath "$0") || return 1
     [[ $script != *$'\n'* && $script != *'"'* && $script != *'%'* && $script != *'\'* && $script != *'$'* ]] || return 1
     # 先原子写入限制策略，再安装/启用，避免首次启用时短暂使用发行版的宽泛默认策略。
@@ -3128,7 +3132,7 @@ _do_full_init() {
         bc net-tools iproute2 iputils-ping "$_dns_pkg" vim nano htop tree lsof
         screen psmisc bsdmainutils nftables python3 util-linux logrotate
         mtr-tiny iperf3 isc-dhcp-client conntrack procps systemd-timesyncd
-        socat netcat-openbsd fail2ban python3-systemd
+        socat netcat-openbsd fail2ban python3-systemd tzdata
     )
 
 

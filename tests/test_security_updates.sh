@@ -8,9 +8,11 @@ trap '[[ $test_dir == /tmp/vps-mgr-security-tests.* ]] && rm -rf "$test_dir"' EX
 source <(sed -e '/^main "\$@"$/d' \
     -e "s|/etc/|$test_dir/etc/|g" -e "s|/opt/proxy-manager|$test_dir/state|g" \
     -e "s|/var/run/|$test_dir/var-run/|g" -e "s|/run/|$test_dir/run/|g" \
+    -e "s|/usr/share/zoneinfo/Asia/Shanghai|$test_dir/zoneinfo/Asia/Shanghai|g" \
     -e "s|/var/log/|$test_dir/log/|g" "$repo_dir/vps-mgr.sh")
 mkdir -p "$test_dir/etc/apt/apt.conf.d" "$test_dir/etc/systemd/system" "$test_dir/run" \
-    "$test_dir/var-run" "$test_dir/log/unattended-upgrades" "$WORK_DIR"
+    "$test_dir/var-run" "$test_dir/log/unattended-upgrades" "$test_dir/zoneinfo/Asia" "$WORK_DIR"
+touch "$test_dir/zoneinfo/Asia/Shanghai"
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
 reject() { if "$@"; then printf 'FAIL: accepted %s\n' "$*" >&2; exit 1; fi; }
 record() { printf '%s\n' "$*" >> "$test_dir/calls"; }
@@ -32,6 +34,34 @@ printf 'Dir::Etc::main "%s/no-main.conf";\nDir::Etc::parts "%s/etc/apt/apt.conf.
 apt-config() {
     APT_CONFIG="$test_dir/apt-isolated.conf" command apt-config "$@"
 }
+# A slim image must acquire Shanghai timezone data before configuring any timer.
+for timezone_result in failed missing installed; do
+(
+    : > "$test_dir/calls"
+    rm "$test_dir/zoneinfo/Asia/Shanghai" 2>/dev/null || true
+    config_before=$(sha256sum "$test_dir/etc/apt/apt.conf.d/99vps-mgr-security-updates" 2>/dev/null || true)
+    _apt_quiet() {
+        record "apt-quiet $*"
+        [[ $* == '安装上海时区数据 install -y -qq tzdata' ]] || return 99
+        case $timezone_result in
+            failed) return 1 ;;
+            missing) return 0 ;;
+            installed) touch "$test_dir/zoneinfo/Asia/Shanghai" ;;
+        esac
+    }
+    if [[ $timezone_result == installed ]]; then
+        _install_security_updates
+        assert test -r "$test_dir/zoneinfo/Asia/Shanghai"
+        assert grep -q 'systemctl enable --now vps-mgr-security-reboot.timer' "$test_dir/calls"
+    else
+        reject _install_security_updates
+        assert test "$config_before" = "$(sha256sum "$test_dir/etc/apt/apt.conf.d/99vps-mgr-security-updates" 2>/dev/null || true)"
+        assert test ! -e "$test_dir/etc/systemd/system/vps-mgr-security-reboot.timer"
+        reject grep -q '^systemctl ' "$test_dir/calls"
+    fi
+    assert grep -qx 'apt-quiet 安装上海时区数据 install -y -qq tzdata' "$test_dir/calls"
+)
+done
 _install_security_updates
 assert _security_updates_policy_ok
 if [[ -f /usr/bin/unattended-upgrade ]]; then
