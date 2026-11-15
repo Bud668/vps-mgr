@@ -313,15 +313,6 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
         if [[ ${*: -1} == _init_srv_name && $environment == tg_* ]]; then
             _init_srv_name="Name_$environment"; return 0
         fi
-        if [[ ${*: -1} == _tg_ans ]]; then
-            case $environment in
-                tg_direct) _tg_ans=123:direct-paste ;;
-                tg_skip) _tg_ans=n ;;
-                tg_eof) return 1 ;;
-                *) _tg_ans=y ;;
-            esac
-            return 0
-        fi
         if [[ ${*: -1} == answer ]]; then answer=y; return 0; fi
         if [[ ${*: -1} == _dns_choice ]]; then
             assert test "$*" = '-r -t 3 _dns_choice'
@@ -359,7 +350,9 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
     do_init_firewall() { record firewall; }
     _tg_input_tokens() {
         record telegram
-        if [[ $environment == tg_direct ]]; then assert test "${2:-}" = 123:direct-paste; fi
+        assert test "$#" = 2
+        assert test "$2" = ask
+        [[ $environment != tg_skip && $environment != tg_eof ]] || return 1
         _write_tg_conf 123:offline -100123 "${1:-test}" 4 5 6
         [[ $environment != partial ]]
     }
@@ -450,7 +443,7 @@ for environment in vps cf google blank invalid timeout unlocked dns_fail dns_hoo
         assert grep -q 'TCPing 已启用：端口 9999' "$test_dir/init-$environment.log"
     fi
     case $environment in
-        tg_skip|tg_eof|tg_existing|tg_existing_fail)
+        tg_existing|tg_existing_fail)
             if grep -qx telegram "$test_dir/calls"; then echo 'Unexpected TG reconfiguration'; exit 1; fi ;;
         *) assert grep -qx telegram "$test_dir/calls" ;;
     esac

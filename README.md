@@ -7,9 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.5-green)
+![Version](https://img.shields.io/badge/version-v2.0.6-green)
 
-当前正式版：**v2.0.5**。版本改动记录见 [GitHub Releases](https://github.com/Bud668/vps-mgr/releases)，本页介绍功能和使用方法。
+当前正式版：**v2.0.6**。版本改动记录见 [GitHub Releases](https://github.com/Bud668/vps-mgr/releases)，本页介绍功能和使用方法。
 
 ## 功能与特点
 
@@ -57,7 +57,7 @@
 在新系统的 SSH 终端中完整复制下面这一条命令。它会在缺少 curl 时先安装依赖，再下载固定正式版并检查脚本语法：
 
 ~~~bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.5/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.6/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ~~~
 
 安装后保留脚本的原路径，防火墙和定时任务会引用它。以后回到这个目录执行：
@@ -215,7 +215,7 @@ SS 的 **9 → 1 → 5** 更新 CN 地址库，**9 → 1 → 7/8** 添加或查�
 
 话题 ID 可从该话题“复制链接”的末尾数字获取。群 ID 可从自己机器人 Bot API 的 getUpdates 响应中的 message.chat.id 确认；群 ID 与话题 ID 是两个不同的值。
 
-整段粘贴六项会自动进入验证。内容隐藏，但会显示已接收项数；核对群和话题后输入 y 保存。逐行输入时每行按回车；只填 2～5 项时连按两次回车结束。支持注释和空行，单独输入 q 放弃。
+初始化时会询问是否配置 TG：回车或 Y 开始，N 跳过，也可在询问处直接粘贴整段配置。Y/N 输入可见，Token 显示星号，群和话题 ID 显示数字，同时显示已接收项数。整段粘贴六项会自动进入验证，无需补回车；格式和 Bot 验证通过后自动保存，无需再次输入 y。逐行输入时每行按回车；只填 2～5 项时连按两次回车结束。支持注释和空行，输入期间单独输入 q 可放弃。保存后会测试各话题通道，提示是否送达。
 
 保存后用 **3 → 4** 测试推送。更新话题未配置时，程序更新和安全补丁通知只记本地日志，不会改发 SSH 话题。多台服务器可以共用一组群和话题，通过各自服务器名称区分消息。
 
@@ -337,7 +337,7 @@ sysctl net.ipv4.tcp_congestion_control
 
 ### TG 输入不显示 是不是没有粘贴成功
 
-输入隐藏是为了避免凭据留在终端画面。观察接收进度，核对随后显示的群和话题；用 **3 → 4** 测试发送。更新话题是配置第 6 项，缺失时更新通知只记日志。
+Token 用星号显示，避免密钥留在终端画面；群和话题 ID 会显示数字，输入时即可看到反馈。配置校验通过后自动保存，观察随后的通道送达结果，也可用 **3 → 4** 测试发送。更新话题是配置第 6 项，缺失时更新通知只记日志。
 
 ### 更新脚本后要不要重新初始化
 

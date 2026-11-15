@@ -34,8 +34,8 @@ for caller in _do_full_init do_system_update; do
     assert grep -q '_confirm_reboot' < <(declare -f "$caller")
 done
 
-# 2/7: direct-paste seed, comments, optional topics, trailing blanks, immediate q, EOF.
-for scenario in full seeded minimal legacy comments bracketed seeded_bracketed q mid_q bracketed_q invalid_token invalid_hub invalid_topic invalid_update eof short_eof save_fail monitor_fail notify_fail; do
+# 2/7: direct paste, comments, optional topics, trailing blanks, immediate q, EOF.
+for scenario in full minimal legacy comments bracketed q mid_q bracketed_q invalid_token invalid_hub invalid_topic invalid_update eof short_eof save_fail monitor_fail notify_fail; do
 (
     : > "$test_dir/calls"
     _tg_api() { record api; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
@@ -43,15 +43,12 @@ for scenario in full seeded minimal legacy comments bracketed seeded_bracketed q
     _tg_notify_configured() { record notify; [[ $scenario != notify_fail ]]; }
     install_quota_services() { record quota; }
     if [[ $scenario == save_fail ]]; then _write_tg_conf() { record save-failed; return 1; }; fi
-    payload=$'123:fake_secret\n-100123\n4\n5\n6\n7\n\ny'
-    seed=''
+    payload=$'123:fake_secret\n-100123\n4\n5\n6\n7\n\n'
     case $scenario in
-        seeded) seed=123:fake_secret; payload=$'-100123\n4\n5\n6\n7\n\ny' ;;
-        minimal) payload=$'123:fake_secret\n-100123\n\n\ny' ;;
-        legacy) payload=$'123:fake_secret\n-100123\n4\n5\n6\n\n\ny' ;;
-        comments) payload=$'# comment\n123:fake_secret\n\n-100123\n4\n5\n6\n7\ny' ;;
-        bracketed) payload=$'\e[200~123:fake_secret\r\n-100123\r\n4\r\n5\r\n6\r\n7\e[201~\r\n\e[200~y\e[201~' ;;
-        seeded_bracketed) seed=$'\e[200~123:fake_secret'; payload=$'-100123\n4\n5\n6\n7\n\e[201~y' ;;
+        minimal) payload=$'123:fake_secret\n-100123\n\n\n' ;;
+        legacy) payload=$'123:fake_secret\n-100123\n4\n5\n6\n\n\n' ;;
+        comments) payload=$'# comment\n123:fake_secret\n\n-100123\n4\n5\n6\n7\n' ;;
+        bracketed) payload=$'\e[200~123:fake_secret\r\n-100123\r\n4\r\n5\r\n6\r\n7\e[201~\r\n' ;;
         q) payload=q ;;
         mid_q) payload=$'123:fake_secret\nq' ;;
         bracketed_q) payload=$'\e[200~Q\e[201~' ;;
@@ -65,10 +62,10 @@ for scenario in full seeded minimal legacy comments bracketed seeded_bracketed q
     rc=0
     if [[ $scenario == eof ]]; then
         output=$(_tg_input_tokens test-server </dev/null 2>&1) || rc=$?
-    else output=$(_tg_input_tokens test-server "$seed" <<< "$payload" 2>&1) || rc=$?; fi
+    else output=$(_tg_input_tokens test-server <<< "$payload" 2>&1) || rc=$?; fi
     reject grep -Fq fake_secret <<< "$output"
     case $scenario in
-        full|seeded|minimal|legacy|comments|bracketed|seeded_bracketed)
+        full|minimal|legacy|comments|bracketed)
             assert test "$rc" = 0
             assert test "$(_tg_cfg_get "$TG_CONF" TG_BOT_TOKEN)" = 123:fake_secret
             assert _tg_config_valid
@@ -86,12 +83,31 @@ for scenario in full seeded minimal legacy comments bracketed seeded_bracketed q
         monitor_fail) assert grep -q 'SSH 监控未就绪' <<< "$output" ;;
     esac
     case $scenario in
-        seeded|seeded_bracketed)
-            assert grep -q '已收到 Token（隐藏）' <<< "$output"
-            reject grep -q '粘贴配置，支持' <<< "$output" ;;
         invalid_token) assert grep -q '第 1 行 Token 格式不正确' <<< "$output" ;;
         invalid_hub) assert grep -q '第 2 行 Chat ID 格式不正确' <<< "$output" ;;
         invalid_topic|invalid_update) assert grep -q '第 3–6 行话题 ID 格式不正确' <<< "$output" ;;
+    esac
+)
+done
+for answer in '' y Y yes YES YeS n N no NO No q Q eof; do
+(
+    : > "$test_dir/calls"
+    _tg_api() { record api; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
+    _write_tg_conf() { record saved; }
+    _setup_ssh_tg_monitor() { :; }
+    _tg_notify_configured() { :; }
+    install_quota_services() { :; }
+    rc=0
+    if [[ $answer == eof ]]; then
+        output=$(_tg_input_tokens test-server ask </dev/null 2>&1) || rc=$?
+    else
+        payload="$answer"$'\n123:fake_secret\n-100123\n4\n5\n6\n7\n'
+        output=$(_tg_input_tokens test-server ask <<< "$payload" 2>&1) || rc=$?
+    fi
+    reject grep -Fq fake_secret <<< "$output"
+    case ${answer,,} in
+        ''|y|yes) assert test "$rc" = 0; assert grep -qx saved "$test_dir/calls" ;;
+        *) assert test "$rc" != 0; assert test ! -s "$test_dir/calls" ;;
     esac
 )
 done
@@ -151,6 +167,7 @@ python3 - "$repo_dir/vps-mgr.sh" <<'PY'
 import errno
 import os
 import pty
+import re
 import select
 import signal
 import sys
@@ -162,7 +179,10 @@ source <(sed '/^main "\$@"$/d' "$1")
 log_message() { :; }
 test_scenario=${3:-}
 _tg_api() { [[ $test_scenario != late_extra ]] || sleep 0.3; printf '{"ok":true,"result":{"username":"offline_bot"}}'; }
-_write_tg_conf() { printf '\nPTY_SAVED\nPTY_UPDATE=%s\n' "${7:-none}"; }
+_write_tg_conf() {
+    [[ $1 == 1234567890:pty_fake_secret_With-Dashes_1234567890 ]] || { echo PTY_BAD_TOKEN; return 1; }
+    printf '\nPTY_SAVED\nPTY_HUB=%s\nPTY_UPDATE=%s\n' "$2" "${7:-none}"
+}
 _setup_ssh_tg_monitor() { :; }
 _tg_notify_configured() { :; }
 install_quota_services() { :; }
@@ -189,7 +209,6 @@ field_count = len(fields)
 plain = b'\n'.join(fields)
 cases = [('plain', plain + b'\n\n\n', 0), ('no_final_newline', plain, 0),
          ('q', b'q\n', 1), ('Q', b'Q\n', 1), ('bracketed_q', b'\x1b[200~Q\x1b[201~\n', 1),
-         ('confirm_q', plain + b'\n', 1),
          ('extra', plain + b'\n7\ny\n', 1),
          ('extra_framed', b'\x1b[200~' + plain + b'\ny\n7\x1b[201~', 1),
          ('late_extra', plain + b'\n', 1),
@@ -199,21 +218,43 @@ cases = [('plain', plain + b'\n\n\n', 0), ('no_final_newline', plain, 0),
          ('minimal', b'\n'.join(fields[:2]) + b'\n\n\n', 0),
          ('legacy', b'\n'.join(fields[:-1]) + b'\n\n\n', 0),
          ('legacy_framed', b'\x1b[200~' + b'\n'.join(fields[:-1]) + b'\x1b[201~', 0),
-         ('manual', fields[0] + b'\n', 0), ('manual_edit', fields[0] + b'\n', 0)]
+         ('manual', fields[0] + b'\n', 0), ('manual_edit', fields[0] + b'\n', 0),
+         ('visible_edit', fields[0][:14], 0)]
 for separator in (b'\n', b'\r', b'\r\n'):
     block = separator.join(fields)
     cases += [('bracketed', b'\x1b[200~' + block + b'\x1b[201~', 0),
               ('marker_on_next_line', b'\x1b[200~' + block + separator + b'\x1b[201~\n', 0)]
-for entry, name, payload, result in [(entry, *case) for entry in ('config', 'init') for case in cases]:
+def current_line(data):
+    line, cursor = [], 0
+    for char in re.findall(r'\x1b\[[0-9;?]*[A-Za-z]|.', data.decode(errors='replace'), re.S):
+        if char.startswith('\x1b['):
+            continue
+        if char == '\n':
+            line, cursor = [], 0
+        elif char == '\r':
+            cursor = 0
+        elif char == '\b':
+            cursor = max(0, cursor - 1)
+        else:
+            if cursor == len(line):
+                line.append(char)
+            else:
+                line[cursor] = char
+            cursor += 1
+    return ''.join(line).rstrip()
+
+entries = [(entry, *case) for entry in ('config', 'init') for case in cases]
+entries += [('init', 'init_y', b'y\n', 0), ('init', 'init_n', b'n\n', 1)]
+for entry, name, payload, result in entries:
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], entry, name])
     output = b''
     sent_at = None
     tail_sent = False
-    confirm_sent = False
     cancel_sent = False
     manual_index = 1
+    edit_stage = 0
     last_manual = 0
     prompt = '是否现在配置'.encode() if entry == 'init' else b'>>> '
     deadline = time.monotonic() + 8
@@ -223,6 +264,9 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                 os.write(fd, payload)
                 sent_at = time.monotonic()
                 last_manual = sent_at
+            if name == 'init_y' and b'>>> ' in output and not tail_sent:
+                os.write(fd, plain + b'\n')
+                tail_sent = True
             if name.startswith('split_') and sent_at is not None and not tail_sent and time.monotonic() - sent_at > (0.8 if name == 'split_framed' else 0.1):
                 assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
                 os.write(fd, b'345678' + (b'\x1b[201~' if name == 'split_framed' else b''))
@@ -240,6 +284,28 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                     assert b'offline_bot' not in output and b'PTY_SAVED' not in output, output
                     os.write(fd, b'345678\n')
                     manual_index += 1
+            if name == 'visible_edit' and sent_at is not None and time.monotonic() - last_manual > 0.15:
+                line = current_line(output)
+                if edit_stage == 0:
+                    assert line.endswith('*' * 14) and fields[0][:14] not in output, (entry, line)
+                    os.write(fd, b'\x15')
+                    edit_stage = 1
+                elif edit_stage == 1:
+                    assert '*' not in line, (entry, line)
+                    os.write(fd, fields[0] + b'\n')
+                    edit_stage = 2
+                elif edit_stage == 2 and line.endswith('Chat ID >'):
+                    os.write(fd, b'-100oops')
+                    edit_stage = 3
+                elif edit_stage == 3:
+                    assert line.endswith('-100****') and b'oops' not in output, (entry, line)
+                    os.write(fd, b'\x15')
+                    edit_stage = 4
+                elif edit_stage == 4:
+                    assert line.endswith('Chat ID >'), (entry, line)
+                    os.write(fd, b'\n'.join(fields[1:]) + b'\n')
+                    edit_stage = 5
+                last_manual = time.monotonic()
             if name == 'late_extra' and '正在验证 Bot...'.encode() in output and not tail_sent:
                 os.write(fd, b'y\n')
                 tail_sent = True
@@ -249,12 +315,6 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
                     assert b'offline_bot' not in output, output
                 os.write(fd, b'q\n')
                 cancel_sent = True
-            if '确认写入？'.encode() in output and not confirm_sent:
-                assert b'PTY_SAVED' not in output, output
-                if name not in ('minimal', 'legacy', 'legacy_framed'):
-                    assert b'12345678' in output, (entry, name, output)
-                os.write(fd, b'Q\n' if name == 'confirm_q' else b'y\n')
-                confirm_sent = True
             if select.select([fd], [], [], 0.05)[0]:
                 try:
                     chunk = os.read(fd, 65536)
@@ -268,16 +328,22 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
         assert sent_at is not None and f'PTY_DONE={result}'.encode() in output, (entry, name, output)
         assert b'PTY_TTY_OK' in output, (entry, name, output)
         assert b'pty_fake_secret' not in output, output
-        prompts = 2 if name.startswith('extra') or name == 'late_extra' else 0 if entry == 'init' and name in ('q', 'Q', 'bracketed_q') else 1
+        assert '确认写入？'.encode() not in output, (entry, name, output)
+        prompts = 2 if name.startswith('extra') or name == 'late_extra' else 0 if entry == 'init' and name in ('q', 'Q', 'bracketed_q', 'init_n') else 1
         assert output.count(b'>>> ') == prompts, (entry, name, output)
         assert '格式不正确'.encode() not in output, (entry, name, output)
         assert (b'PTY_SAVED' in output) == (result == 0), output
         if result == 0:
+            assert b'PTY_HUB=-1001234567890' in output, (entry, name, output)
             if name in ('minimal', 'legacy', 'legacy_framed'):
                 assert b'PTY_UPDATE=none' in output, (entry, name, output)
             else:
                 assert f'已接收 {field_count}/{field_count} 项'.encode() in output, (entry, name, output)
                 assert b'PTY_UPDATE=12345678' in output, (entry, name, output)
+        if name == 'visible_edit':
+            assert edit_stage == 5, (entry, name, output)
+        if name == 'init_n':
+            assert '已跳过 TG 配置'.encode() in output and b'offline_bot' not in output, output
         if name.startswith('extra'):
             assert f'配置超过 {field_count} 项或含多余输入'.encode() in output, output
             assert f'已接收 {field_count + 1}/{field_count}'.encode() not in output, output
@@ -289,18 +355,19 @@ for entry, name, payload, result in [(entry, *case) for entry in ('config', 'ini
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
         os.close(fd)
-print('PASS: real TTY auto-submit, progress, extra-input guard, split paste, manual input and terminal restore')
+print('PASS: real TTY auto-save, init opt-in/skip, masked Token, visible IDs, editing, paste guards and terminal restore')
 
-for interrupt in (b'\x03', b'\x04'):
+for entry, interrupt in [(entry, interrupt) for entry in ('config', 'init') for interrupt in (b'\x03', b'\x04')]:
     pid, fd = pty.fork()
     if pid == 0:
-        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], 'config'])
+        os.execvp('bash', ['bash', '--noprofile', '--norc', '-c', code, 'pty-test', sys.argv[1], entry])
     output = b''
     interrupted = False
+    prompt = '是否现在配置'.encode() if entry == 'init' else b'>>> '
     deadline = time.monotonic() + 5
     try:
         while time.monotonic() < deadline:
-            if b'>>> ' in output and not interrupted and not termios.tcgetattr(fd)[3] & termios.ECHO:
+            if prompt in output and not interrupted and not termios.tcgetattr(fd)[3] & termios.ECHO:
                 os.write(fd, interrupt)
                 interrupted = True
             if select.select([fd], [], [], 0.05)[0]:
