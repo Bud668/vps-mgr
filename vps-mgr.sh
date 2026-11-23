@@ -10,13 +10,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 # ── 手动配置区（升级时只改这里）──────────────────────────────────
 readonly SNELL_VERSION_OVERRIDE="v5.0.1"
+readonly SNELL_BETA_VERSION="v6.0.0"
 
 
 # ==============================================================================
 # SECTION 1: 全局常量
 # ==============================================================================
 
-readonly SCRIPT_VERSION="2.0.6"
+readonly SCRIPT_VERSION="2.0.7"
 readonly SELF_REPO="Bud668/vps-mgr"
 readonly TZ_DEFAULT="Asia/Shanghai"
 readonly WORK_DIR="/opt/proxy-manager"
@@ -45,7 +46,7 @@ readonly SNELL_USER="snellproxy"
 readonly SNELL_BIN="/usr/local/bin/snell-server"
 readonly SNELL_CONFIG_DIR="/etc/snell"
 readonly SNELL_SERVICE_FILE="/etc/systemd/system/snell@.service"
-# Snell 无 --version，安装时把版本号落盘记录，供更新检查比对
+# 优先读取程序 --version，安装记录仅供旧版本兼容。
 readonly SNELL_VERSION_FILE="/etc/snell/.version"
 # Snell 无 GitHub 仓库，版本从 Surge 官方 KB 页面抓取
 readonly SNELL_KB_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
@@ -265,6 +266,8 @@ detect_arch() {
 
 SNELL_ARCH=$(detect_arch)
 SS_ARCH=$SNELL_ARCH
+# Snell 官方提供 i386；不要把其他代理核心的架构支持一起扩大。
+case "$(uname -m)" in i386|i486|i586|i686) SNELL_ARCH=i386 ;; esac
 
 _valid_ipv4() {
     [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -4282,6 +4285,48 @@ get_server_info() {
 # 核心服务管理逻辑
 # ------------------------------------------------------------------------------
 
+_snell_version_valid() {
+    [[ ${1:-} =~ ^v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?$ ]]
+}
+
+_snell_binary_version() {
+    local raw line
+    [[ -x $1 ]] || return 1
+    raw=$(timeout 5 "$1" --version 2>&1) || return 1
+    while IFS= read -r line; do
+        if [[ $line =~ (^|[[:space:]])snell-server[[:space:]]+(v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?)([[:space:]]+\([^()]*\))?[[:space:]]*$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[2]}"; return 0
+        fi
+    done <<< "$raw"
+    return 1
+}
+
+_snell_stable_version() {
+    # 官方 v6.0.0 没有 beta 后缀但仍在测试；官方转正后再放开该大版本。
+    [[ ${1:-} =~ ^v[1-5]\.[0-9]+\.[0-9]+$ ]]
+}
+
+_snell_version_lt() {
+    local current=${1#v} target=${2#v}
+    dpkg --compare-versions "${current/b/~b}" lt "${target/b/~b}"
+}
+
+_snell_arch_supported() {
+    case "$SNELL_ARCH" in
+        amd64|i386|aarch64) return 0 ;;
+        armv7l) [[ ${1#v} == [1-5].* ]] && return 0 ;;
+    esac
+    msg_error "Snell $1 不提供当前架构 $SNELL_ARCH 的官方包；V6 支持 amd64/i386/aarch64，armv7l 请选 V5"
+    return 1
+}
+
+_snell_url_version() {
+    local filename=${1%%\?*}
+    filename=${filename##*/}
+    [[ $filename =~ ^snell-server-(v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?)-linux-(amd64|i386|aarch64|armv7l)\.zip$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 # 获取已安装的版本号
 get_installed_version() {
     local service_name=$1
@@ -4289,10 +4334,17 @@ get_installed_version() {
     local ver=""
     case "$service_name" in
         snell)
-            # Snell 无 --version，读安装时落盘的版本号；缺失（旧脚本装的）则回退内置版本
-            if [[ -f "$SNELL_BIN" ]]; then
-                ver=$(cat "$SNELL_VERSION_FILE" 2>/dev/null || true)
-                [[ "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || ver="${SNELL_VERSION_OVERRIDE}"
+            if [[ -f "$bin_path" ]]; then
+                ver=$(_snell_binary_version "$bin_path") || ver=""
+                if [[ -z $ver && -f $SNELL_VERSION_FILE && ! -L $SNELL_VERSION_FILE ]]; then
+                    local owner mode
+                    owner=$(stat -c %u "$SNELL_VERSION_FILE" 2>/dev/null) || owner=""
+                    mode=$(stat -c %a "$SNELL_VERSION_FILE" 2>/dev/null) || mode=""
+                    if [[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#022) == 0 )); then
+                        ver=$(cat "$SNELL_VERSION_FILE" 2>/dev/null || true)
+                        _snell_version_valid "$ver" || ver=""
+                    fi
+                fi
             fi
             ;;
         realm|sing-box)
@@ -4354,19 +4406,19 @@ check_service_status() {
 # 版本检查与更新
 # ------------------------------------------------------------------------------
 
-# 从 Surge KB 抓取 Snell 最新【稳定版】(排除 beta)。
-# 锚定到 snell-server-vX.Y.Z-linux 下载链接取版本——页面上还混着 Surge 客户端等无关
-# 版本号，直接 grep 全页会误取（如 v7.2.0）。'-linux' 紧跟补丁号，天然排除 bN 结尾的
-# beta。任何一步失败都回退内置 SNELL_VERSION_OVERRIDE，保证抓取源挂了也不影响装/升级。
+# V6 尚为 beta，不能仅按下载文件有没有 b 后缀判断稳定版。
 _snell_latest_stable() {
     local _html _ver
     _html=$(curl -fsSL --max-time 12 "$SNELL_KB_URL" 2>/dev/null) \
         || { echo "$SNELL_VERSION_OVERRIDE"; return; }
     _ver=$(printf '%s' "$_html" \
-        | grep -oE 'snell-server-v[0-9]+\.[0-9]+\.[0-9]+-linux' \
+        | grep -oE 'snell-server-v[1-5]\.[0-9]+\.[0-9]+-linux' \
         | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' \
-        | sort -V | tail -1)
-    [[ "$_ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$_ver" || echo "$SNELL_VERSION_OVERRIDE"
+        | sort -V | tail -1) || _ver=""
+    # 新页面可能仅保留 V6 和旧 V4 下载链接，不能因此把 V5 误判为过期。
+    if _snell_stable_version "$_ver" && ! _snell_version_lt "$_ver" "$SNELL_VERSION_OVERRIDE"; then
+        echo "$_ver"
+    else echo "$SNELL_VERSION_OVERRIDE"; fi
 }
 
 # 后台空闲检查新版本 (每24小时一次)，结果写入缓存
@@ -4387,7 +4439,8 @@ check_updates_background() {
         [[ -f "$SNELL_BIN" ]] && snell_installed=$(get_installed_version snell "$SNELL_BIN")
         if [[ -n "$snell_installed" && -f "$SNELL_BIN" ]]; then
             snell_latest=$(_snell_latest_stable)
-            if [[ "$snell_installed" != "$snell_latest" && "$snell_installed" != "未知" ]]; then
+            if _snell_version_valid "$snell_installed" &&
+                _snell_version_lt "$snell_installed" "$snell_latest"; then
                 results+="snell:${snell_latest}${NL}"
             fi
         fi
@@ -4420,7 +4473,15 @@ check_updates_background() {
 get_cached_latest_version() {
     local service_name=$1
     if [[ ! -f "$UPDATE_CHECK_CACHE" ]]; then echo ""; return; fi
-    grep -m1 "^${service_name}:" "$UPDATE_CHECK_CACHE" 2>/dev/null | cut -d: -f2 || true
+    local latest installed
+    latest=$(grep -m1 "^${service_name}:" "$UPDATE_CHECK_CACHE" 2>/dev/null | cut -d: -f2) || latest=""
+    if [[ $service_name == snell ]]; then
+        _snell_stable_version "$latest" || return 0
+        installed=$(get_installed_version snell "$SNELL_BIN")
+        _snell_version_valid "$installed" || return 0
+        _snell_version_lt "$installed" "$latest" || return 0
+    fi
+    printf '%s\n' "$latest"
 }
 
 # 复用每日任务，只通知已安装的代理；不调用安装、配置或服务重启入口。
@@ -4487,46 +4548,59 @@ update_service() {
     case "$service_name" in
         snell)
             if [[ ! -f "$SNELL_BIN" ]]; then msg_error "Snell 未安装。"; return; fi
-            local installed _latest
+            local installed _latest snell_input
             installed=$(get_installed_version snell "$SNELL_BIN")
             msg_step "正在从 Surge KB 查询最新稳定版..."
             _latest=$(_snell_latest_stable)
             printf "  当前已安装: ${C_YELLOW}%s${C_RESET}\n" "$installed"
             printf "  最新稳定版: ${C_GREEN}%s${C_RESET}\n" "$_latest"
-            printf "\n${C_CYAN}请输入目标版本号或完整下载链接 (直接回车使用最新稳定版 %s):${C_RESET}\n" "$_latest"
-            printf "  格式1 - 版本号: ${C_WHITE}v5.0.2${C_RESET}  (装 beta 如 v6.0.0b4 也可)\n"
-            printf "  格式2 - 完整URL: ${C_WHITE}https://dl.nssurge.com/snell/snell-server-vX.X.X-linux-amd64.zip${C_RESET}\n"
+            printf '\n  1. %s（官方 beta，客户端须支持 Snell V6）\n' "$SNELL_BETA_VERSION"
+            printf '  2. %s（稳定版）\n' "$_latest"
+            printf '  也可输入版本号（含 bN）或完整 HTTPS 下载链接；q 返回\n'
+            printf '  回车仅更新当前大版本的稳定版，不跨版本或降级\n'
             printf "${C_PURPLE}>>> ${C_RESET}"
-            read -r snell_input
+            read -r snell_input || return 1
             snell_input="${snell_input// /}"
 
             local target_version snell_download_url
-            if [[ -z "$snell_input" ]]; then
+            if [[ $snell_input == q || $snell_input == Q ]]; then return 0
+            elif [[ -z "$snell_input" ]]; then
+                if ! _snell_version_valid "$installed" || [[ ${installed%%.*} != "${_latest%%.*}" ]] ||
+                    ! _snell_version_lt "$installed" "$_latest"; then
+                    msg_info "没有可默认安装的同大版本稳定更新；V6 beta 或切换版本请显式选择"; return 0
+                fi
                 target_version="$_latest"
+                snell_download_url="https://dl.nssurge.com/snell/snell-server-${target_version}-linux-${SNELL_ARCH}.zip"
+            elif [[ $snell_input == 1 || $snell_input == 2 ]]; then
+                target_version=$SNELL_BETA_VERSION
+                [[ $snell_input != 2 ]] || target_version=$_latest
                 snell_download_url="https://dl.nssurge.com/snell/snell-server-${target_version}-linux-${SNELL_ARCH}.zip"
             elif [[ "$snell_input" =~ ^https:// ]]; then
                 snell_download_url="$snell_input"
-                target_version=$(echo "$snell_input" | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "(自定义)")
+                target_version=$(_snell_url_version "$snell_input") || target_version="(自定义)"
             elif [[ "$snell_input" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?$ ]]; then
                 [[ "$snell_input" != v* ]] && snell_input="v${snell_input}"
                 target_version="$snell_input"
                 snell_download_url="https://dl.nssurge.com/snell/snell-server-${target_version}-linux-${SNELL_ARCH}.zip"
             else
-                msg_error "格式无法识别，请输入版本号 (如 v5.0.2) 或完整 URL。"
-                return
+                msg_error "格式无法识别，请输入 1/2、版本号或完整 HTTPS URL。"
+                return 1
             fi
 
-            if [[ "$installed" == "$target_version" && "$target_version" != "(自定义)" ]]; then
-                msg_info "Snell 已是 ${target_version}，无需更新。"
-                printf "\n${C_CYAN}按任意键返回...${C_RESET}"; read -rsn1; return
+            if [[ $target_version != '(自定义)' ]]; then
+                _snell_arch_supported "$target_version" || return 1
             fi
+            if [[ "$installed" == "$target_version" ]] && _snell_stable_version "$target_version"; then
+                msg_info "Snell 已是 ${target_version}，无需更新。"
+                return 0
+            fi
+            [[ $target_version != v6.* ]] || msg_warn "V6 目前是 beta；请将 Surge 配置设为 version=6，并保持两端版本兼容"
 
             msg_step "正在更新 Snell -> ${target_version}..."
             printf "  下载: ${C_CYAN}%s${C_RESET}\n" "$snell_download_url"
             install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$snell_download_url" "zip" "true" || return 1
             # 同步更新 template service 文件（含 OOMScoreAdjust/RestartSec/StartLimitIntervalSec）
-            create_snell_template_service
-            systemctl daemon-reload
+            create_snell_template_service && systemctl daemon-reload || return 1
             msg_success "Snell 已更新到 ${target_version}。"
             rm -f "$UPDATE_CHECK_CACHE"
             ;;
@@ -4578,7 +4652,7 @@ install_service() {
         local answer; read -rp "$service 已安装，覆盖程序并保留配置？[y/N]: " answer
         [[ $answer == y || $answer == Y ]] || return 1
     fi
-    local tmp member candidate
+    local tmp member candidate snell_version=""
     tmp=$(mktemp -d) || return 1
     candidate="$tmp/candidate"
     if ! curl -fSL --connect-timeout 10 --max-time 180 --retry 2 "$url" -o "$tmp/archive"; then
@@ -4615,10 +4689,22 @@ install_service() {
                 { rm -rf "$tmp"; return 1; } ;;
         realm) "$candidate" --version >/dev/null || { rm -rf "$tmp"; return 1; } ;;
         snell)
-            local status=0
-            timeout 5 "$candidate" -h > "$tmp/help" 2>&1 || status=$?
-            (( status <= 1 )) && grep -qiE 'snell|usage' "$tmp/help" ||
-                { rm -rf "$tmp"; msg_error "Snell 程序验证失败"; return 1; } ;;
+            local status=0 expected_version
+            expected_version=$(_snell_url_version "$url") || expected_version=""
+            snell_version=$(_snell_binary_version "$candidate") || snell_version=""
+            if [[ -n $snell_version && -n $expected_version && $snell_version != "$expected_version" ]]; then
+                rm -rf "$tmp"; msg_error "Snell 程序版本与下载目标不符，未替换程序"; return 1
+            fi
+            if [[ -z $snell_version ]]; then
+                if [[ $expected_version == v6.* ]]; then
+                    rm -rf "$tmp"; msg_error "无法确认下载的 Snell V6 版本，未替换程序"; return 1
+                fi
+                timeout 5 "$candidate" -h > "$tmp/help" 2>&1 || status=$?
+                (( status <= 1 )) && grep -qiE 'snell|usage' "$tmp/help" ||
+                    { rm -rf "$tmp"; msg_error "Snell 程序验证失败"; return 1; }
+                # 老程序仅能从明确的官方下载文件名恢复版本；自定义未知包不能沿用旧记录。
+                [[ $url != https://dl.nssurge.com/snell/snell-server-* ]] || snell_version=$expected_version
+            fi ;;
     esac
     id "$user" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /nonexistent "$user" || {
         rm -rf "$tmp"; return 1;
@@ -4627,9 +4713,17 @@ install_service() {
     if ! _replace_binary "$candidate" "$destination" "$service"; then rm -rf "$tmp"; return 1; fi
     rm -rf "$tmp"
     if [[ $service == snell ]]; then
-        local version
-        version=$(printf '%s' "$url" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -1 || true)
-        [[ -z $version ]] || printf '%s\n' "$version" > "$SNELL_VERSION_FILE"
+        if [[ -n $snell_version ]]; then
+            local version_tmp
+            version_tmp=$(mktemp "$config_dir/.snell-version.XXXXXX") || return 1
+            if ! { printf '%s\n' "$snell_version" > "$version_tmp" && chmod 600 "$version_tmp" &&
+                mv -fT "$version_tmp" "$SNELL_VERSION_FILE"; }; then
+                rm -f "$version_tmp"; msg_error "Snell 已替换，但版本记录保存失败"; return 1
+            fi
+        else
+            rm -f "$SNELL_VERSION_FILE" || return 1
+            msg_warn "自定义 Snell 版本无法识别，已清理旧版本记录"
+        fi
     fi
     msg_success "$service 程序已安装"
 }
@@ -4800,14 +4894,46 @@ _uninstall_service_locked() {
 # ------------------------------------------------------------------------------
 
 
+_snell_policy_valid() {
+    case "$1:$2" in
+        [1-6]:default|6:unshaped|6:unsafe-raw) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_snell_surge_line() {
+    local name=$1 host=$2 port=$3 psk=$4 version=$5 mode=$6 options=""
+    _snell_policy_valid "$version" "$mode" || { msg_warn "Snell 版本或模式无效，已跳过节点导出"; return 1; }
+    [[ $mode == default ]] || options+=", mode=$mode"
+    if (( version >= 4 )); then options+=", reuse=true"; fi
+    printf '%b%s = snell, %s, %s, psk="%s", version=%s%s, tfo=true%b\n' \
+        "$C_GREEN" "$name" "$host" "$port" "$psk" "$version" "$options" "$C_RESET"
+}
+
 parse_snell_nodes() {
-    local f port psk
-    while IFS= read -r f; do
-        [[ -f "$f" ]] || continue
-        port=$(awk '/^\[snell-server\]/{in_s=1} in_s&&/^listen/{n=split($NF,a,":");print a[n];exit}' "$f" 2>/dev/null || true)
-        psk=$(awk '/^\[snell-server\]/{in_s=1} in_s&&/^psk[[:space:]]*=/{sub(/^psk[[:space:]]*=[[:space:]]*/,""); print; exit}' "$f" 2>/dev/null || true)
-        [[ -n "$port" && -n "$psk" ]] && echo "$port $psk"
-    done < <(find "$SNELL_CONFIG_DIR" -name "snell-[0-9]*.conf" -type f 2>/dev/null | sort)
+    local f
+    for f in "$SNELL_CONFIG_DIR"/snell-[0-9]*.conf; do
+        [[ -f $f ]] || continue
+        awk '
+            function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+            /^[[:space:]]*\[/ { section = (trim($0) == "[snell-server]"); next }
+            section && /=/ {
+                sep = index($0, "="); key = trim(substr($0, 1, sep - 1)); val = trim(substr($0, sep + 1))
+                if (key == "listen") listen = val
+                else if (key == "psk") psk = val
+                else if (key == "mode") mode = val
+            }
+            END {
+                if (psk == "") exit
+                n = split(listen, addrs, ",")
+                for (i = 1; i <= n; i++) {
+                    addr = trim(addrs[i]); if (addr !~ /:[0-9]+$/) continue
+                    sub(/^.*:/, "", addr)
+                    if (addr + 0 > 0 && addr + 0 <= 65535 && !seen[addr]++)
+                        printf "%s\037%s\037%s\n", addr, psk, (mode == "" ? "default" : mode)
+                }
+            }' "$f"
+    done
 }
 
 get_connection_stats() {
@@ -4868,6 +4994,20 @@ show_detailed_connections() {
 # ------------------------------------------------------------------------------
 
 
+_snell_reinstall() {
+    local version url
+    version=$(get_installed_version snell "$SNELL_BIN")
+    _snell_version_valid "$version" || {
+        msg_error "已装 Snell 版本未知，未改动；请从菜单 16 → 1 明确选择版本"; return 1;
+    }
+    _snell_arch_supported "$version" || return 1
+    url="https://dl.nssurge.com/snell/snell-server-${version}-linux-${SNELL_ARCH}.zip"
+    install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$url" zip || return 1
+    create_snell_template_service && systemctl daemon-reload && manage_services start snell || return 1
+    rm -f "$UPDATE_CHECK_CACHE"
+    msg_success "Snell $version 重新安装完成，已保留配置并重启节点"
+}
+
 _snell_manage_menu() {
     while true; do
         clear
@@ -4885,15 +5025,7 @@ _snell_manage_menu() {
             2) delete_snell_node         || true ;;
             3) edit_config               || true ;;
             4) show_detailed_connections || true ;;
-            5)
-               local _sv="${SNELL_VERSION_OVERRIDE}"
-               local _url="https://dl.nssurge.com/snell/snell-server-${_sv}-linux-${SNELL_ARCH}.zip"
-               if install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$_url" "zip"; then
-                   create_snell_template_service
-                   systemctl daemon-reload
-                   manage_services "start" "snell" || true
-                   msg_success "Snell 重新安装完成，已重启所有节点"
-               fi ;;
+            5) _snell_reinstall || true ;;
             0) return ;;
             *) msg_warn "无效选项" ;;
         esac
@@ -5065,6 +5197,10 @@ _realm_safe_restart() {
 
 _realm_add_endpoint() {
     local port=$1 remote=$2 psk=$3 alias=$4 cc=$5 tmp had_meta=0 had_tcp=0 had_udp=0
+    local snell_version=${6:-5} snell_mode=${7:-default}
+    if [[ -n $psk ]]; then
+        _snell_policy_valid "$snell_version" "$snell_mode" || { msg_error "Snell 协议版本或模式无效，未添加"; return 1; }
+    fi
     _check_port_available "$port" || { msg_error "端口已被监听或配置占用，未添加"; return 1; }
     if jq -e --arg r "$remote" 'any(.endpoints[]; .remote==$r)' "$REALM_CONFIG_FILE" >/dev/null; then
         msg_error "远端地址已存在"; return 1
@@ -5080,7 +5216,9 @@ _realm_add_endpoint() {
     if jq --arg l "0.0.0.0:$port" --arg r "$remote" '.endpoints += [{listen:$l,remote:$r}]' \
         "$REALM_CONFIG_FILE" > "$tmp/config" && validate_realm_config "$tmp/config" &&
         jq --arg p "$port" --rawfile psk <(printf '%s' "$psk") --arg alias "$alias" --arg cc "$cc" \
-        '. + {($p): {psk:$psk,alias:$alias,country_code:$cc}}' "$tmp/old_meta" > "$tmp/meta" &&
+        --arg version "$snell_version" --arg mode "$snell_mode" \
+        '. + {($p): ({psk:$psk,alias:$alias,country_code:$cc} +
+            (if $psk == "" then {} else {snell_version:($version|tonumber),snell_mode:$mode} end))}' "$tmp/old_meta" > "$tmp/meta" &&
         chown "$REALM_USER:$REALM_USER" "$tmp/config" "$tmp/meta" && chmod 600 "$tmp/config" "$tmp/meta" &&
         open_firewall_port "$port" && mv "$tmp/config" "$REALM_CONFIG_FILE" && mv "$tmp/meta" "$REALM_META_FILE"; then
         rm -rf "$tmp"; return 0
@@ -5094,6 +5232,29 @@ _realm_add_endpoint() {
     # 失败备份留给管理员排查，不在恢复失败时删除唯一副本。
     msg_warn "原配置备份: $tmp"
     return 1
+}
+
+_realm_update_snell_policy() {
+    local port=$1 remote=$2 psk=$3 version=$4 mode=$5 tmp
+    if [[ -z $psk || ! -f $REALM_META_FILE ]] || ! _valid_port "$port" || ! _snell_policy_valid "$version" "$mode"; then
+        msg_warn "已有 Snell 元数据或导出参数无效，未修改"; return 1
+    fi
+    jq -e --arg p "$port" --arg r "$remote" \
+        'any(.endpoints[]; .remote == $r and (.listen | endswith(":"+$p)))' \
+        "$REALM_CONFIG_FILE" >/dev/null || { msg_warn "原转发规则已变化，未修改 Snell 参数"; return 1; }
+    if ! jq -e --arg p "$port" --rawfile psk <(printf '%s' "$psk") --argjson v "$version" --arg m "$mode" \
+        '.[$p].psk == $psk and (((.[$p].snell_version // 5) != $v) or ((.[$p].snell_mode // "default") != $m))' \
+        "$REALM_META_FILE" >/dev/null; then
+        msg_warn "远端已存在，元数据无效、PSK 不匹配或导出参数未变化，未修改"; return 1
+    fi
+    tmp=$(mktemp "$REALM_CONFIG_DIR/.metadata.XXXXXX") || return 1
+    if jq --arg p "$port" --argjson v "$version" --arg m "$mode" \
+        '.[$p].snell_version = $v | .[$p].snell_mode = $m' "$REALM_META_FILE" > "$tmp" &&
+        chown "$REALM_USER:$REALM_USER" "$tmp" && chmod 600 "$tmp" && mv -T "$tmp" "$REALM_META_FILE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    msg_error "Snell 导出参数保存失败，原元数据未替换"; return 1
 }
 
 _realm_remove_ports() {
@@ -5144,6 +5305,7 @@ _process_realm_rule() {
     #   (B) Surge Snell 配置行(name = snell, host, port, psk=..., listening=...)
     # Realm 只转发 TCP、协议对其透明，非 Snell 节点(SS/Hy2 等)只需拿到远端 host:port 即可。
     local remote_host="" remote_port="" psk="" manual_listening_port="" node_alias="" _escaped_host
+    local snell_version=1 snell_mode=default _version_set=0
     if [[ "$raw_config" =~ ^(ss|ssr|vless|vmess|trojan|hysteria2|hy2|tuic)://[^[:space:]]*@ ]]; then
         # URL 分支：删 scheme → 删 userinfo(贪婪到最后一个@) → 截到 / ? # 之前 = 纯 host:port
         local _hostport
@@ -5166,8 +5328,43 @@ _process_realm_rule() {
         fi
         _escaped_host=$(echo "$remote_host" | sed 's/\./\\./g; s/\[/\\[/g; s/\]/\\]/g; s/+/\\+/g')
         remote_port=$(echo "$raw_config" | grep -oP "${_escaped_host},\s*\K\d+" | head -1 || true)
-        psk=$(echo "$raw_config" | grep -oP 'psk=["'\'']?\K[^,"'\'']+' | head -n 1 || true)
-        manual_listening_port=$(echo "$raw_config" | grep -oP 'listening=\K\d+' | head -n 1 || true)
+        local _option _key _value _mode_set=0 _psk_set=0 _listening_set=0
+        local -a _snell_options=()
+        IFS=, read -ra _snell_options <<< "$raw_config"
+        for _option in "${_snell_options[@]:3}"; do
+            if [[ $_option =~ ^[[:space:]]*(version|mode|psk|listening)[[:space:]]*=(.*)$ ]]; then
+                _key=${BASH_REMATCH[1]}; _value=${BASH_REMATCH[2]}
+                _value="${_value#"${_value%%[![:space:]]*}"}"
+                _value="${_value%"${_value##*[![:space:]]}"}"
+                case $_key in
+                    version)
+                        (( _version_set == 0 )) || { msg_error "Snell version 重复，未添加"; return 1; }
+                        snell_version=$_value; _version_set=1 ;;
+                    mode)
+                        (( _mode_set == 0 )) || { msg_error "Snell mode 重复，未添加"; return 1; }
+                        snell_mode=$_value; _mode_set=1 ;;
+                    psk)
+                        (( _psk_set == 0 )) || { msg_error "Snell psk 重复，未添加"; return 1; }
+                        psk=$_value
+                        if [[ $psk == \"*\" || $psk == \'*\' ]]; then psk=${psk:1:${#psk}-2}; fi
+                        if [[ $psk == *,* || $psk == *\"* || $psk == *\'* || $psk == *\\* ]]; then
+                            msg_error "Snell PSK 含无法安全导入的逗号、引号或反斜杠，未添加"; return 1
+                        fi
+                        _psk_set=1 ;;
+                    listening)
+                        (( _listening_set == 0 )) && _valid_port "$_value" || { msg_error "Snell listening 无效或重复，未添加"; return 1; }
+                        manual_listening_port=$_value; _listening_set=1 ;;
+                esac
+            elif [[ $_option =~ ^[[:space:]]*(version|mode|psk|listening)([[:space:]]|$) ]]; then
+                msg_error "Snell 节点参数格式无效，未添加"; return 1
+            elif [[ $_option != *=* && $_option =~ [^[:space:]] ]]; then
+                msg_error "Snell 节点包含不完整参数，未添加"; return 1
+            fi
+        done
+        if (( _mode_set )) && [[ $snell_version != 6 ]]; then
+            msg_error "Snell mode 仅支持 version=6，未添加"; return 1
+        fi
+        _snell_policy_valid "$snell_version" "$snell_mode" || { msg_error "Snell 协议版本或模式无效，未添加"; return 1; }
         node_alias=$(echo "$raw_config" | grep -oP '^[^=]+(?=\s*=)' | xargs || true)
     fi
     
@@ -5190,7 +5387,7 @@ _process_realm_rule() {
     fi
 
     if [[ -z "$remote_ip" || -z "$remote_port" ]]; then
-        if [[ "$silent_mode" == "false" ]]; then msg_error "无法解析: $raw_config"; fi
+        if [[ "$silent_mode" == "false" ]]; then msg_error "无法解析节点的主机或端口"; fi
         return 1
     fi
     
@@ -5199,8 +5396,16 @@ _process_realm_rule() {
     local remote_addr="${remote_host}:${remote_port}"
     [[ $remote_host != *:* ]] || remote_addr="[${remote_host}]:${remote_port}"
 
-    # 防止重复添加同一远端地址
-    if jq -e --arg r "$remote_addr" '.endpoints[] | select(.remote == $r)' "$REALM_CONFIG_FILE" >/dev/null 2>&1; then
+    # Same-PSK Snell upgrades change client metadata only; forwarding remains untouched.
+    local existing_port
+    existing_port=$(jq -r --arg r "$remote_addr" '.endpoints[] | select(.remote == $r) | .listen | split(":")[-1]' "$REALM_CONFIG_FILE") || return 1
+    if [[ -n $existing_port ]]; then
+        if [[ -n $psk ]] && (( _version_set )) &&
+            [[ -z $manual_listening_port || $((10#$manual_listening_port)) == "$existing_port" ]]; then
+            _state_locked _realm_update_snell_policy "$existing_port" "$remote_addr" "$psk" "$snell_version" "$snell_mode" || return 1
+            msg_success "端口 $existing_port 的 Snell 导出参数已更新（version=$snell_version，mode=$snell_mode）；沿用原转发规则"
+            return 0
+        fi
         if [[ "$silent_mode" == "false" ]]; then msg_warn "该远端地址已存在转发规则: ${remote_addr}，跳过。"; fi
         return 1
     fi
@@ -5268,14 +5473,14 @@ _process_realm_rule() {
 
     local safe_alias
     safe_alias=$(echo "$new_name" | tr -d '"\\')
-    _state_locked _realm_add_endpoint "$local_port" "$remote_addr" "$psk" "$safe_alias" "$remote_country_code" || return 1
+    _state_locked _realm_add_endpoint "$local_port" "$remote_addr" "$psk" "$safe_alias" "$remote_country_code" "$snell_version" "$snell_mode" || return 1
 
     if [[ "$silent_mode" == "false" ]]; then
         local display_prefix="$flag"
         if [[ "$new_name" == *" → "* ]]; then display_prefix=""; fi
         msg_success "添加成功: ${new_name} (Port $local_port)"
         if [[ -n "$psk" ]]; then
-             printf "${C_GREEN}%s%s = snell, %s, %s, psk=\"%s\", version=5, reuse=true, tfo=true${C_RESET}\n" "$display_prefix" "$new_name" "$SERVER_IP" "$local_port" "$psk"
+             _snell_surge_line "$display_prefix$new_name" "$SERVER_IP" "$local_port" "$psk" "$snell_version" "$snell_mode" || return 1
         fi
     else
         echo "   [OK] $new_name (Port: $local_port)"
@@ -5292,7 +5497,8 @@ add_realm_forward_advanced() {
     msg_step "智能添加转发规则（支持多行批量粘贴）"
     printf "${C_YELLOW}请粘贴落地机节点，支持多行/多协议：Snell 配置行 或 ss:// / hysteria2:// 等分享链接，粘贴完成后回车空行确认:${C_RESET}\n"
 
-    local lines=() raw_config
+    local lines=() raw_config config_before config_after
+    config_before=$(sha256sum "$REALM_CONFIG_FILE") || return 1
     while IFS= read -r raw_config; do
         [[ -z "$raw_config" ]] && break
         lines+=("$raw_config")
@@ -5314,12 +5520,15 @@ add_realm_forward_advanced() {
 
     [[ ${#lines[@]} -gt 1 ]] && printf "${C_CYAN}批量添加完成: ${C_GREEN}成功 %d${C_CYAN} / ${C_RED}失败 %d${C_RESET}\n" "$ok" "$fail"
 
-    if [[ $ok -gt 0 ]]; then
+    config_after=$(sha256sum "$REALM_CONFIG_FILE") || return 1
+    if [[ $ok -gt 0 && $config_before != "$config_after" ]]; then
         if [[ "$_restart_mode" == "auto" ]]; then
             _realm_safe_restart
         else
             _realm_restart_hint
         fi
+    elif [[ $ok -gt 0 ]]; then
+        msg_info "仅更新 Snell 导出参数，无需重启 Realm"
     fi
 }
 
@@ -5469,12 +5678,23 @@ EOF
 
 install_snell() {
     _fw_ensure || return 1
-    if [[ "$SNELL_ARCH" == "unsupported" ]]; then die "不支持架构"; fi
-
-    local snell_version="${SNELL_VERSION_OVERRIDE}"
+    local choice snell_version
+    printf '\n  1. Snell %s（官方 beta，默认；客户端须支持 V6）\n' "$SNELL_BETA_VERSION"
+    printf '  2. Snell %s（稳定版）\n' "$SNELL_VERSION_OVERRIDE"
+    printf '  V6 beta 期间请保持客户端与服务端版本兼容；q 返回\n'
+    while :; do
+        read -rp '  请选择 [1/2，回车默认 1]: ' choice || return 1
+        case "$choice" in
+            ''|1) snell_version=$SNELL_BETA_VERSION; break ;;
+            2) snell_version=$SNELL_VERSION_OVERRIDE; break ;;
+            q|Q) return 0 ;;
+            *) msg_warn "请输入 1、2 或 q" ;;
+        esac
+    done
+    _snell_arch_supported "$snell_version" || return 1
     local snell_download_url="https://dl.nssurge.com/snell/snell-server-${snell_version}-linux-${SNELL_ARCH}.zip"
 
-    install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$snell_download_url" "zip" || return
+    install_service "snell" "$SNELL_USER" "$SNELL_BIN" "$SNELL_CONFIG_DIR" "$snell_download_url" "zip" || return 1
 
     # 创建/更新模板服务文件
     create_snell_template_service && systemctl daemon-reload || return 1
@@ -5497,38 +5717,48 @@ add_snell_node() {
 }
 
 _snell_add_node() {
-    local port=$1 psk had_tcp=0 had_udp=0
+    local port=$1 psk version network_config had_tcp=0 had_udp=0
+    local -a open_port=(open_firewall_port "$port")
     _check_port_available "$port" || { msg_error "端口已占用，未创建节点"; return 1; }
+    version=$(get_installed_version snell "$SNELL_BIN")
+    [[ $version =~ ^v[1-6]\. ]] || { msg_error "无法确定 Snell 协议版本，请先用菜单 16 → 1 核对服务端版本"; return 1; }
+    if [[ $version == v6.* ]]; then
+        network_config=$'mode = default\ndns-ip-preference = ipv4-only\n# vps-mgr: firewall=tcp'
+        open_port=(_firewall_open_port tcp "$port")
+    else
+        network_config='ipv6 = false'
+        _fw_has_element udp_ports "$port" && had_udp=1
+    fi
     psk=$(openssl rand -base64 32) || return 1
     local node_conf="${SNELL_CONFIG_DIR}/snell-${port}.conf"
     _fw_has_element tcp_ports "$port" && had_tcp=1
-    _fw_has_element udp_ports "$port" && had_udp=1
-    (umask 077; cat > "$node_conf" <<EOF
-[snell-server]
-listen = 0.0.0.0:${port}
-psk = ${psk}
-ipv6 = false
-EOF
+    (umask 077
+     printf '[snell-server]\nlisten = 0.0.0.0:%s\npsk = %s\n%s\n' "$port" "$psk" "$network_config" > "$node_conf"
     ) || { rm -f "$node_conf"; return 1; }
     if chown "${SNELL_USER}:${SNELL_USER}" "$node_conf" && chmod 600 "$node_conf" &&
         systemctl enable --now "snell@${port}.service" && sleep 1 &&
-        systemctl is-active --quiet "snell@${port}.service" && open_firewall_port "$port"; then
+        systemctl is-active --quiet "snell@${port}.service" && "${open_port[@]}"; then
         return 0
     fi
     msg_error "Snell 启动或防火墙配置失败，未完成安装；请检查 journalctl -u snell@${port}"
     (( had_tcp )) || _fw_element delete tcp_ports "$port" || true
-    (( had_udp )) || _fw_element delete udp_ports "$port" || true
+    [[ $version == v6.* ]] || (( had_udp )) || _fw_element delete udp_ports "$port" || true
     if systemctl disable --now "snell@${port}.service"; then rm -f "$node_conf"
     else msg_warn "服务停止失败，保留配置 $node_conf 供排查"; fi
     return 1
 }
 
 _snell_remove_port() {
-    local port=$1
+    local port=$1 conf="$SNELL_CONFIG_DIR/snell-$1.conf"
     _valid_port "$port" || return 1
-    systemctl disable --now "snell@${port}.service" &&
-        close_firewall_port "$port" && _quota_forget "$port" &&
-        rm -f "$SNELL_CONFIG_DIR/snell-${port}.conf"
+    systemctl disable --now "snell@${port}.service" || return 1
+    # 删除时按建节点时放行的协议处理，升级程序不会改变防火墙规则的归属。
+    if grep -qxF '# vps-mgr: firewall=tcp' "$conf" 2>/dev/null; then
+        _fw_element delete tcp_ports "$port" || return 1
+    else
+        close_firewall_port "$port" || return 1
+    fi
+    _quota_forget "$port" && rm -f "$conf"
 }
 
 delete_snell_node() {
@@ -5876,9 +6106,13 @@ _do_update_menu() {
 
     printf " ${C_GREEN}1.${C_RESET} Snell      "
     if [[ -f "$SNELL_BIN" ]]; then
-        [[ -n "$_sn" && "$_sn" != "$_sv" ]] \
-            && printf "  ${C_YELLOW}%s${C_RESET}  →  ${C_GREEN}%s${C_RESET} ${C_RED}[有更新]${C_RESET}\n" "$_sv" "$_sn" \
-            || printf "  ${C_GREEN}%s${C_RESET}  (已是最新)\n" "$_sv"
+        if [[ -n $_sn ]]; then
+            printf "  ${C_YELLOW}%s${C_RESET}  →  ${C_GREEN}%s${C_RESET} ${C_RED}[有更新]${C_RESET}\n" "$_sv" "$_sn"
+        elif [[ $_sv == v6.* ]]; then
+            printf "  ${C_YELLOW}%s${C_RESET}  (beta；选择后手动更新)\n" "$_sv"
+        else
+            printf "  ${C_GREEN}%s${C_RESET}  (未发现稳定版更新)\n" "$_sv"
+        fi
     else
         printf "  ${C_DIM}未安装${C_RESET}\n"
     fi
@@ -8546,19 +8780,23 @@ show_menu() {
     if find "$SNELL_CONFIG_DIR" -name "snell-[0-9]*.conf" -type f -print -quit 2>/dev/null | grep -q .; then
         local short_suffix
         short_suffix="_$(echo "$SERVER_IP" | cut -d. -f4)"
-        local _node_idx=0
-        while IFS=' ' read -r s_port s_psk; do
-            [[ -z "$s_port" || -z "$s_psk" ]] && continue
-            if [[ $_node_idx -eq 0 ]]; then
-                printf "${C_PURPLE}================================================================${C_RESET}\n"
-                printf "${C_BLUE}:: Snell 配置 ::${C_RESET}\n"
-            fi
-            _node_idx=$((_node_idx + 1))
-            local _sfx="${short_suffix}"
-            [[ $_node_idx -gt 1 ]] && _sfx="${short_suffix}-${_node_idx}"
-            printf "${C_GREEN}%s%s = snell, %s, %s, psk=\"%s\", version=5, reuse=true, tfo=true${C_RESET}\n" \
-                "$flag" "$_sfx" "$SERVER_IP" "$s_port" "$s_psk"
-        done < <(parse_snell_nodes)
+        local _node_idx=0 s_port s_psk s_mode protocol=${snell_ver#v}
+        protocol=${protocol%%.*}
+        if [[ ! $protocol =~ ^[1-6]$ ]]; then
+            msg_warn "无法确定本机 Snell 协议版本，暂不导出客户端配置"
+        else
+            while IFS=$'\x1f' read -r s_port s_psk s_mode; do
+                [[ -z "$s_port" || -z "$s_psk" ]] && continue
+                if [[ $_node_idx -eq 0 ]]; then
+                    printf "${C_PURPLE}================================================================${C_RESET}\n"
+                    printf "${C_BLUE}:: Snell 配置 ::${C_RESET}\n"
+                fi
+                _node_idx=$((_node_idx + 1))
+                local _sfx="${short_suffix}"
+                [[ $_node_idx -gt 1 ]] && _sfx="${short_suffix}-${_node_idx}"
+                _snell_surge_line "$flag$_sfx" "$SERVER_IP" "$s_port" "$s_psk" "$protocol" "$s_mode" || continue
+            done < <(parse_snell_nodes)
+        fi
     fi
 
     if _sbx_any ss || _sbx_any socks || _sbx_any hy2; then
@@ -8583,11 +8821,13 @@ show_menu() {
                 local psk=""
                 local alias=""
                 local country_code=""
+                local snell_version=5 snell_mode=default
                 
                 # 尝试从 metadata 读取 PSK
                 if [[ -f "$REALM_META_FILE" ]]; then
-                    IFS=$'\x1f' read -r psk alias country_code < <(
-                        jq -r --arg p "$l_port" '[.[$p].psk // "", .[$p].alias // "", .[$p].country_code // ""] | join("\u001f")' "$REALM_META_FILE"
+                    IFS=$'\x1f' read -r psk alias country_code snell_version snell_mode < <(
+                        jq -r --arg p "$l_port" '[.[$p].psk // "", .[$p].alias // "", .[$p].country_code // "",
+                            .[$p].snell_version // 5, .[$p].snell_mode // "default"] | join("\u001f")' "$REALM_META_FILE"
                     ) || true
                 fi
                 
@@ -8623,8 +8863,8 @@ show_menu() {
                          display_flag="" 
                     fi
 
-                    printf "${C_GREEN}%s%s = snell, %s, %s, psk=\"%s\", version=5, reuse=true, tfo=true${C_RESET}\n" \
-                        "$display_flag" "$final_name" "$SERVER_IP" "$l_port" "$psk"
+                    _snell_surge_line "$display_flag$final_name" "$SERVER_IP" "$l_port" "$psk" "$snell_version" "$snell_mode" ||
+                        msg_warn "Realm 端口 $l_port 的 Snell 导出参数无效，未生成节点行"
                 else
                     # 无元数据，显示普通转发信息
                     printf "${C_YELLOW}Port %s -> %s${C_RESET}\n" "$l_port" "$r_addr"

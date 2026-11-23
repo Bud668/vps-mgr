@@ -247,6 +247,7 @@ for scenario in enable inactive firewall success; do
     }
     open_firewall_port() { [[ $scenario != firewall ]]; }
     touch "$SNELL_BIN"
+    get_installed_version() { printf 'v5.0.1\n'; }
     get_port_interactive() { echo 24100; }
     if [[ $scenario == success ]]; then
         add_snell_node
@@ -257,6 +258,33 @@ for scenario in enable inactive firewall success; do
     fi
 )
 done
+
+# V6 only exposes TCP, retains its IPv4 selection, and exports the actual mode.
+(
+    get_installed_version() { printf 'v6.0.0\n'; }
+    : > "$test_dir/calls"
+    open_firewall_port() { return 1; }
+    _snell_add_node 24102
+    conf="$SNELL_CONFIG_DIR/snell-24102.conf"
+    assert grep -qx 'mode = default' "$conf"
+    assert grep -qx 'dns-ip-preference = ipv4-only' "$conf"
+    assert grep -qx 'element add tcp_ports 24102' "$test_dir/calls"
+    reject grep -q 'udp_ports 24102' "$test_dir/calls"
+    sed -i 's/^mode = default/mode = unshaped/;s/^listen = .*/listen = 0.0.0.0:24102,[::]:24102/' "$conf"
+    mapfile -t records < <(parse_snell_nodes | awk -F '\037' '$1 == 24102')
+    assert test "${#records[@]}" = 1
+    IFS=$'\037' read -r port psk mode <<< "${records[0]}"
+    assert test "$mode" = unshaped
+    assert test "${#psk}" -ge 32
+    assert grep -q 'version=6, mode=unshaped' < <(_snell_surge_line Test 192.0.2.1 "$port" "$psk" 6 "$mode")
+    close_firewall_port() { return 1; }
+    _snell_remove_port 24102
+    assert grep -qx 'element delete tcp_ports 24102' "$test_dir/calls"
+    reject grep -q 'udp_ports 24102' "$test_dir/calls"
+    get_installed_version() { printf '未知\n'; }
+    reject _snell_add_node 24103
+    assert test ! -e "$SNELL_CONFIG_DIR/snell-24103.conf"
+)
 
 # 10: no-op package upgrade must preserve an existing userspace reboot marker.
 (

@@ -7,9 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Debian%20%2F%20Ubuntu-blue)
 ![Shell](https://img.shields.io/badge/shell-bash-lightgrey)
-![Version](https://img.shields.io/badge/version-v2.0.6-green)
+![Version](https://img.shields.io/badge/version-v2.0.7-green)
 
-当前正式版：**v2.0.6**。版本改动记录见 [GitHub Releases](https://github.com/Bud668/vps-mgr/releases)，本页介绍功能和使用方法。
+当前正式版：**v2.0.7**。版本改动记录见 [GitHub Releases](https://github.com/Bud668/vps-mgr/releases)，本页介绍功能和使用方法。
 
 ## 功能与特点
 
@@ -57,7 +57,7 @@
 在新系统的 SSH 终端中完整复制下面这一条命令。它会在缺少 curl 时先安装依赖，再下载固定正式版并检查脚本语法：
 
 ~~~bash
-(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.6/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
+(command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }) && curl -fL --connect-timeout 10 --max-time 120 https://raw.githubusercontent.com/Bud668/vps-mgr/v2.0.7/vps-mgr.sh -o vps-mgr.sh && bash -n vps-mgr.sh && chmod 700 vps-mgr.sh && ./vps-mgr.sh
 ~~~
 
 安装后保留脚本的原路径，防火墙和定时任务会引用它。以后回到这个目录执行：
@@ -126,7 +126,7 @@ XanMod 需要受支持的 CPU 和系统环境，容器不会更换宿主内核�
 
 | 类型 | 入口 | 适用场景与要点 |
 |---|---|---|
-| Snell | **7** | 使用 Surge 等兼容客户端；当前默认安装服务端 v5.0.1，输出 Snell 配置行 |
+| Snell | **7** | 新装默认 v6.0.0（官方标注 Beta），也可选 v5.0.1 稳定版；按已装协议版本导出 Surge 节点 |
 | SS/SS2022 | **9 → 1** | 需要加密代理且客户端支持相应方法；默认 2022-blake3-aes-256-gcm，也可选 aes-128-gcm |
 | SOCKS5 | **9 → 2** | 需要账号密码和来源白名单的代理入口；协议本身不加密，适合可信网络等场景 |
 | Hysteria2 | **9 → 3** | 客户端支持 Hy2，且链路和供应商允许 UDP；默认使用自签证书和 salamander 混淆 |
@@ -144,7 +144,16 @@ Hysteria2 输出的链接包含 insecure=1，表示跳过服务端证书验证�
 3. 将输出的 ss:// 链接导入支持该加密方法的客户端；NAT 机器核对外部地址和端口。
 4. 以后从 **9 → 1 → 1** 查看节点，从 **9 → 1 → 3** 删除节点。
 
-Snell 首次进入菜单 7 会引导安装并创建节点；已有 Snell 时，从 **7 → 1** 继续添加节点。客户端使用脚本输出的地址、端口、密钥及协议版本。
+首次进入菜单 **7** 选择 Snell 版本并创建节点。V6 客户端要求 Surge iOS 5.20.0+ 或 Surge Mac 6.7.0+。已有节点需要切换时，用 **16 → 1 → 1** 明确选择 V6；同机的 Snell 节点共用一个服务端程序，切换后在所有对应的 Surge 节点使用 `version=6`。菜单 **7 → 1** 只添加节点，菜单 7 的重装操作沿用已安装的版本。
+
+V6 新节点使用 `mode = default`、`dns-ip-preference = ipv4-only`，自动生成独立随机 PSK，并放行所选 TCP 端口。已有 V5 配置中的 `ipv6 = false` 也可被 V6 读取。将主界面的节点行复制到 Surge 的 `[Proxy]` 中；默认模式可以省略，修改模式时两端必须一致。示例中的地址、端口和 PSK 请替换为实际值。
+
+~~~ini
+[Proxy]
+Snell-落地 = snell, exit.example.com, 7177, psk=YOUR_RANDOM_PSK, version=6
+~~~
+
+[Surge 官方 Snell 配置手册](https://manual.nssurge.com/policies/snell.html) · [服务端下载与发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)
 
 同机的 SS、SOCKS5、Hysteria2 共用 sing-box 服务。增加、删除节点或修改 ACL 时会重新应用配置，可能短暂影响其他 sing-box 节点。
 
@@ -158,6 +167,10 @@ Snell 首次进入菜单 7 会引导安装并创建节点；已有 Snell 时，�
 2. 在中转机选择 **8：安装 Realm**；已有 Realm 时用 **8 → 2** 手动填写落地机地址和端口，也可用菜单 10 智能粘贴配置。
 3. 为中转入口选择可访问的本机端口。后期修改规则后，选择 **11：重启 Realm** 应用。
 4. 客户端保留落地节点的协议与密钥，将连接地址、端口改成中转机的公网入口。
+
+菜单 **10** 保存导入节点的协议版本和 V6 模式。已有的旧记录沿用 V5。落地机升到 V6 后，在中转机重新粘贴同一落地地址、端口和 PSK 的新配置行，即可更新导出参数；沿用原中转端口，无需重启 Realm。把更新后的节点行复制到 Surge。
+
+如果使用 Surge 自身的代理链，在落地节点行追加 `underlying-proxy=已有的入口策略名`。[Surge 官方链式代理说明](https://manual.nssurge.com/policies/parameters.html)
 
 Realm 负责转发，不会替你安装落地代理或更换加密协议。**当前脚本生成的 Realm 默认配置用于 TCP 转发**，不要据此认为 Hysteria2 等 UDP 协议也能直接使用这套中转配置。
 
